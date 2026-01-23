@@ -1,25 +1,17 @@
-# FAC-Synthesis
+# Less is Enough: Synthesizing Diverse Data in Feature Space of LLMs
 
-Code and prompts for **feature-guided synthetic data generation** using **Sparse Autoencoder (SAE) features**, with downstream evaluation on multiple LLM tasks.
-
-This repo is organized to be **simple, reproducible, and modular**, following the “pipeline-first” style commonly used in open research codebases (e.g., HF Open-R1).
+This is the official implementation of the paper: Less is Enough: Synthesizing Diverse Data in Feature Space of LLMs.
 
 ---
 
-## Overview
+## Introduction
 
-The core workflow is:
-
-1. **Feature extraction** with SAE activations  
-2. **Missing-feature identification** by comparing coverage between an anchor set and task-relevant data  
-3. **Feature-guided synthesis** + activation-based quality control  
-4. **Downstream training / evaluation** (or steering-vector construction)
-
-Supported tasks:
-- Toxicity Detection
-- Reward Modeling
-- Behavior Steering (Sycophancy / Survival Instinct)
-- Instruction Following
+The diversity of post-training data is critical for effective downstream performance in large language models (LLMs). Existing metrics primarily quantify diversity in surface-level linguistic features in text space, which only serve as weak proxies for the task-relevant latent representations that ultimately determine downstream performance.
+In this work, we first introduce **_Feature Activation Coverage_ (FAC)** that measures data diversity in an interpretable feature space. 
+Building upon this metric, we further propose a diversity-driven data synthesis framework, **FAC Synthesis**, that first uses a sparse autoencoder to identify missing features from a seed dataset, and then generates synthetic samples explicitly reflects these missing features.
+Experiments show that our approach consistently improves diversity of generated synthetic data and task performance on various downstream tasks, including instruction following, toxicity detection, reward modeling, and behavior steering. 
+Interestingly, we identify a shared, interpretable feature space across model families (i.e., LLaMA, Mistral, and Qwen), enabling cross-model knowledge transfer.
+Our work provides a solid and practical methodology for exploring data-centric optimization of LLMs.
 
 ---
 
