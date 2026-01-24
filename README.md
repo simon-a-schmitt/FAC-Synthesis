@@ -6,11 +6,9 @@ This is the official implementation of the paper: `Less is Enough: Synthesizing 
 
 ## Core Insight
 
-**Less is Enough** — **"Treating the symptom at its root is more effective than casting a wide net."**
-
-In the post-training stage of LLMs, rather than blindly pursuing massive amounts of surface-level diverse text, it is far better to precisely identify and synthesize those **truly missing key features** (missing features in the latent feature space). With only a small number of highly targeted synthetic samples, we can significantly fill the gaps in **Feature Activation Coverage (FAC)**, leading to clear performance improvements on downstream tasks.
-
 **Work smarter, not harder** — Replace a large amount of "ordinary data" with a minimal amount of "smart data."
+
+In the post-training stage of LLMs, rather than blindly pursuing massive amounts of surface-level diverse text, it is far better to precisely identify and synthesize those **truly missing key features**. With only a small number of highly targeted synthetic samples, we can significantly fill the gaps in **Feature Activation Coverage (FAC)**, leading to clear performance improvements on downstream tasks.
 
 ### Why is this insight simple yet powerful?
 
@@ -20,11 +18,6 @@ Our work reveals:
 
 - Many texts that "appear very different" actually activate highly overlapping features;
 - A small number of samples that "look ordinary but fill feature gaps" can instead bring much larger performance leaps.
-
-It's like solving a puzzle:
-You already finished most of it.
-Just add the few parts you’re missing, and it’s complete.
-No need to gather thousands of duplicates
 
 ---
 
