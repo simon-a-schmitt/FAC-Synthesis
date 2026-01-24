@@ -25,7 +25,7 @@ Our work reveals:
 </p>
 
 <p align="center">
-  <sub><b>Figure 1:</b> The Efficiency Frontier of Instruction Following Datasets. Our proposed method achieves a Win Rate on AlpacaEval 2.0 comparable to MAGPIE while using only 2K synthetic samples (vs. 300K for MAGPIE).</sub>
+  <b>Figure 1:</b> The Efficiency Frontier of Instruction Following Datasets. Our proposed method achieves a Win Rate on AlpacaEval 2.0 comparable to MAGPIE while using only 2K synthetic samples (vs. 300K for MAGPIE).
 </p>
 
 ---
