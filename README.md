@@ -21,7 +21,7 @@ Our work reveals:
 - For instruction following, **FAC Synthesis** achieves performance comparable to the prior SOTA **MAGPIE**, while requiring **150× less data** than MAGPIE.
 
 <p align="center">
-  <img src="assets/fig1.png" width="400" />
+  <img src="Figures/Figure_0.png" width="400" />
 </p>
 
 <p align="center">
