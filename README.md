@@ -6,18 +6,19 @@ This is the official implementation of the paper: `Less is Enough: Synthesizing 
 
 ## Core Insight
 
-**Work smarter, not harder** — Replace a large amount of "ordinary data" with a minimal amount of "smart data."
+**Work smarter, not harder**
 
-In the post-training stage of LLMs, rather than blindly pursuing massive amounts of surface-level diverse text, it is far better to precisely identify and synthesize those **truly missing key features**. With only a small number of highly targeted synthetic samples, we can significantly fill the gaps in **Feature Activation Coverage (FAC)**, leading to clear performance improvements on downstream tasks.
+In the post-training stage of LLMs, instead of blindly adding massive amounts of surface-level diverse text, it is more effective to precisely identify and synthesize those **truly missing key features**. With only a small number of targeted synthetic samples, we can significantly fill the gaps in **Feature Activation Coverage (FAC)**, leading to clear performance improvements on downstream tasks.
 
 ### Why is this insight simple yet powerful?
 
-Traditional data synthesis focuses on quantity and surface diversity (vocabulary, sentence patterns, topic distribution), but these are often just **weak proxies**. What truly determines a model's downstream performance is **coverage in the feature space**.
+Traditional data synthesis focuses on quantity and surface diversity (vocabulary, sentence patterns, topic distribution), but these are often just **weak proxies**. What truly determines a model's downstream performance is **the coverage of key features required by the target task**.
 
 Our work reveals:
 
 - Many texts that "appear very different" actually activate highly overlapping features;
-- A small number of samples that "look ordinary but fill feature gaps" can instead bring much larger performance gains.
+- **FAC** predicts downstream performance much better than standard diversity metrics, including **Distinct-1/2** and **n-gram Entropy** at the word level, **POS-tag Distinct-2** at the syntax level, and **Pair CosDist** and **Semantic Entropy** at the embedding level.  
+- For instruction following, **FAC Synthesis** achieves performance comparable to the prior SOTA **MAGPIE**, while requiring **150× less data** than MAGPIE.
 
 ---
 
