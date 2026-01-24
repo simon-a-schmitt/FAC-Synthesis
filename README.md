@@ -20,6 +20,10 @@ Our work reveals:
 - **FAC** predicts downstream performance much better than standard diversity metrics, including **Distinct-1/2** and **n-gram Entropy** at the word level, **POS-tag Distinct-2** at the syntax level, and **Pair CosDist** and **Semantic Entropy** at the embedding level.  
 - For instruction following, **FAC Synthesis** achieves performance comparable to the prior SOTA **MAGPIE**, while requiring **150× less data** than MAGPIE.
 
+<p align="center">
+  <img src="Figures/Figure_0.png" width="600" />
+</p>
+
 ---
 
 ## Getting Started
