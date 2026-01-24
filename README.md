@@ -1,6 +1,6 @@
 # Less is Enough: Synthesizing Diverse Data in Feature Space of LLMs
 
-This is the official implementation of the paper: Less is Enough: Synthesizing Diverse Data in Feature Space of LLMs.
+This is the official implementation of the paper: 'Less is Enough: Synthesizing Diverse Data in Feature Space of LLMs'.
 
 ---
 
