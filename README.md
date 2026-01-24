@@ -128,9 +128,3 @@ If you use this repository, please cite:
   year      = {2026}
 }
 ```
-
----
-
-## License
-
-Released under the **MIT License**. See `LICENSE` for details.
