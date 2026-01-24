@@ -6,7 +6,7 @@ This is the official implementation of the paper: `Less is Enough: Synthesizing 
 
 ## Core Insight
 
-**Work smarter, not harder**
+✨ **Work smarter, not harder.**
 
 In the post-training stage of LLMs, instead of blindly adding massive amounts of surface-level diverse text, it is more effective to precisely identify and synthesize those **truly missing key features**. With only a small number of targeted synthetic samples, we can significantly fill the gaps in **Feature Activation Coverage (FAC)**, leading to clear performance improvements on downstream tasks.
 
