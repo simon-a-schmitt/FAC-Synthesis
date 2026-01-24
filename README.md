@@ -17,7 +17,7 @@ Traditional data synthesis focuses on quantity and surface diversity (vocabulary
 Our work reveals:
 
 - Many texts that "appear very different" actually activate highly overlapping features;
-- A small number of samples that "look ordinary but fill feature gaps" can instead bring much larger performance leaps.
+- A small number of samples that "look ordinary but fill feature gaps" can instead bring much larger performance gains.
 
 ---
 
