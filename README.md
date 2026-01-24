@@ -4,14 +4,27 @@ This is the official implementation of the paper: `Less is Enough: Synthesizing 
 
 ---
 
-## Abstract
+## Core Insight
 
-The diversity of post-training data is critical for effective downstream performance in large language models (LLMs). Existing metrics primarily quantify diversity in surface-level linguistic features in text space, which only serve as weak proxies for the task-relevant latent representations that ultimately determine downstream performance.
-In this work, we first introduce **_Feature Activation Coverage_ (FAC)** that measures data diversity in an interpretable feature space. 
-Building upon this metric, we further propose a diversity-driven data synthesis framework, **FAC Synthesis**, that first uses a sparse autoencoder to identify missing features from a seed dataset, and then generates synthetic samples explicitly reflects these missing features.
-Experiments show that our approach consistently improves diversity of generated synthetic data and task performance on various downstream tasks, including instruction following, toxicity detection, reward modeling, and behavior steering. 
-Interestingly, we identify a shared, interpretable feature space across model families (i.e., LLaMA, Mistral, and Qwen), enabling cross-model knowledge transfer.
-Our work provides a solid and practical methodology for exploring data-centric optimization of LLMs.
+**Less is Enough** — **"Treating the symptom at its root is more effective than casting a wide net."**
+
+In the post-training stage of LLMs, rather than blindly pursuing massive amounts of surface-level diverse text, it is far better to precisely identify and synthesize those **truly missing key features** (missing features in the latent feature space). With only a small number of highly targeted synthetic samples, we can significantly fill the gaps in **Feature Activation Coverage (FAC)**, leading to clear performance improvements on downstream tasks.
+
+**Work smarter, not harder** — Replace a large amount of "ordinary data" with a minimal amount of "smart data."
+
+### Why is this insight simple yet powerful?
+
+Traditional data synthesis focuses on quantity and surface diversity (vocabulary, sentence patterns, topic distribution), but these are often just **weak proxies**. What truly determines a model's downstream performance is **coverage in the feature space**.
+
+Our work reveals:
+
+- Many texts that "appear very different" actually activate highly overlapping features;
+- A small number of samples that "look ordinary but fill feature gaps" can instead bring much larger performance leaps.
+
+It's like solving a puzzle:
+You already finished most of it.
+Just add the few parts you’re missing, and it’s complete.
+No need to gather thousands of duplicates
 
 ---
 
