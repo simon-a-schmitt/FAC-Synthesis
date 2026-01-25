@@ -1,8 +1,8 @@
 import os
-token = "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"
-os.environ["HF_HOME"] = "/scratch/cz06540/huggingface"
-os.environ["TRANSFORMERS_CACHE"] = "/scratch/cz06540/huggingface/transformers"
-os.environ["HF_DATASETS_CACHE"] = "/scratch/cz06540/huggingface/datasets"
+token = "xxx"
+os.environ["HF_HOME"] = "/xxx/"
+os.environ["TRANSFORMERS_CACHE"] = "/xxx/"
+os.environ["HF_DATASETS_CACHE"] = "/xxx/"
 
 from dataclasses import dataclass, field
 from typing import Optional
@@ -29,7 +29,7 @@ class ScriptArguments:
         metadata={"help": "the location of the output file"},
     )
     reward_name_or_path: Optional[str] = field(
-        default="/home/cyeab/axtool/models/llama8b_it_data_henrydong/checkpoint-1308",
+        default=None,
         metadata={"help": "the name of the gold reward model"},
     )
 
