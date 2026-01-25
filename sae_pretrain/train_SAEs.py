@@ -134,7 +134,7 @@ if __name__ == "__main__":
     layer = int(sys.argv[2])
     model_name = sys.argv[3]
 
-    corpus = GroupActvDataset(f"/scratch/zl22754/prompt_actvs_l{layer}/", layerID=None)
+    corpus = GroupActvDataset(f"/xxx/prompt_actvs_l{layer}/", layerID=None)
 
     generator = Generator(model_name, device="cuda")
     hidden_size = generator._model.config.hidden_size
