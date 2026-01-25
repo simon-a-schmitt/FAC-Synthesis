@@ -74,7 +74,6 @@ FAC-Synthesis/
 Most of the scripts for SAE pretraining are located in `sae_pretrain/`. To pre-train SAEs, run the following commands:
 
 ```bash
-```bash
 # Step-1: Collect hidden activations from the backbone LLM (e.g., layer 16)
 python create_actvs_uni.py 0 0 1 meta-llama/Llama-3.1-8B-Instruct 16
 
@@ -128,18 +127,3 @@ In the evaluation stage, our downstream training and testing scripts are adapted
 - [RLHF-Reward-Modeling](https://github.com/RLHFlow/RLHF-Reward-Modeling)
 - [CAA](https://github.com/nrimsky/CAA)
 - [LLaMAFactory](https://github.com/hiyouga/LLaMAFactory)
-
----
-
-## Citation
-
-If you use this repository, please cite:
-
-```bibtex
-@inproceedings{fac_synthesis_2026,
-  title     = {FAC-Synthesis},
-  author    = {Anonymous Authors},
-  booktitle = {International Conference on Machine Learning (ICML)},
-  year      = {2026}
-}
-```
