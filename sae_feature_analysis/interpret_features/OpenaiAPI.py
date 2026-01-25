@@ -173,11 +173,3 @@ class Chatting(_APISetup):
         :return: An instance of the class (cls).
         """
         return cls(secret_key, model, system, examples, cache, temperature, top_p, n)
-    
-
-if __name__ == "__main__":
-    KEY = "XXXXXXXXXXXXXX"
-    model = Chatting.ChatGPT(KEY)
-    while True:
-        prompt = input("> User: ")
-        print("> GPT: %s" % model(prompt)[0])
