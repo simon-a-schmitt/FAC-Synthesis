@@ -242,7 +242,9 @@ def run_rewardbench_eval(
 class ScriptArguments:
     data_set_name: Optional[str] = field(default="allenai/reward-bench")
     record_dir: Optional[str] = field(default="./bench_mark_eval.txt")
-    reward_name_or_path: Optional[str] = field(default="sfairXC/FsfairX-LLaMA3-RM-v0.1")
+    reward_name_or_path: Optional[str] = field(
+    default="REWARD_MODEL_PATH"
+    )
     split: Optional[str] = field(default="filtered")
     batch_size: Optional[int] = field(default=8)
     limit: Optional[int] = field(default=0)
