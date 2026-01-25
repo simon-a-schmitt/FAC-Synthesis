@@ -1,4 +1,5 @@
 import time
+import os
 import re
 import string
 import json
@@ -95,7 +96,7 @@ class TextSpanJudge:
 
 
 if __name__ == "__main__":
-    KEY = "xxx"
+    KEY = os.environ.get("OPENAI_API_KEY")
 
     model = TextSpanExplainer(KEY)
     judge = TextSpanJudge(KEY)
