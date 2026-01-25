@@ -62,7 +62,7 @@ class HarmfulJudge:
     
 
 if __name__ == "__main__":
-    KEY = "xxx"
+    KEY = os.environ.get("OPENAI_API_KEY")
     
     model = HarmfulJudge(KEY)
 
