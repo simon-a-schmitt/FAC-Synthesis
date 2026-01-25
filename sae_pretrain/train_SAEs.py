@@ -10,11 +10,10 @@ from llm_surgery_uni import switch_mode, mount_function
 from datautils import GroupActvDataset
 from generator_uni import UnifiedGenerator as Generator
 
-CACHE_DIR = os.environ.get("TRANSFORMERS_CACHE", "/scratch/huggingface")
+CACHE_DIR = os.environ.get("TRANSFORMERS_CACHE", "./.cache")
 os.environ["TRANSFORMERS_CACHE"] = CACHE_DIR
 os.environ["HF_HOME"] = CACHE_DIR
 os.makedirs(CACHE_DIR, exist_ok=True)
-print("HF Cache Dir =", os.environ["TRANSFORMERS_CACHE"])
 
 trf.set_seed(42)
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -134,12 +133,14 @@ if __name__ == "__main__":
     layer = int(sys.argv[2])
     model_name = sys.argv[3]
 
-    corpus = GroupActvDataset(f"/xxx/prompt_actvs_l{layer}/", layerID=None)
+    corpus = GroupActvDataset(
+    os.environ.get("DATA_PATH", "./data/prompt_actvs_l{layer}/"),
+    layerID=None
+    )
 
     generator = Generator(model_name, device="cuda")
     hidden_size = generator._model.config.hidden_size
     print("Hidden size:", hidden_size)
-    print(generator.generate("Who is the president of the United States?", max_new_tokens=64, do_sample=False))
 
     # init SAE
     sae = TopKSAE(hidden_size, 2**16, topK=20, device="cuda")
