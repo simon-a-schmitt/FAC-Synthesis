@@ -23,7 +23,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 @dataclass
 class Args:
-    base_model_dir: str = "/models/toxic_cls"
+    base_model_dir="MODEL_PATH"
     valid_data_path: str = "...tsv"
     test_data_path: str = "...tsv"
     output_dir: str = "./model_finetuned"
@@ -81,7 +81,7 @@ def load_and_sample_safe_dataset(real_data_path, num_pos_samples=1000, seed=42):
 
 
 td_neg_subset = load_and_sample_safe_dataset(
-    real_data_path="/home/zl22754/SelfReg-Achieving_Controllable_LLM_Classifier_with_SAE/src/ToxicDetect/datasets/TD_train.tsv",
+    real_data_path="/xxx/xxx.tsv",
     num_pos_samples=1000,
     seed=args.seed,
 )
