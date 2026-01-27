@@ -68,8 +68,8 @@ class EvalRewardBenchCallback(TrainerCallback):
 class ScriptArguments:
     local_rank: Optional[int] = field(default=-1)
     deepspeed: Optional[str] = None
-    per_device_train_batch_size: int = 1
-    gradient_accumulation_steps: int = 4
+    per_device_train_batch_size: int = 2
+    gradient_accumulation_steps: int = 16
     learning_rate: float = 8e-5
     weight_decay: float = 0.01
     model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
