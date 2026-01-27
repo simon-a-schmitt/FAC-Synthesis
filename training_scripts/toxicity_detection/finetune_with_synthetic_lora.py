@@ -30,7 +30,7 @@ class Args:
     seed: int = 42
     per_device_train_batch_size: int = 4
     per_device_eval_batch_size: int = 2
-    gradient_accumulation_steps: int = 16
+    gradient_accumulation_steps: int = 4
     learning_rate: float = 5e-5
     num_train_epochs: float = 3.0
     max_length: int = 512
