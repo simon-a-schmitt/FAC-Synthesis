@@ -49,7 +49,7 @@ if __name__ == "__main__":
     model_name = sys.argv[4]
     layer = int(sys.argv[5])
 
-    corpus = CorpusSearchIndex("datasets/prompt_dataset_train.tsv", cache_freq=10000, sampling=None)
+    corpus = CorpusSearchIndex("", cache_freq=10000, sampling=None)
     model = UnifiedGenerator(model_name, device="cuda")
 
     group_size = 256
@@ -86,7 +86,7 @@ if __name__ == "__main__":
 
                 if len(group_actvs[0]) >= group_size:
                     for l, g_actv in zip(layers, group_actvs):
-                        fpath = f"/scratch/sae_input/prompt_actvs_l{l}/group_{group_idx}.pt"
+                        fpath = f""
                         os.makedirs(os.path.dirname(fpath), exist_ok=True)
                         tc.save(g_actv, fpath)
                         g_actv.clear()
