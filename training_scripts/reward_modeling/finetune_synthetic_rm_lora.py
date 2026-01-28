@@ -19,7 +19,7 @@ from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(os.path.join(os.path.dirname(__file__), "../useful_code"))
-os.environ["HF_TOKEN"] = "xxx"
+os.environ["HF_TOKEN"] = ""
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 from transformers.utils import PaddingStrategy
