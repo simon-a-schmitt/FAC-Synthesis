@@ -58,7 +58,7 @@ def test_steering(layers: List[int], multipliers: List[int], settings: SteeringS
     os.makedirs(save_dir, exist_ok=True)
     
     model_name_for_vector = "xxx/llama-3.1-8b-instruct"
-    model_weights_path = settings.override_model_weights_path or "xxx/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
+    model_weights_path = settings.override_model_weights_path or ""
     
     print(f"Loading model from: {model_weights_path}")
     model = Llama3Wrapper(model_path=model_weights_path, hf_token=HF_TOKEN, use_chat=not settings.use_base_model)
