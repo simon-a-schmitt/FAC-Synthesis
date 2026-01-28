@@ -3,10 +3,10 @@ import json
 import pandas as pd
 from collections import defaultdict
 
-FINAL_DECISION_FILE = 'xxx.tsv'
-EXTSPANS_FILE = 'xxx.tsv'
-YNTHETIC_QUERIES_FILE = 'xxx.tsv'
-OUTPUT_JSONL = 'xxx.jsonl'
+FINAL_DECISION_FILE = ''
+EXTSPANS_FILE = ''
+YNTHETIC_QUERIES_FILE = ''
+OUTPUT_JSONL = ''
 
 TARGET_SAMPLE_COUNT = 2
 
@@ -49,7 +49,7 @@ def analyze_data():
         if neuron_id in matching_ids_set:
             neuron_to_textid[neuron_id].add(row['TextID'])
 
-    warn_ids = ["xxx", "xxx", "xxx"]
+    warn_ids = ["", "", ""]
     warn_counts = defaultdict(int)
     for fid in warn_ids:
         warn_counts[fid] += 1
