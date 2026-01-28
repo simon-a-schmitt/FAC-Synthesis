@@ -18,7 +18,7 @@ from transformers import (
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(os.path.join(os.path.dirname(__file__), "../useful_code"))
-token=os.environ.get("HF_TOKEN")
+os.environ["HF_TOKEN"] = ""
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 from transformers.utils import PaddingStrategy
