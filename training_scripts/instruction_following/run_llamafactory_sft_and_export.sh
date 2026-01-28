@@ -3,14 +3,14 @@ set -euo pipefail
 
 MODEL_NAME_OR_PATH="meta-llama/Meta-Llama-3-8B"
 DATASET="dataset"
-DATASET_DIR="data"
+DATASET_DIR=""
 TEMPLATE="alpaca"
 
 # Training output (LoRA adapters)
-OUTPUT_DIR="outputs/xxx"
+OUTPUT_DIR=""
 
 # Export merged model
-EXPORT_DIR="outputs/xxx"
+EXPORT_DIR=""
 
 echo "[INFO] Starting SFT training..."
 llamafactory-cli train \
