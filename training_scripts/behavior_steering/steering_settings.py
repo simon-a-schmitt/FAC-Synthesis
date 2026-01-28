@@ -32,7 +32,6 @@ class SteeringSettings:
             "override_vector_model": self.override_vector_model,
             "use_base_model": self.use_base_model,
             "model_size": self.model_size,
-            "override_model_weights_path": self.override_model_weights_path,
         }
         return "_".join([f"{k}={str(v).replace('/', '-')}" for k, v in elements.items() if v is not None])
 
