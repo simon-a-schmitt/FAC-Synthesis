@@ -1,5 +1,9 @@
 import os
-token = "xxx"
+
+token = os.environ.get("HF_TOKEN")
+if not token:
+    raise RuntimeError("HF_TOKEN is not set. Please export HF_TOKEN first.")
+
 os.environ["HF_HOME"] = "/xxx/"
 os.environ["TRANSFORMERS_CACHE"] = "/xxx/"
 os.environ["HF_DATASETS_CACHE"] = "/xxx/"
