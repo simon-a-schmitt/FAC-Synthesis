@@ -75,8 +75,8 @@ class ScriptArguments:
     model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
     bf16: bool = True
     num_train_epochs: int = 1.0
-    train_set_path: str = "xxx"
-    output_path: str = "./models"
+    train_set_path: str = ""
+    output_path: str = ""
     gradient_checkpointing: bool = False
     optim: str = "adamw_torch"
     lr_scheduler_type: str = "cosine"
@@ -84,7 +84,7 @@ class ScriptArguments:
     seed: int = 42
     save_every_steps: int = 10000
     eval_every_steps: int = 50
-    init_model_path: Optional[str] = 'xxx'
+    init_model_path: Optional[str] = ''
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.1
