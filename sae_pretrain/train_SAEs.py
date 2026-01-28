@@ -134,7 +134,7 @@ if __name__ == "__main__":
     model_name = sys.argv[3]
 
     corpus = GroupActvDataset(
-    os.environ.get("DATA_PATH", "./data/prompt_actvs_l{layer}/"),
+    os.environ.get("DATA_PATH", ""),
     layerID=None
     )
 
