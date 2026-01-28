@@ -54,7 +54,7 @@ class HelpfulJudge:
     
 
 if __name__ == "__main__":
-    KEY = os.environ.get("OPENAI_API_KEY")
+    KEY = os.environ.get("OPENAI_API_KEY", "<YOUR_API_KEY>")
     
     model = HelpfulJudge(KEY)
 
