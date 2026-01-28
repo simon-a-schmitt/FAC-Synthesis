@@ -22,10 +22,10 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 @dataclass
 class Args:
-    base_model_dir: str = ".../models/toxic_cls"
-    valid_data_path: str = "...tsv"
-    test_data_path: str = "...tsv"
-    output_dir: str = "./model_finetuned"
+    base_model_dir: str = ""
+    valid_data_path: str = ""
+    test_data_path: str = ""
+    output_dir: str = ""
     seed: int = 42
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 2
@@ -41,7 +41,7 @@ args = parser.parse_args_into_dataclasses()[0]
 
 print(args.seed)
 
-base_path_prefix = ".../models/toxic_cls/"
+base_path_prefix = ""
 args.base_model_dir = os.path.join(base_path_prefix, "checkpoint")
 print("args.base_model_dir", args.base_model_dir)
 
@@ -77,10 +77,10 @@ def load_and_sample_safe_dataset(real_data_path, num_pos_samples=1000, seed=42):
 
 
 train_ds_pos = load_tsv(
-    "xxx.tsv"
+    ""
 )
 td_pos_subset = load_and_safe_toxic_dataset(
-    real_data_path="xxx.tsv",
+    real_data_path="",
     num_pos_samples=1000,
     seed=args.seed,
 )
