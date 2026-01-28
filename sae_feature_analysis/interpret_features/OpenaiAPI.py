@@ -11,7 +11,7 @@ import openai
 import filelock
 
 
-STORED_FILE = "./cache_myself.txt"
+STORED_FILE = ""
 
 
 def synchronize(func, iters, batch_size=None, workers=None):
