@@ -71,6 +71,10 @@ FAC-Synthesis/
 ```
 
 ### Pre-training Sparse Autoencoders
+We provide pre-trained SAE checkpoints on Hugging Face:
+- **Llama-3.1-8B-Instruct SAE**: [Zhongzhi1228/sae_llama_l16_h65536](https://huggingface.co/Zhongzhi1228/sae_llama_l16_h65536)
+- **Qwen2-7B-Instruct SAE**: [Zhongzhi1228/sae_qwen_l14_h65536](https://huggingface.co/Zhongzhi1228/sae_qwen_l14_h65536)
+- **Mistral-7B-Instruct SAE**: [Zhongzhi1228/sae_mistral_l16_h65536](https://huggingface.co/Zhongzhi1228/sae_mistral_l16_h65536)
 Most of the scripts for SAE pretraining are located in `sae_pretrain/`. To pre-train SAEs, run the following commands:
 
 ```bash
