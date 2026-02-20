@@ -35,7 +35,7 @@ Our work reveals:
 ### Installation
 
 ```bash
-[git clone https://github.com/Zhongzhi660/FAC-Synthesis.git](https://github.com/Zhongzhi660/FAC-Synthesis.git)
+git clone https://github.com/Zhongzhi660/FAC-Synthesis.git
 cd FAC-Synthesis
 pip install -r requirements.txt
 ```
