@@ -132,3 +132,20 @@ In the evaluation stage, our downstream training and testing scripts are adapted
 - [RLHF-Reward-Modeling](https://github.com/RLHFlow/RLHF-Reward-Modeling)
 - [CAA](https://github.com/nrimsky/CAA)
 - [LLaMAFactory](https://github.com/hiyouga/LLaMAFactory)
+
+## Citation
+
+If you find this work helpful for your research, please cite our paper 🤩:
+
+```bibtex
+@article{li2026less,
+  title={Less is Enough: Synthesizing Diverse Data in Feature Space of LLMs},
+  author={Li, Zhongzhi and Wu, Xuansheng and Li, Yijiang and Hu, Lijie and Liu, Ninghao},
+  journal={arXiv preprint arXiv:2602.10388},
+  year={2026}
+}
+```
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Zhongzhi660/FAC-Synthesis&type=Date)](https://star-history.com/#Zhongzhi660/FAC-Synthesis&Date)
