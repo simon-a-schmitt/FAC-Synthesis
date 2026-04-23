@@ -27,6 +27,9 @@ class CorpusSearchIndex:
                 row = f.readline()
                 if len(row) == 0:
                     break
+
+                # Potential mistake, setting value to 0 for each instance is not useful
+                # Likely only the keys within doc2idx are used so values can be disregarded
                 self._doc2idx[row] = 0
                 self._numrow += 1
                 if self._numrow % self._cache_freq == 0:

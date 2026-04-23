@@ -141,6 +141,7 @@ class UnifiedGenerator:
         else:
             input_ids = tc.tensor([text_or_ids[:512]], device=self._device)
 
+        # Forward pass to get hidden states and optionally logits
         outs = self._model(input_ids, output_hidden_states=True, return_dict=True)
         if not return_logits:
             return outs.hidden_states

@@ -107,6 +107,8 @@ def mount_function(model, name, layer_idx, hook):
             print(f"Hook has no function {func}, setting default.")
             setattr(hook, func, lambda x: x)
 
+    # hook function
+    # hook -> Collector object
     def call_hook(x):
         if not hook.enabled:
             return x
@@ -122,12 +124,24 @@ def mount_function(model, name, layer_idx, hook):
             return y
         return hook.generate(x)
 
+    # ops contains list of targeted layer classes and correct forward method for each model family
     class_list, _ = ops[name]
+
+    # Flag: Did we find any suitable layer? 
     hit = False
+
+    # Recursive search trough all blocks, layers, submodules
     for mod_name, layer in model.named_modules():
+        # Only consider layers of the specified type (from ops)
         if any(isinstance(layer, cls) for cls in class_list):
+
+            # Decrement layer counter for matching layers 
             layer_idx -= 1
+
+            # Correct layer found, mount hook
             if layer_idx == 0:
+
+                # Within the found layer instance a new attribute of name __sae_surgery (view KEY definition) is set
                 setattr(layer, KEY, call_hook)
                 print(f"Mounted hook at {mod_name}")
                 hit = True

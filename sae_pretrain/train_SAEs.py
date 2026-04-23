@@ -78,6 +78,8 @@ def train_SAE(dataset, sae, generator, layer, hidden_size,
                 if bar.n <= skips[1]:
                     continue
 
+                # Convert activations to SAE compatible format (2D tensor of shape [num_tokens, hidden_size])
+                # Cap number of tokens per sequence for each model family
                 seq_len = actv.shape[-2]
                 if "llama" in generator._name.lower():
                     max_tokens = min(seq_len, 286)
@@ -91,10 +93,16 @@ def train_SAE(dataset, sae, generator, layer, hidden_size,
                 x = actv[..., :max_tokens, :]
                 x = x.reshape(-1, x.shape[-1])
 
+                # autocast context: SAE loss is computed in bfloat16 for better performance, but activations are kept in their original dtype (usually float16) to avoid precision issues
                 with tc.autocast(device_type="cuda", dtype=tc.bfloat16, enabled=True):
+
+                    # Forward pass through SAE and compute losses (overall loss and three diagnostic metrics)
                     ttl, l0, l1, l2 = sae.compute_loss(x.to("cuda", non_blocking=True))
+                
+                # Backpropagation with scaled loss
                 scaler.scale(ttl).backward()
 
+                # Logging
                 ttls.append(ttl.item())
                 l0s.append(l0.item())
                 l1s.append(l1.item())
@@ -133,11 +141,13 @@ if __name__ == "__main__":
     layer = int(sys.argv[2])
     model_name = sys.argv[3]
 
+    # Load model activations
     corpus = GroupActvDataset(
     os.environ.get("DATA_PATH", ""),
     layerID=None
     )
 
+    # Model wrapper (UnifiedGenerator)
     generator = Generator(model_name, device="cuda")
     hidden_size = generator._model.config.hidden_size
     print("Hidden size:", hidden_size)

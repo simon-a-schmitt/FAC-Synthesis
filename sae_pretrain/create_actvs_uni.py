@@ -70,20 +70,25 @@ if __name__ == "__main__":
 
     with tc.no_grad():
         bar = tqdm.tqdm(total=len(corpus))
+
+        # One text from the corpus
         for i, text in enumerate(corpus):
             bar.update(1)
             try:
+                # Text activaitons are grouped together in groups of 256 elements
                 if i < group_idx * group_size:
                     continue
                 fpath = f"/scratch/sae_input/prompt_actvs_l{layers[0]}/group_{group_idx}.pt"
                 if os.path.exists(fpath):
                     group_idx += jump
                     continue
-
+                
+                # Append activations to the corresponding group list
                 for g_actv, item in zip(group_actvs, collect_actvs(text, model, collectors)):
                     if item is not None:
                         g_actv.append(item)
 
+                # Write acitvations for current group to file
                 if len(group_actvs[0]) >= group_size:
                     for l, g_actv in zip(layers, group_actvs):
                         fpath = f""
@@ -95,6 +100,7 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"Encountered error at line {i}: {e}")
 
+        # Write remaining activations to file (last group won't reach 256 elements)
         if len(group_actvs) > 0:
             for l, g_actv in zip(layers, group_actvs):
                 if len(g_actv) > 0:
