@@ -21,11 +21,22 @@ class UnifiedGenerator:
     Uses tokenizer.apply_chat_template for chat-format models.
     """
 
-    def __init__(self, model_name: str, device: str = "cuda", dtype: str = "bfloat16"):
+    def __init__(
+        self,
+        model_name: str,
+        device: str = "cuda",
+        dtype: str = "bfloat16",
+        cache_dir: str = None,
+        local_files_only: bool = False,
+        strict_local_paths: bool = False,
+    ):
         self._name = model_name
         self._device = device
         self._dtype = tc.bfloat16 if dtype == "bfloat16" else tc.float16
         self._family = self.detect_family(model_name)
+        self._cache_dir = cache_dir if cache_dir else CACHE_DIR
+        self._local_files_only = local_files_only
+        self._strict_local_paths = strict_local_paths
         self.build_model()
 
     def detect_family(self, model_name: str) -> str:
@@ -43,10 +54,16 @@ class UnifiedGenerator:
         print(f"Initializing model: {self._name}")
         maps = "cpu" if self._device == "cpu" else "auto"
 
+        if self._strict_local_paths and not os.path.isdir(self._name):
+            raise FileNotFoundError(
+                f"strict_local_paths=True requires a local model directory, got: {self._name}"
+            )
+
         tok = AutoTokenizer.from_pretrained(
             self._name,
             use_fast=True,
-            cache_dir=CACHE_DIR,
+            cache_dir=self._cache_dir,
+            local_files_only=self._local_files_only,
         )
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token if tok.eos_token else "</s>"
@@ -54,9 +71,10 @@ class UnifiedGenerator:
 
         model = AutoModelForCausalLM.from_pretrained(
             self._name,
-            cache_dir=CACHE_DIR,
+            cache_dir=self._cache_dir,
             torch_dtype=self._dtype,
             device_map=maps,
+            local_files_only=self._local_files_only,
         )
         model.config.pad_token_id = tok.pad_token_id
         model.eval()
