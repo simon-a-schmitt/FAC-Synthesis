@@ -31,6 +31,10 @@ class UnifiedGenerator:
         strict_local_paths: bool = False,
     ):
         self._name = model_name
+        # Intelligenter Fallback: Wenn CUDA angefordert aber nicht verfügbar, nutze CPU
+        if device == "cuda" and not tc.cuda.is_available():
+            print("WARNING: CUDA requested but torch.cuda.is_available() is False. Falling back to CPU.")
+            device = "cpu"
         self._device = device
         self._dtype = tc.bfloat16 if dtype == "bfloat16" else tc.float16
         self._family = self.detect_family(model_name)
@@ -52,6 +56,7 @@ class UnifiedGenerator:
     @tc.no_grad()
     def build_model(self):
         print(f"Initializing model: {self._name}")
+        print(f"Using device: {self._device}")
         maps = "cpu" if self._device == "cpu" else "auto"
 
         if self._strict_local_paths and not os.path.isdir(self._name):
@@ -114,14 +119,19 @@ class UnifiedGenerator:
         else:
             messages = user_or_messages
 
-        input_ids = self._tokenizer.apply_chat_template(
+        enc = self._tokenizer.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=True,
             return_tensors="pt",
-        ).to(self._device)
-
-        attention_mask = tc.ones_like(input_ids)
+        )
+        # Extract tensors from BatchEncoding and move to device
+        input_ids = enc["input_ids"].to(self._device)
+        attention_mask = enc.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self._device)
+        else:
+            attention_mask = tc.ones_like(input_ids)
         kwrds.setdefault("pad_token_id", self._tokenizer.pad_token_id)
         kwrds.setdefault("max_new_tokens", 128)
         kwrds.setdefault("do_sample", True)
@@ -146,21 +156,29 @@ class UnifiedGenerator:
         add_generation_prompt: bool = False,
         return_logits: bool = False,
     ):
+        attention_mask = None
         if isinstance(text_or_ids, str):
             messages = self.build_messages(
                 user_text=text_or_ids, system_text=system, history=history
             )
-            input_ids = self._tokenizer.apply_chat_template(
+            enc = self._tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
                 add_generation_prompt=add_generation_prompt,
                 return_tensors="pt",
-            ).to(self._device)
+            )
+            input_ids = enc["input_ids"].to(self._device)
+            attention_mask = enc.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self._device)
         else:
             input_ids = tc.tensor([text_or_ids[:512]], device=self._device)
 
         # Forward pass to get hidden states and optionally logits
-        outs = self._model(input_ids, output_hidden_states=True, return_dict=True)
+        if attention_mask is not None:
+            outs = self._model(input_ids, attention_mask=attention_mask, output_hidden_states=True, return_dict=True)
+        else:
+            outs = self._model(input_ids, output_hidden_states=True, return_dict=True)
         if not return_logits:
             return outs.hidden_states
         return outs.hidden_states, outs.logits

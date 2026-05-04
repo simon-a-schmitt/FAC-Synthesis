@@ -92,10 +92,17 @@ class SparseAutoencoder(tc.nn.Module):
     @classmethod
     def from_disk(cls, fpath, device="cuda"):
         print("Loading SAE from %s." % fpath)
-        states = tc.load(fpath)
+        # Intelligenter Fallback: Wenn CUDA nicht verfügbar, auf CPU fallback
+        if device == "cuda" and not tc.cuda.is_available():
+            print("WARNING: CUDA requested but not available. Falling back to CPU.")
+            device = "cpu"
+        # Lade immer zuerst auf CPU, dann verschiebe zu Device
+        states = tc.load(fpath, map_location=tc.device('cpu'))
         model = cls(**states["config"], device="cpu")
         model.load_state_dict(states['weight'], strict=True)
-        return model.to(device)
+        model = model.to(device)
+        print(f"SAE loaded on device: {device}")
+        return model
 
     def dump_disk(self, fpath):
         os.makedirs(os.path.split(fpath)[0], exist_ok=True)
