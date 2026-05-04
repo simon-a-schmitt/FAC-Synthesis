@@ -1,6 +1,6 @@
-import sys
 import os
 import bisect
+import tempfile
 import tqdm
 import torch as tc
 import numpy as np
@@ -10,7 +10,6 @@ from generator import Generator
 from autoencoder import load_pretrained
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[1] if len(sys.argv) > 1 else "0"
 CACHE_DIR = "./"
 
 class TopKCollector:
@@ -85,6 +84,22 @@ def collect_text_spans(corpus, sae, generator, tokenizer, model_name, subgroup, 
     dataset_name = os.path.splitext(os.path.basename(args.data_path))[0]
     root = f"./xxx/threshold_{args.threshold}"
     os.makedirs(root, exist_ok=True)
+    out_path = os.path.join(root, f"textspans_group{subgroup}.tsv")
+    checkpoint_every = getattr(args, "checkpoint_every", 25)
+
+    def write_snapshot(path):
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp_textspans_", suffix=".tsv", dir=root, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf8") as f:
+                f.write("NeuronID\tTextID\tScore\tSpan\n")
+                for c in collectors:
+                    for neuron, idx, score, span in c:
+                        span = span.replace("\n", "\\n").replace("\t", "\\t").replace("\r", "")
+                        f.write(f"{neuron}\t{idx}\t{score:.8f}\t{span}\n")
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     collectors = [TopKCollector(max_collects) for _ in range(65536)]
     bar = tqdm.tqdm(total=len(corpus), desc=f"Collecting ({model_name})")
@@ -123,24 +138,23 @@ def collect_text_spans(corpus, sae, generator, tokenizer, model_name, subgroup, 
         for neuron, span, score in zip(results["Neurons"], results["Spans"], results["Scores"]):
             collectors[neuron].update(score, (neuron, idx, score, span))
 
-    out_path = os.path.join(root, f"textspans_group{subgroup}.tsv")
-    with open(out_path, "w", encoding="utf8") as f:
-        f.write("NeuronID\tTextID\tScore\tSpan\n")
-        for c in collectors:
-            for neuron, idx, score, span in c:
-                span = span.replace("\n", "\\n").replace("\t", "\\t").replace("\r", "")
-                f.write(f"{neuron}\t{idx}\t{score:.8f}\t{span}\n")
+        if (idx + 1) % checkpoint_every == 0:
+            write_snapshot(out_path)
+
+    write_snapshot(out_path)
 
 
 if __name__ == "__main__":
     """
     Usage:
-      python collect_spans.py <GPU_ID> <MODEL_KEY> <SUBGROUP> <TOTAL_GROUP> [--sae-path PATH_OR_ALIAS] [--sae-layer LAYER_ID]
+            python collect_spans.py <DEVICE> <MODEL_KEY> <SUBGROUP> <TOTAL_GROUP> [--sae-path PATH_OR_ALIAS] [--sae-layer LAYER_ID]
+
+        DEVICE can be "cpu" or "cuda".
     """
     import argparse
 
     parser = argparse.ArgumentParser(description="Collect top-k text spans per neuron via SAE hooks.")
-    parser.add_argument("gpu_id", type=str, help="CUDA device id(s), e.g., '0' or '0,1'")
+    parser.add_argument("device", type=str, help="Execution device, either 'cpu' or 'cuda'")
     parser.add_argument("model_key", type=str, choices=["mistral", "llama", "qwen"], help="Backbone model key")
     parser.add_argument("subgroup", type=int, help="This worker's subgroup id (0..TOTAL_GROUP-1)")
     parser.add_argument("ttlgroup", type=int, help="Total number of groups")
@@ -152,11 +166,17 @@ if __name__ == "__main__":
                         help="Path to the input dataset file (e.g., TD_train_1.tsv)")
     parser.add_argument("--threshold", type=float, required=True,
                         help="Activation threshold (e.g., 0, 0.5, 1.0, 1.5, 2.0, 4.0)")
+    parser.add_argument("--checkpoint-every", type=int, default=25,
+                        help="Write a snapshot TSV every N processed samples")
     
     args = parser.parse_args()
 
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    args.device = args.device.lower()
+    if args.device not in {"cpu", "cuda"}:
+        raise ValueError("device must be either 'cpu' or 'cuda'")
+
+    if args.device == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     model_key = args.model_key
     subgroup = args.subgroup
@@ -164,7 +184,7 @@ if __name__ == "__main__":
 
     sae_source = args.sae_path if args.sae_path is not None else model_key
     print(f"[SAE] Loading from: {sae_source}")
-    name, layer, sae = load_pretrained(sae_source)
+    name, layer, sae = load_pretrained(sae_source, device=args.device)
 
     if args.sae_layer is not None:
         print(f"[SAE] Overriding layer: {layer} -> {args.sae_layer}")
@@ -185,7 +205,8 @@ if __name__ == "__main__":
         cache_freq=1000,
         sampling=None,
     )
-    generator = Generator(model_ckpt, device="cuda", dtype="bfloat16")
+    dtype = "float32" if args.device == "cpu" else "bfloat16"
+    generator = Generator(model_ckpt, device=args.device, dtype=dtype)
     tokenizer = generator._tokenizer
 
     print(f"[HOOK] Mounting SAE to model='{model_key}', layer={layer}")

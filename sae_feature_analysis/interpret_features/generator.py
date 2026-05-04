@@ -1,11 +1,9 @@
 import os
-import sys
 import transformers as trf
 import torch as tc
 
 trf.set_seed(42)
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[1] if len(sys.argv) > 1 else "0"
 
 CACHE_DIR = "xxx/.cache/huggingface"
 
