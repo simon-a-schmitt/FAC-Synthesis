@@ -18,9 +18,17 @@ def MaskTopK(x, k):
     return tc.zeros_like(x).scatter_(-1, idx ,1)
 
 
+def _resolve_device(device):
+    if device == "cuda" and not tc.cuda.is_available():
+        print("[SAE] CUDA requested but unavailable; falling back to CPU.")
+        return "cpu"
+    return device
+
+
 class SparseAutoencoder(tc.nn.Module):
     def __init__(self, d_inp, d_hide, device="cuda"):
         super().__init__()
+        device = _resolve_device(device)
         self.monitoring = False
         self.do_edit = False
         self.dims = (d_inp, d_hide)
@@ -94,7 +102,8 @@ class SparseAutoencoder(tc.nn.Module):
     @classmethod
     def from_disk(cls, fpath, device="cuda"):
         print("Loading SAE from %s." % fpath)
-        states = tc.load(fpath, weights_only=True)
+        device = _resolve_device(device)
+        states = tc.load(fpath, map_location="cpu", weights_only=True)
         model = cls(**states["config"], device="cpu")
         model.load_state_dict(states['weight'], strict=True)
         return model.to(device)
@@ -127,10 +136,10 @@ class TopKSAE(SparseAutoencoder):
         self.norm_mask = (~self.dead_mask.bool()).float()
 
     def set_dead_mask(self, index):
-        self.dead_mask = tc.zeros(self.dims[1]).cuda()
+        self.dead_mask = tc.zeros(self.dims[1], device=self.b_dec.device)
         for i in index:
             self.dead_mask[i] = 1
-        self.norm_mask = (~self.dead_mask.bool()).float().cuda()
+        self.norm_mask = (~self.dead_mask.bool()).float().to(self.b_dec.device)
     
     def reset_frequency(self):
         self.freq = tc.zeros_like(self.freq)
@@ -197,8 +206,11 @@ class TopKSAE(SparseAutoencoder):
 
 SAEs = {"sae": SparseAutoencoder, "ae": SparseAutoencoder, "topk": TopKSAE, 
         "topk5": TopKSAE, "topk6": TopKSAE, "topk7": TopKSAE}
+
+
 def load_pretrained(fpath, device="cuda"):
     assert os.path.exists(fpath)
+    device = _resolve_device(device)
     name = os.path.split(fpath)[-1].rsplit(".pth")[0]
     cls = name.split("_l", 1)[0].lower()
     layer = int(name.split("_l", 1)[1].split("_", 1)[0])

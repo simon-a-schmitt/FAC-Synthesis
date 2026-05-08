@@ -5,7 +5,46 @@ import torch as tc
 trf.set_seed(42)
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
-CACHE_DIR = "xxx/.cache/huggingface"
+CACHE_DIR = os.environ.get("TRANSFORMERS_CACHE", os.path.expanduser("~/.cache/huggingface"))
+
+
+def _resolve_device(device):
+    if device == "cuda" and not tc.cuda.is_available():
+        print("[LLM] CUDA requested but unavailable; falling back to CPU.")
+        return "cpu"
+    return device
+
+
+def _resolve_torch_dtype(dtype):
+    if isinstance(dtype, tc.dtype):
+        return dtype
+    dtype_map = {
+        "float32": tc.float32,
+        "float16": tc.float16,
+        "bfloat16": tc.bfloat16,
+    }
+    if dtype not in dtype_map:
+        raise ValueError(f"Unsupported dtype {dtype}; choose from {list(dtype_map.keys())}")
+    return dtype_map[dtype]
+
+
+def _resolve_local_model_path(model_key: str) -> str:
+    if model_key == "llama3-8b":
+        ws_path = os.environ.get("WS_PATH")
+        if ws_path:
+            local_path = os.path.join(ws_path, "models", "llama-3.1-8b")
+            if os.path.isdir(local_path):
+                return local_path
+
+        local_path = os.environ.get("LLAMA_MODEL_PATH")
+        if local_path and os.path.isdir(local_path):
+            return local_path
+
+        raise FileNotFoundError(
+            "Local Llama model not found. Set WS_PATH or LLAMA_MODEL_PATH to a valid local snapshot."
+        )
+
+    return MODEL_MAP[model_key]["hf_name"]
 
 
 MODEL_MAP = {
@@ -43,26 +82,29 @@ class Generator:
     def __init__(self, model_key="mistral-7b", device="cuda", dtype="bfloat16"):
         if model_key not in MODEL_MAP:
             raise ValueError(f"Unsupported model key {model_key}, choose from {list(MODEL_MAP.keys())}")
-        self._name = MODEL_MAP[model_key]["hf_name"]
-        self._device = device
-        self._dtype = dtype
+        self._name = _resolve_local_model_path(model_key)
+        self._device = _resolve_device(device)
+        self._dtype = _resolve_torch_dtype(dtype)
         self.build_model()
 
     @tc.no_grad()
     def build_model(self):
         print(f"Initializing LLM: {self._name}")
         maps = "cpu" if self._device == "cpu" else "auto"
+        load_kwargs = {"local_files_only": True} if os.path.isdir(self._name) else {}
         self._tokenizer = trf.AutoTokenizer.from_pretrained(
             self._name,
             use_fast=True,
             padding_side="right",
-            cache_dir=CACHE_DIR
+            cache_dir=CACHE_DIR,
+            **load_kwargs,
         )
         self._model = trf.AutoModelForCausalLM.from_pretrained(
             self._name,
             cache_dir=CACHE_DIR,
             torch_dtype=self._dtype,
-            device_map=maps
+            device_map=maps,
+            **load_kwargs,
         )
         if not self._tokenizer.eos_token:
             self._tokenizer.eos_token = "</s>"

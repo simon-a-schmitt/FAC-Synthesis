@@ -26,46 +26,39 @@ def _sae_forward_common(
     hidden_states,
     attention_mask=None,
     position_ids=None,
-    past_key_value=None,
+    past_key_values=None,
     output_attentions=False,
     use_cache=False,
-    cache_position=None,
+    position_embeddings=None,
     **kwargs,
 ):
-    """Unified forward function for Llama / Mistral / Qwen models."""
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
 
-    # Self-Attention
-    hidden_states, self_attn_weights, present_key_value = self.self_attn(
+    hidden_states, _ = self.self_attn(
         hidden_states=hidden_states,
         attention_mask=attention_mask,
         position_ids=position_ids,
-        past_key_value=past_key_value,
-        output_attentions=output_attentions,
+        past_key_values=past_key_values,
         use_cache=use_cache,
-        cache_position=cache_position,
+        position_embeddings=position_embeddings,
         **kwargs,
     )
     hidden_states = residual + hidden_states
 
-    # MLP
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
     hidden_states = residual + self.mlp(hidden_states)
 
-    # SAE hook
     if hasattr(self, KEY):
         sae_fn = getattr(self, KEY)
         if sae_fn is not None:
-            hidden_states = sae_fn(hidden_states.to(torch.float32)).to(hidden_states.dtype)
+            hidden_states = sae_fn(hidden_states.to(torch.float32))
+            if isinstance(hidden_states, tuple):
+                hidden_states = hidden_states[-1]
+            hidden_states = hidden_states.to(self.post_attention_layernorm.weight.dtype)
 
-    outputs = (hidden_states,)
-    if output_attentions:
-        outputs += (self_attn_weights,)
-    if use_cache:
-        outputs += (present_key_value,)
-    return outputs
+    return hidden_states
 
 
 def sae_llama_forward(self, *args, **kwargs):
@@ -121,10 +114,13 @@ def mount_function(model, name, layer_idx, hook):
                 raise RuntimeError
             return x
         if hook.computing:
-            y = hook.compute_loss(x)
+            hook.compute_loss(x)
             if hook.early_stop:
                 raise RuntimeError
-            return y
+            if hasattr(hook, 'recons_h') and hook.recons_h is not None:
+                return hook.recons_h
+            _, x_recon = hook(x)
+            return x_recon
         return hook.generate(x)
 
     class_list, _ = ops[name]
