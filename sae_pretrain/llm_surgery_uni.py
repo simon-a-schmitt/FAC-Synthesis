@@ -24,24 +24,29 @@ def _sae_forward_common(
     hidden_states,
     attention_mask=None,
     position_ids=None,
-    past_key_values=None,
+    past_key_value=None,
     use_cache=False,
     position_embeddings=None,
+    output_attentions=False,
+    cache_position=None,
     **kwargs,
 ):
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
 
-    # Self-Attention: in transformers 2.11 returns (hidden_states, attn_weights_or_none)
-    hidden_states, _ = self.self_attn(
+    # Preserve the decoder-layer output contract expected by LlamaModel.
+    attn_output = self.self_attn(
         hidden_states=hidden_states,
         attention_mask=attention_mask,
         position_ids=position_ids,
-        past_key_values=past_key_values,
+        past_key_value=past_key_value,
+        output_attentions=output_attentions,
         use_cache=use_cache,
+        cache_position=cache_position,
         position_embeddings=position_embeddings,
         **kwargs,
     )
+    hidden_states = attn_output[0]
     hidden_states = residual + hidden_states
 
     # MLP
@@ -55,8 +60,15 @@ def _sae_forward_common(
         if sae_fn is not None:
             hidden_states = sae_fn(hidden_states.to(torch.float32)).to(hidden_states.dtype)
 
-    # IMPORTANT: return only hidden_states tensor (not tuple)
-    return hidden_states
+    outputs = (hidden_states,)
+
+    if output_attentions:
+        outputs += (attn_output[1],)
+
+    if use_cache:
+        outputs += (attn_output[2 if output_attentions else 1],)
+
+    return outputs
 
 
 def sae_llama_forward(self, *args, **kwargs):

@@ -167,10 +167,16 @@ class UnifiedGenerator:
                 add_generation_prompt=add_generation_prompt,
                 return_tensors="pt",
             )
-            input_ids = enc["input_ids"].to(self._device)
-            attention_mask = enc.get("attention_mask")
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(self._device)
+            # Handle both dict and tensor returns from apply_chat_template
+            if isinstance(enc, dict):
+                input_ids = enc["input_ids"].to(self._device)
+                attention_mask = enc.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(self._device)
+            else:
+                # enc is a tensor directly
+                input_ids = enc.to(self._device)
+                attention_mask = None
         else:
             input_ids = tc.tensor([text_or_ids[:512]], device=self._device)
 
