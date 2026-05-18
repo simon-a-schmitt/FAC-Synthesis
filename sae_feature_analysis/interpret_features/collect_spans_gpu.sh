@@ -9,12 +9,12 @@
 ##############################################################################
 
 #SBATCH --job-name=sae_spans_gpu
-#SBATCH --partition=gpu_h100
+#SBATCH --partition=gpu_h100_short
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=6           # 6 CPUs pro GPU (24 CPUs / 4 GPUs)
 #SBATCH --mem=180000mb        
-#SBATCH --time=02:00:00             
+#SBATCH --time=00:30:00            
 #SBATCH --output=%x_%j.out          # sae_spans_gpu_<jobid>.out
 #SBATCH --error=%x_%j.err
 
