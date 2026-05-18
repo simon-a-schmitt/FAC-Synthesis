@@ -211,4 +211,8 @@ benchmarks/cuad/CUAD_v1
 
 feature_annotation_data/fineweb_edu/fineweb_edu_sample.txt
 
+*.tsv
+
+fac_test_pipeline/results.jsonl
+fac_test_pipeline/results_non_zero_latent.jsonl
 sae_feature_analysis/interpret_features/xxx
