@@ -3,11 +3,11 @@ import sys
 from typing import List, Dict, Any, Union
 import transformers as trf
 import torch as tc
+from typing import Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 trf.set_seed(42)
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[1] if len(sys.argv) > 1 else "0"
 
 CACHE_DIR = os.environ.get(
     "TRANSFORMERS_CACHE", os.path.expanduser("~/.cache/huggingface")
@@ -110,6 +110,7 @@ class UnifiedGenerator:
         *,
         system: str = None,
         history: List[Dict[str, str]] = None,
+        max_input_tokens: Optional[int] = None,
         **kwrds,
     ) -> str:
         if isinstance(user_or_messages, str):
@@ -125,13 +126,36 @@ class UnifiedGenerator:
             add_generation_prompt=True,
             return_tensors="pt",
         )
-        # Extract tensors from BatchEncoding and move to device
-        input_ids = enc["input_ids"].to(self._device)
-        attention_mask = enc.get("attention_mask")
+        # Handle both dict and tensor returns from apply_chat_template
+        if isinstance(enc, dict):
+            input_ids = enc["input_ids"]
+            attention_mask = enc.get("attention_mask")
+        else:
+            # enc is a tensor directly
+            input_ids = enc
+            attention_mask = None
+
+        # ensure batch dimension: some tokenizers return shape (seq_len,) for single example
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        input_ids = input_ids.to(self._device)
+
         if attention_mask is not None:
+            if attention_mask.dim() == 1:
+                attention_mask = attention_mask.unsqueeze(0)
             attention_mask = attention_mask.to(self._device)
         else:
             attention_mask = tc.ones_like(input_ids)
+        if max_input_tokens is not None:
+            max_input_tokens = int(max_input_tokens)
+            if max_input_tokens > 0 and input_ids.shape[1] > max_input_tokens:
+                input_ids = input_ids[:, -max_input_tokens:]
+                attention_mask = attention_mask[:, -max_input_tokens:]
+
+        if not kwrds.get("do_sample", True):
+            kwrds.pop("temperature", None)
+            kwrds.pop("top_p", None)
+
         kwrds.setdefault("pad_token_id", self._tokenizer.pad_token_id)
         kwrds.setdefault("max_new_tokens", 128)
         kwrds.setdefault("do_sample", True)
