@@ -1,0 +1,78 @@
+import pandas as pd
+from typing import List, Dict, Tuple, Optional
+
+
+DEFAULT_CASEHOLD_INSTRUCTION = (
+    "Identify the single correct legal holding statement from options A-E to fill the <HOLDING> placeholder in the citation and output only the corresponding letter."
+)
+
+
+def map_casehold_label(label) -> str:
+    label_map = {0: "A", 1: "B", 2: "C", 3: "D", 4: "E", "0": "A", "1": "B", "2": "C", "3": "D", "4": "E", "A": "A", "B": "B", "C": "C", "D": "D", "E": "E"}
+    return label_map.get(label, label_map.get(str(label), str(label)))
+
+
+def strip_casehold_instruction(text: str, instruction: str = DEFAULT_CASEHOLD_INSTRUCTION) -> str:
+    text = str(text).strip()
+    instruction = instruction.strip()
+    if text.startswith(instruction):
+        return text[len(instruction):].lstrip("\n\r \t").strip()
+    return text
+
+
+def build_casehold_prompt_from_row(row: pd.Series, instruction_prompt: str) -> str:
+    prompt_parts = [instruction_prompt, strip_casehold_instruction(row.get("Citing Text", row.get("prompt", "")))]
+    # Try to collect five options
+    for i, letter in enumerate("ABCDE"):
+        key = f"Holding Statement {i}"
+        if key in row:
+            prompt_parts.append(f"{letter}. {row[key]}")
+    # If explicit options not found, try columns 0..4
+    if len(prompt_parts) == 1 + 1:
+        # fallback: search numeric columns like 0..4
+        for i, letter in enumerate("ABCDE"):
+            if str(i) in row.index:
+                prompt_parts.append(f"{letter}. {row[str(i)]}")
+    return " \n".join(prompt_parts)
+
+
+def load_casehold_tsv(path: str, instruction_prompt: Optional[str] = None) -> List[Dict[str, str]]:
+    """Load a CaseHold-style TSV and return list of records with keys: prompt, gt_label
+
+    The loader is tolerant to several possible column layouts used in this repo.
+    """
+    df = pd.read_csv(path, sep="\t", dtype=str).fillna("")
+
+    records = []
+    # If file already exported by notebook (prompt + gt holding label)
+    if "prompt" in df.columns and any(c.lower().startswith("gt") for c in df.columns):
+        gt_col = [c for c in df.columns if c.lower().startswith("gt")][0]
+        for _, r in df.iterrows():
+            rec = {"prompt": strip_casehold_instruction(r["prompt"]), "gt": map_casehold_label(r[gt_col])}
+            records.append(rec)
+        return records
+
+    # If it contains Citing Text and Holding Statement columns
+    if "Citing Text" in df.columns:
+        gt_col = None
+        for c in ["GT Holding Label", "GT Holding", "gt holding label", "gt"]:
+            if c in df.columns:
+                gt_col = c
+                break
+        for _, r in df.iterrows():
+            prompt = build_casehold_prompt_from_row(r, instruction_prompt or "Identify the single correct legal holding statement from options A-E to fill the <HOLDING> placeholder in the citation and output only the corresponding letter.")
+            gt = map_casehold_label(r.get(gt_col, "")) if gt_col else ""
+            records.append({"prompt": prompt, "gt": gt})
+        return records
+
+    # Fallback: if there are only two columns 'prompt' and 'gt'
+    cols = list(df.columns)
+    if len(cols) >= 2:
+        # try to heuristically pick columns
+        prompt_col = cols[0]
+        gt_col = cols[1]
+        for _, r in df.iterrows():
+            records.append({"prompt": str(r[prompt_col]), "gt": map_casehold_label(r[gt_col])})
+        return records
+
+    raise ValueError(f"Unrecognized CaseHold TSV format for file: {path}")
