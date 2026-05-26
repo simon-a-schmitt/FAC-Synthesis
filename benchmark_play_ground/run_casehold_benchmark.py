@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 from typing import List, Dict
+import torch
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
@@ -85,14 +86,40 @@ def main():
 
         print(prompt)
         
-        raw = model.generate(
-            prompt,
-            max_new_tokens=16,
-            do_sample=False,
-            temperature=0.0,
-            use_cache=False,
-            max_input_tokens=args.max_input_tokens,
-        )
+        try:
+            raw = model.generate(
+                prompt,
+                max_new_tokens=16,
+                do_sample=False,
+                temperature=1.0,
+                top_p=1.0,
+                use_cache=True,
+                max_input_tokens=args.max_input_tokens,
+            )
+        except RuntimeError as e:
+            msg = str(e)
+            if "CUDA error" not in msg:
+                raise
+
+            # Retry once with a tighter context window to avoid transient GPU kernel failures.
+            if args.device == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            fallback_max_input = args.max_input_tokens if args.max_input_tokens else 2048
+            fallback_max_input = min(fallback_max_input, 2048)
+            print(
+                f"CUDA generation failed at index {idx}. Retrying with max_input_tokens={fallback_max_input}, use_cache=True..."
+            )
+
+            raw = model.generate(
+                prompt,
+                max_new_tokens=16,
+                do_sample=False,
+                temperature=1.0,
+                top_p=1.0,
+                use_cache=True,
+                max_input_tokens=fallback_max_input,
+            )
         pred = extract_label_from_text(raw)
         result = {
             "index": idx,

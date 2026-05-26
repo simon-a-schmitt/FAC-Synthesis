@@ -37,6 +37,7 @@ class LocalModel:
         max_new_tokens: int = 32,
         do_sample: bool = False,
         temperature: float = 0.0,
+        top_p: float = 1.0,
         max_input_tokens: Optional[int] = None,
         use_cache: Optional[bool] = None,
         system: Optional[str] = None,
@@ -52,6 +53,7 @@ class LocalModel:
                 max_new_tokens=max_new_tokens,
                 do_sample=do_sample,
                 temperature=temperature,
+                top_p=top_p,
                 max_input_tokens=max_input_tokens,
                 use_cache=use_cache,
             )
@@ -61,6 +63,7 @@ class LocalModel:
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
             temperature=temperature,
+            top_p=top_p,
             max_input_tokens=max_input_tokens,
             use_cache=use_cache,
             system=system,
