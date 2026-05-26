@@ -147,6 +147,16 @@ class TopKSAE(SparseAutoencoder):
             self.aux_loss = normalized_l2(aux_recons_h, x - self.recons_h)
         h = h * mask
         return tc.relu(h)
+
+    def encode_dense(self, x):
+        """Return dense activations without applying the Top-K mask.
+
+        This is an opt-in inference path so existing callers that rely on
+        Top-K behavior remain unchanged.
+        """
+        x = x.to(self.b_dec.device)
+        h = self._encode(x)
+        return tc.relu(h)
     
     def decode(self, h):
         if self.recons_h is None:
