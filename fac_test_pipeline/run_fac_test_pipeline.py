@@ -77,6 +77,64 @@ def load_prompts(prompts_json: str) -> List[str]:
     return prompts
 
 
+def _special_token_id_set(tokenizer) -> set[int]:
+    special_ids = set(getattr(tokenizer, "all_special_ids", []))
+    special_ids.update(range(128000, 128256))
+    return special_ids
+
+
+def _is_newline_only_token(token: str) -> bool:
+    stripped = token.replace("Ċ", "").replace("\n", "")
+    return len(stripped) == 0 and len(token) > 0
+
+
+def _find_user_content_start(token_ids: List[int], tokens: List[str], tokenizer) -> int:
+    marker_tokens = ("<|start_header_id|>", "user", "<|end_header_id|>")
+    marker_ids = [tokenizer.convert_tokens_to_ids(tok) for tok in marker_tokens]
+
+    user_header_end = -1
+    if all(isinstance(tok_id, int) and tok_id >= 0 for tok_id in marker_ids):
+        marker_len = len(marker_ids)
+        for idx in range(0, len(token_ids) - marker_len + 1):
+            if list(token_ids[idx : idx + marker_len]) == marker_ids:
+                user_header_end = idx + marker_len
+                break
+
+    if user_header_end < 0:
+        marker_len = len(marker_tokens)
+        for idx in range(0, len(tokens) - marker_len + 1):
+            if tuple(tokens[idx : idx + marker_len]) == marker_tokens:
+                user_header_end = idx + marker_len
+                break
+
+    if user_header_end < 0:
+        return 0
+
+    content_start = user_header_end
+    while content_start < len(tokens) and _is_newline_only_token(tokens[content_start]):
+        content_start += 1
+    return content_start
+
+
+def _encode_prompt_token_ids(prompt: str, model: UnifiedGenerator) -> List[int]:
+    messages = model.build_messages(user_text=prompt)
+    enc = model._tokenizer.apply_chat_template(  # noqa: SLF001
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        return_tensors="pt",
+    )
+    if isinstance(enc, dict):
+        input_ids = enc["input_ids"]
+    else:
+        input_ids = enc
+
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+
+    return input_ids[0].tolist()
+
+
 def extract_latent_for_prompt(prompt: str, model: UnifiedGenerator, collector: Collector, sae: TopKSAE) -> tc.Tensor:
     collector.cache = None
     try:
@@ -89,8 +147,25 @@ def extract_latent_for_prompt(prompt: str, model: UnifiedGenerator, collector: C
         raise RuntimeError("Collector cache is empty. Hook may not be mounted correctly.")
 
     hidden = collector.cache.to(tc.float32)
-    last_token_hidden = hidden[:, -1, :]
-    latent = sae.encode(last_token_hidden).detach().cpu().squeeze(0)
+    hidden_seq = hidden[0]
+    token_ids = _encode_prompt_token_ids(prompt, model)
+    special_ids = _special_token_id_set(model._tokenizer)  # noqa: SLF001
+
+    # Apply SAE per token first, then aggregate feature-wise across tokens.
+    token_latents = sae.encode(hidden_seq)
+    if len(token_ids) != token_latents.shape[0]:
+        seq_len = min(len(token_ids), token_latents.shape[0])
+        token_ids = token_ids[:seq_len]
+        token_latents = token_latents[:seq_len]
+
+    tokens = model._tokenizer.convert_ids_to_tokens(token_ids)  # noqa: SLF001
+    content_start = _find_user_content_start(token_ids, tokens, model._tokenizer)
+    token_mask = tc.tensor(
+        [idx >= content_start and token_id not in special_ids for idx, token_id in enumerate(token_ids)],
+        device=token_latents.device,
+    )
+    token_latents = token_latents * token_mask.to(token_latents.dtype).unsqueeze(-1)
+    latent = token_latents.max(dim=0).values.detach().cpu()
     return latent
 
 
