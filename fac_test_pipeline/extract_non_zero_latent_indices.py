@@ -1,6 +1,8 @@
 import argparse
 import json
 from typing import Any, Iterable, List
+import os
+import heapq
 
 
 def iter_jsonl(path: str) -> Iterable[dict[str, Any]]:
@@ -20,6 +22,7 @@ def iter_jsonl(path: str) -> Iterable[dict[str, Any]]:
 
 def non_zero_entries(values: list[Any]) -> List[tuple[int, Any]]:
     return [(index, value) for index, value in enumerate(values) if value != 0]
+    # return [(index, value) for index, value in enumerate(values)]
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,14 +41,24 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    for record in iter_jsonl(args.input_jsonl):
+    for record in iter_jsonl(os.path.join("output", args.input_jsonl)):
         latent = record.get("latent")
         if not isinstance(latent, list):
             raise ValueError("Each dictionary must contain a 'latent' field with a list value.")
 
         entries = non_zero_entries(latent)
-        print(entries)
 
+        target_index_list = [94, 132, 113, 53, 36]
+        # [1422, 5911, 13798, 53635]
+        # 
+        target_entries = [(i, v) for i, v in entries if i in target_index_list]
+        print(target_entries)
+
+        # print the 20 tuples with the highest value
+        # top20 = heapq.nlargest(20, entries, key=lambda t: t[1])
+        # print(top20)
+
+        
 
 if __name__ == "__main__":
     main()
