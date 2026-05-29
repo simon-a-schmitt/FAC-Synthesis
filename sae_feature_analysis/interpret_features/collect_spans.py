@@ -101,6 +101,45 @@ def count_assigned_samples(num_rows, subgroup, ttlgroup, upper_exclusive=None):
         return 0
     return ((upper_exclusive - 1 - subgroup) // ttlgroup) + 1
 
+
+def _special_token_id_set(tokenizer):
+    special_ids = set(getattr(tokenizer, "all_special_ids", []))
+    special_ids.update(range(128000, 128256))
+    return special_ids
+
+
+def _is_newline_only_token(token):
+    stripped = token.replace("Ċ", "").replace("\n", "")
+    return len(stripped) == 0 and len(token) > 0
+
+
+def _find_user_content_start(token_ids, tokens, tokenizer):
+    marker_tokens = ("<|start_header_id|>", "user", "<|end_header_id|>")
+    marker_ids = [tokenizer.convert_tokens_to_ids(tok) for tok in marker_tokens]
+
+    user_header_end = -1
+    if all(isinstance(tok_id, int) and tok_id >= 0 for tok_id in marker_ids):
+        marker_len = len(marker_ids)
+        for idx in range(0, len(token_ids) - marker_len + 1):
+            if list(token_ids[idx : idx + marker_len]) == marker_ids:
+                user_header_end = idx + marker_len
+                break
+
+    if user_header_end < 0:
+        marker_len = len(marker_tokens)
+        for idx in range(0, len(tokens) - marker_len + 1):
+            if tuple(tokens[idx : idx + marker_len]) == marker_tokens:
+                user_header_end = idx + marker_len
+                break
+
+    if user_header_end < 0:
+        return 0
+
+    content_start = user_header_end
+    while content_start < len(tokens) and _is_newline_only_token(tokens[content_start]):
+        content_start += 1
+    return content_start
+
 def activations(messages, model, sae, tokenizer, size=32, shift=31):
     """
     Compute neuron activations for one conversation.
@@ -109,8 +148,30 @@ def activations(messages, model, sae, tokenizer, size=32, shift=31):
     switch_mode(sae, "train")
     topk, sae.topk = sae.topk, 65536
 
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    ids = tokenizer(text, return_tensors="pt").input_ids[0].to(model._device)
+    enc = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        return_tensors="pt",
+    )
+    if isinstance(enc, dict):
+        input_ids = enc["input_ids"]
+    else:
+        input_ids = enc
+
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+
+    ids = input_ids[0].to(model._device)
+    token_ids = ids.tolist()
+    tokens = tokenizer.convert_ids_to_tokens(token_ids)
+
+    special_ids = _special_token_id_set(tokenizer)
+    content_start = _find_user_content_start(token_ids, tokens, tokenizer)
+    token_mask = tc.tensor(
+        [idx >= content_start and token_id not in special_ids for idx, token_id in enumerate(token_ids)],
+        device=ids.device,
+    )
 
     try:
         with tc.no_grad():
@@ -118,17 +179,16 @@ def activations(messages, model, sae, tokenizer, size=32, shift=31):
     except RuntimeError:
         pass
 
-    ids = ids[shift:]
-    
     device = model._device
     IDX_dev = IDX.to(device)
-    act, pos = sae.actvs.squeeze()[shift:].max(dim=0)
+    masked_actvs = sae.actvs.squeeze() * token_mask.to(sae.actvs.dtype).unsqueeze(-1)
+    act, pos = masked_actvs.max(dim=0)
     choose = act > args.threshold
     idx = IDX_dev[choose].tolist()
     act = act[choose].float().cpu().tolist()
     pos = pos[choose].cpu().tolist()
 
-    spans = [ids[max(0, p - size):p] for p in pos]
+    spans = [ids[max(0, p - size + 1):p + 1] for p in pos]
     spans = tokenizer.batch_decode(spans)
     sae.topk = topk
     return {"Neurons": idx, "Spans": spans, "Scores": act}
