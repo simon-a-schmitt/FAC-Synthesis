@@ -140,7 +140,7 @@ def _find_user_content_start(token_ids, tokens, tokenizer):
         content_start += 1
     return content_start
 
-def activations(messages, model, sae, tokenizer, size=32, shift=31):
+def activations(messages, model, sae, tokenizer, size=32):
     """
     Compute neuron activations for one conversation.
     'messages' is a list of {"role": ..., "content": ...}.

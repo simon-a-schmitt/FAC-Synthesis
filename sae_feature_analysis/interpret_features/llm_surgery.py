@@ -1,55 +1,42 @@
 import torch
 import transformers.models.mistral.modeling_mistral as mistral
 import transformers.models.llama.modeling_llama as llama
-
+ 
 # Try importing Qwen variants
 try:
     import transformers.models.qwen2.modeling_qwen2 as qwen2
 except Exception:
     qwen2 = None
-
+ 
 try:
     import transformers.models.qwen2_moe.modeling_qwen2_moe as qwen2_moe
 except Exception:
     qwen2_moe = None
-
+ 
 try:
     import transformers.models.qwen2_5.modeling_qwen2_5 as qwen2_5
 except Exception:
     qwen2_5 = None
-
+ 
 KEY = "__sae_surgery"
-
-
-def _sae_forward_common(
-    self,
-    hidden_states,
-    attention_mask=None,
-    position_ids=None,
-    past_key_values=None,
-    output_attentions=False,
-    use_cache=False,
-    position_embeddings=None,
-    **kwargs,
-):
+ 
+ 
+def _sae_forward_common(self, hidden_states, **kwargs):
+    # Alle uebrigen Argumente (attention_mask, position_ids, past_key_value,
+    # use_cache, position_embeddings, cache_position, ...) werden vom umgebenden
+    # LlamaModel.forward bereits korrekt benannt uebergeben und unveraendert an
+    # self_attn durchgereicht. Kein Umbenennen (Plural/Singular) -> keine Kollision.
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
-
-    hidden_states, _ = self.self_attn(
-        hidden_states=hidden_states,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        use_cache=use_cache,
-        position_embeddings=position_embeddings,
-        **kwargs,
-    )
+ 
+    attn_outputs = self.self_attn(hidden_states=hidden_states, **kwargs)
+    hidden_states = attn_outputs[0]
     hidden_states = residual + hidden_states
-
+ 
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
     hidden_states = residual + self.mlp(hidden_states)
-
+ 
     if hasattr(self, KEY):
         sae_fn = getattr(self, KEY)
         if sae_fn is not None:
@@ -57,29 +44,29 @@ def _sae_forward_common(
             if isinstance(hidden_states, tuple):
                 hidden_states = hidden_states[-1]
             hidden_states = hidden_states.to(self.post_attention_layernorm.weight.dtype)
-
+ 
     return hidden_states
-
-
+ 
+ 
 def sae_llama_forward(self, *args, **kwargs):
     return _sae_forward_common(self, *args, **kwargs)
-
-
+ 
+ 
 def sae_mistral_forward(self, *args, **kwargs):
     return _sae_forward_common(self, *args, **kwargs)
-
-
+ 
+ 
 def sae_qwen_forward(self, *args, **kwargs):
     return _sae_forward_common(self, *args, **kwargs)
-
-
+ 
+ 
 # Register target decoder classes
 ops = {
     "mistral": ([mistral.MistralDecoderLayer], sae_mistral_forward),
     "llama": ([llama.LlamaDecoderLayer], sae_llama_forward),
     "qwen": ([], sae_qwen_forward),
 }
-
+ 
 # Add Qwen layers if available
 if qwen2 is not None and hasattr(qwen2, "Qwen2DecoderLayer"):
     ops["qwen"][0].append(qwen2.Qwen2DecoderLayer)
@@ -87,13 +74,13 @@ if qwen2_moe is not None and hasattr(qwen2_moe, "Qwen2MoeDecoderLayer"):
     ops["qwen"][0].append(qwen2_moe.Qwen2MoeDecoderLayer)
 if qwen2_5 is not None and hasattr(qwen2_5, "Qwen2_5DecoderLayer"):
     ops["qwen"][0].append(qwen2_5.Qwen2_5DecoderLayer)
-
+ 
 # Monkey-patch all decoder classes
 for class_list, new_forward in ops.values():
     for target_class in class_list:
         setattr(target_class, "forward", new_forward)
-
-
+ 
+ 
 def mount_function(model, name, layer_idx, hook):
     assert layer_idx > 0
     for attr in ["enabled", "monitoring", "computing", "early_stop"]:
@@ -104,7 +91,7 @@ def mount_function(model, name, layer_idx, hook):
         if not hasattr(hook, func):
             print(f"Hook has no function {func}, setting default.")
             setattr(hook, func, lambda x: x)
-
+ 
     def call_hook(x):
         if not hook.enabled:
             return x
@@ -122,7 +109,7 @@ def mount_function(model, name, layer_idx, hook):
             _, x_recon = hook(x)
             return x_recon
         return hook.generate(x)
-
+ 
     class_list, _ = ops[name]
     hit = False
     for mod_name, layer in model.named_modules():
@@ -138,8 +125,8 @@ def mount_function(model, name, layer_idx, hook):
             f"Failed to mount hook: no target layer matched for '{name}'. "
             f"Check model family and layer index."
         )
-
-
+ 
+ 
 def switch_mode(hook, mode):
     mode = mode.lower()
     assert mode in {"turnoff", "turnon", "monitor", "train", "generate"}
