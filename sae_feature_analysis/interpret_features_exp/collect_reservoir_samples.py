@@ -101,22 +101,19 @@ def normalize_messages(text):
 
 
 class ReservoirSampler:
-    __slots__ = ("capacity", "items", "seen", "rng")
+    __slots__ = ("capacity", "items", "seen")
 
-    def __init__(self, capacity, seed, items=None, seen=0, rng_state=None):
+    def __init__(self, capacity, items=None, seen=0):
         self.capacity = int(capacity)
         self.items = array("f", items) if items is not None else array("f")
         self.seen = int(seen)
-        self.rng = random.Random(int(seed))
-        if rng_state is not None:
-            self.rng.setstate(rng_state)
 
-    def update(self, item):
+    def update(self, item, rng):
         self.seen += 1
         if len(self.items) < self.capacity:
             self.items.append(item)
             return
-        choice = self.rng.randrange(self.seen)
+        choice = rng.randrange(self.seen)
         if choice < self.capacity:
             self.items[choice] = item
 
@@ -125,22 +122,11 @@ class ReservoirSampler:
             "capacity": self.capacity,
             "items": self.items,
             "seen": self.seen,
-            "rng_state": self.rng.getstate(),
         }
 
     @classmethod
     def from_state(cls, state):
-        return cls(
-            state["capacity"],
-            seed=0,
-            items=state.get("items", []),
-            seen=state.get("seen", 0),
-            rng_state=state.get("rng_state"),
-        )
-
-
-def derive_feature_seed(base_seed, feature_id):
-    return (int(base_seed) * 1_000_003 + int(feature_id)) & ((1 << 64) - 1)
+        return cls(state["capacity"], items=state.get("items", []), seen=state.get("seen", 0))
 
 
 def compute_samples(messages, model, sae, tokenizer):
@@ -195,9 +181,9 @@ def compute_samples(messages, model, sae, tokenizer):
         sae.topk = original_topk
 
 
-def write_state_dump(path, samplers, last_idx, completed, args, seed, processed_docs):
+def write_checkpoint(path, samplers, last_idx, completed, args, seed, processed_docs, rng_state):
     payload = {
-        "version": 2,
+        "version": 3,
         "data_path": args.data_path,
         "last_idx": int(last_idx),
         "processed_docs": int(processed_docs),
@@ -205,20 +191,7 @@ def write_state_dump(path, samplers, last_idx, completed, args, seed, processed_
         "completed": bool(completed),
         "seed": int(seed),
         "feature_samplers": {int(feature_id): sampler.to_state() for feature_id, sampler in samplers.items()},
-    }
-    atomic_write_pickle(path, payload)
-
-
-def write_progress(path, samplers, last_idx, completed, args, seed, processed_docs):
-    payload = {
-        "version": 2,
-        "data_path": args.data_path,
-        "last_idx": int(last_idx),
-        "processed_docs": int(processed_docs),
-        "max_samples": int(args.max_samples),
-        "completed": bool(completed),
-        "seed": int(seed),
-        "feature_samplers": {int(feature_id): sampler.to_state() for feature_id, sampler in samplers.items()},
+        "rng_state": rng_state,
     }
     atomic_write_pickle(path, payload)
 
@@ -230,10 +203,10 @@ def load_progress(path):
         return pickle.load(f)
 
 
-def get_sampler(samplers, feature_id, base_seed, capacity):
+def get_sampler(samplers, feature_id, capacity):
     sampler = samplers.get(feature_id)
     if sampler is None:
-        sampler = ReservoirSampler(capacity, derive_feature_seed(base_seed, feature_id))
+        sampler = ReservoirSampler(capacity)
         samplers[feature_id] = sampler
     return sampler
 
@@ -244,6 +217,7 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
     generator._model.eval()
     switch_mode(sae, "train")
     sae.early_stop = True
+    rng = random.Random(int(seed))
 
     root = os.path.join(SCRIPT_DIR, "xxx", "reservoir_samples")
     os.makedirs(root, exist_ok=True)
@@ -258,7 +232,7 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
             raise FileNotFoundError(f"resume='require' but no progress file found: {progress_path}")
 
     if progress is not None:
-        if int(progress.get("version", 0)) < 2:
+        if int(progress.get("version", 0)) < 3:
             print("[WARN] Existing progress file uses an old format; restarting from scratch.")
             progress = None
 
@@ -281,15 +255,26 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
             for feature_id, feature_state in progress.get("feature_samplers", {}).items()
         }
         start_idx = max(0, int(progress.get("last_idx", -1)) + 1)
+        rng_state = progress.get("rng_state")
+        if rng_state is not None:
+            rng.setstate(rng_state)
         if progress.get("completed", False):
             print("[INFO] Existing reservoir run already completed. Writing dump and returning.")
-            write_state_dump(out_path, samplers, progress.get("last_idx", -1), True, args, seed, progress.get("processed_docs", 0))
+            write_checkpoint(
+                out_path,
+                samplers,
+                progress.get("last_idx", -1),
+                True,
+                args,
+                seed,
+                progress.get("processed_docs", 0),
+                rng.getstate(),
+            )
             return
 
     total_rows = len(corpus)
     if start_idx >= total_rows:
-        write_state_dump(out_path, samplers, total_rows - 1, True, args, seed, total_rows)
-        write_progress(progress_path, samplers, total_rows - 1, True, args, seed, total_rows)
+        write_checkpoint(out_path, samplers, total_rows - 1, True, args, seed, total_rows, rng.getstate())
         return
 
     bar = tqdm.tqdm(total=total_rows, desc="Reservoir sampling")
@@ -316,15 +301,14 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
                 feature_ids, values = compute_samples(messages, generator, sae, tokenizer)
                 if feature_ids.numel() > 0:
                     for feature_id, value in zip(feature_ids.tolist(), values.tolist()):
-                        sampler = get_sampler(samplers, int(feature_id), seed, args.max_samples)
-                        sampler.update(float(value))
+                        sampler = get_sampler(samplers, int(feature_id), args.max_samples)
+                        sampler.update(float(value), rng)
             except Exception as exc:
                 print(f"[WARN] Template error at sample {idx}: {exc}")
 
         if processed_this_run % checkpoint_every == 0:
             processed_docs = last_idx + 1
-            write_state_dump(out_path, samplers, last_idx, False, args, seed, processed_docs)
-            write_progress(progress_path, samplers, last_idx, completed=False, args=args, seed=seed, processed_docs=processed_docs)
+            write_checkpoint(progress_path, samplers, last_idx, False, args, seed, processed_docs, rng.getstate())
 
         if args.max_docs_per_run > 0 and processed_this_run >= args.max_docs_per_run:
             stopped_by_budget = True
@@ -332,8 +316,8 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
 
     processed_docs = last_idx + 1 if last_idx >= 0 else 0
     completed = (not stopped_by_budget) and (last_idx >= total_rows - 1)
-    write_state_dump(out_path, samplers, last_idx, completed, args, seed, processed_docs)
-    write_progress(progress_path, samplers, last_idx, completed=completed, args=args, seed=seed, processed_docs=processed_docs)
+    write_checkpoint(progress_path, samplers, last_idx, completed, args, seed, processed_docs, rng.getstate())
+    write_checkpoint(out_path, samplers, last_idx, completed, args, seed, processed_docs, rng.getstate())
     if stopped_by_budget:
         print(
             f"[INFO] Run budget reached ({args.max_docs_per_run} docs). Checkpoint written; rerun to continue."
@@ -365,7 +349,7 @@ if __name__ == "__main__":
     parser.add_argument("--sae-path", type=str, default=None, help="SAE checkpoint path")
     parser.add_argument("--sae-layer", type=int, default=None, help="Override SAE layer ID")
     parser.add_argument("--max-samples", type=int, default=1000, help="Reservoir capacity per feature")
-    parser.add_argument("--checkpoint-every", type=int, default=25, help="Checkpoint every N documents")
+    parser.add_argument("--checkpoint-every", type=int, default=1000, help="Checkpoint every N documents (default: 1000)")
     parser.add_argument("--resume", type=str, default="auto", choices=["auto", "never", "require"],
                         help="Resume mode: auto, never, or require")
     parser.add_argument("--max-docs-per-run", type=int, default=0,
