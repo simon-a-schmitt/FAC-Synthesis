@@ -1,5 +1,4 @@
-import base64
-import json
+from array import array
 import os
 import pickle
 import random
@@ -32,26 +31,16 @@ def resolve_runtime_device(requested_device):
     return requested_device
 
 
-def atomic_write_json(path, payload):
+def atomic_write_pickle(path, payload):
     root = os.path.dirname(path) or "."
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_state_", suffix=".json", dir=root, text=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_state_", suffix=".pkl", dir=root)
     try:
-        with os.fdopen(fd, "w", encoding="utf8") as f:
-            json.dump(payload, f, ensure_ascii=True, indent=2, sort_keys=True)
+        with os.fdopen(fd, "wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp_path, path)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-
-
-def encode_rng_state(rng):
-    return base64.b64encode(pickle.dumps(rng.getstate())).decode("ascii")
-
-
-def decode_rng_state(payload):
-    rng = random.Random()
-    rng.setstate(pickle.loads(base64.b64decode(payload.encode("ascii"))))
-    return rng
 
 
 def _special_token_id_set(tokenizer):
@@ -112,11 +101,15 @@ def normalize_messages(text):
 
 
 class ReservoirSampler:
+    __slots__ = ("capacity", "items", "seen", "rng")
+
     def __init__(self, capacity, seed, items=None, seen=0, rng_state=None):
         self.capacity = int(capacity)
-        self.items = list(items) if items is not None else []
+        self.items = array("f", items) if items is not None else array("f")
         self.seen = int(seen)
-        self.rng = decode_rng_state(rng_state) if rng_state is not None else random.Random(int(seed))
+        self.rng = random.Random(int(seed))
+        if rng_state is not None:
+            self.rng.setstate(rng_state)
 
     def update(self, item):
         self.seen += 1
@@ -127,108 +120,122 @@ class ReservoirSampler:
         if choice < self.capacity:
             self.items[choice] = item
 
+    def to_state(self):
+        return {
+            "capacity": self.capacity,
+            "items": self.items,
+            "seen": self.seen,
+            "rng_state": self.rng.getstate(),
+        }
 
-def compute_samples(messages, model, sae, tokenizer, span_size=32):
+    @classmethod
+    def from_state(cls, state):
+        return cls(
+            state["capacity"],
+            seed=0,
+            items=state.get("items", []),
+            seen=state.get("seen", 0),
+            rng_state=state.get("rng_state"),
+        )
+
+
+def derive_feature_seed(base_seed, feature_id):
+    return (int(base_seed) * 1_000_003 + int(feature_id)) & ((1 << 64) - 1)
+
+
+def compute_samples(messages, model, sae, tokenizer):
     switch_mode(sae, "train")
-    original_topk, sae.topk = sae.topk, 65536
-
-    enc = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=False,
-        return_tensors="pt",
-    )
-    if isinstance(enc, dict):
-        input_ids = enc["input_ids"]
-    else:
-        input_ids = enc
-
-    if input_ids.dim() == 1:
-        input_ids = input_ids.unsqueeze(0)
-
-    ids = input_ids[0].to(model._device)
-    token_ids = ids.tolist()
-    tokens = tokenizer.convert_ids_to_tokens(token_ids)
-
-    special_ids = _special_token_id_set(tokenizer)
-    content_start = _find_user_content_start(token_ids, tokens, tokenizer)
-    token_mask = tc.tensor(
-        [idx >= content_start and token_id not in special_ids for idx, token_id in enumerate(token_ids)],
-        device=ids.device,
-    )
+    original_topk = sae.topk
+    sae.topk = 65536
 
     try:
-        with tc.no_grad():
-            model.get_activates(ids)
-    except RuntimeError:
-        pass
+        enc = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_tensors="pt",
+        )
+        if isinstance(enc, dict):
+            input_ids = enc["input_ids"]
+        else:
+            input_ids = enc
 
-    token_actvs = sae.actvs.squeeze()
-    masked_actvs = token_actvs * token_mask.to(token_actvs.dtype).unsqueeze(-1)
-    active_pairs = tc.nonzero(masked_actvs > 0, as_tuple=False)
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
 
-    samples = []
-    if active_pairs.numel() > 0:
-        for token_idx, feature_idx in active_pairs.tolist():
-            score = float(masked_actvs[token_idx, feature_idx].float().item())
-            span_ids = ids[max(0, token_idx - span_size + 1): token_idx + 1]
-            span = tokenizer.batch_decode([span_ids])[0]
-            samples.append(
-                {
-                    "feature_id": int(feature_idx),
-                    "score": score,
-                    "token_idx": int(token_idx),
-                    "token": tokens[token_idx],
-                    "span": span,
-                }
-            )
+        ids = input_ids[0].to(model._device)
+        token_ids = ids.tolist()
+        tokens = tokenizer.convert_ids_to_tokens(token_ids)
 
-    sae.topk = original_topk
-    return samples
+        special_ids = _special_token_id_set(tokenizer)
+        content_start = _find_user_content_start(token_ids, tokens, tokenizer)
+        token_mask = tc.tensor(
+            [idx >= content_start and token_id not in special_ids for idx, token_id in enumerate(token_ids)],
+            device=ids.device,
+        )
 
+        try:
+            with tc.no_grad():
+                model.get_activates(ids)
+        except RuntimeError:
+            pass
 
-def escape_tsv(value):
-    return str(value).replace("\r", "").replace("\n", "\\n").replace("\t", "\\t")
+        token_actvs = sae.actvs.squeeze()
+        masked_actvs = token_actvs * token_mask.to(token_actvs.dtype).unsqueeze(-1)
+        active_mask = masked_actvs > 0
+        active_pairs = tc.nonzero(active_mask, as_tuple=False)
 
+        if active_pairs.numel() == 0:
+            return active_pairs[:, 1].to("cpu"), tc.empty((0,), device="cpu", dtype=tc.float32)
 
-def write_snapshot(path, sampler):
-    root = os.path.dirname(path) or "."
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_reservoir_", suffix=".tsv", dir=root, text=True)
-    try:
-        with os.fdopen(fd, "w", encoding="utf8") as f:
-            f.write("FeatureID\tScore\tDocID\tTokenIndex\tToken\tSpan\n")
-            for sample in sampler.items:
-                f.write(
-                    f"{sample['feature_id']}\t{sample['score']:.8f}\t{sample['doc_id']}\t"
-                    f"{sample['token_idx']}\t{escape_tsv(sample['token'])}\t{escape_tsv(sample['span'])}\n"
-                )
-        os.replace(tmp_path, path)
+        feature_ids = active_pairs[:, 1].to("cpu")
+        values = masked_actvs[active_mask].detach().to(device="cpu", dtype=tc.float32)
+        return feature_ids, values
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        sae.topk = original_topk
 
 
-def write_progress(path, sampler, last_idx, completed, args, seed):
+def write_state_dump(path, samplers, last_idx, completed, args, seed, processed_docs):
     payload = {
-        "version": 1,
+        "version": 2,
         "data_path": args.data_path,
         "last_idx": int(last_idx),
+        "processed_docs": int(processed_docs),
         "max_samples": int(args.max_samples),
         "completed": bool(completed),
-        "sample_count": int(len(sampler.items)),
         "seed": int(seed),
-        "seen": int(sampler.seen),
-        "rng_state": encode_rng_state(sampler.rng),
-        "samples": sampler.items,
+        "feature_samplers": {int(feature_id): sampler.to_state() for feature_id, sampler in samplers.items()},
     }
-    atomic_write_json(path, payload)
+    atomic_write_pickle(path, payload)
+
+
+def write_progress(path, samplers, last_idx, completed, args, seed, processed_docs):
+    payload = {
+        "version": 2,
+        "data_path": args.data_path,
+        "last_idx": int(last_idx),
+        "processed_docs": int(processed_docs),
+        "max_samples": int(args.max_samples),
+        "completed": bool(completed),
+        "seed": int(seed),
+        "feature_samplers": {int(feature_id): sampler.to_state() for feature_id, sampler in samplers.items()},
+    }
+    atomic_write_pickle(path, payload)
 
 
 def load_progress(path):
     if not os.path.exists(path):
         return None
-    with open(path, "r", encoding="utf8") as f:
-        return json.load(f)
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def get_sampler(samplers, feature_id, base_seed, capacity):
+    sampler = samplers.get(feature_id)
+    if sampler is None:
+        sampler = ReservoirSampler(capacity, derive_feature_seed(base_seed, feature_id))
+        samplers[feature_id] = sampler
+    return sampler
 
 
 def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
@@ -240,8 +247,8 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
 
     root = os.path.join(SCRIPT_DIR, "xxx", "reservoir_samples")
     os.makedirs(root, exist_ok=True)
-    out_path = os.path.join(root, "reservoir_samples.tsv")
-    progress_path = os.path.join(root, "reservoir_samples.checkpoint.json")
+    out_path = os.path.join(root, "reservoir_samples.pkl")
+    progress_path = os.path.join(root, "reservoir_samples.checkpoint.pkl")
     checkpoint_every = int(args.checkpoint_every)
 
     progress = None
@@ -249,6 +256,11 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
         progress = load_progress(progress_path)
         if progress is None and args.resume == "require":
             raise FileNotFoundError(f"resume='require' but no progress file found: {progress_path}")
+
+    if progress is not None:
+        if int(progress.get("version", 0)) < 2:
+            print("[WARN] Existing progress file uses an old format; restarting from scratch.")
+            progress = None
 
     if progress is not None:
         same_setup = (
@@ -261,26 +273,23 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
             progress = None
 
     if progress is None or args.resume == "never":
-        sampler = ReservoirSampler(args.max_samples, seed)
+        samplers = {}
         start_idx = 0
     else:
-        sampler = ReservoirSampler(
-            args.max_samples,
-            progress.get("seed", seed),
-            items=progress.get("samples", []),
-            seen=progress.get("seen", 0),
-            rng_state=progress.get("rng_state"),
-        )
+        samplers = {
+            int(feature_id): ReservoirSampler.from_state(feature_state)
+            for feature_id, feature_state in progress.get("feature_samplers", {}).items()
+        }
         start_idx = max(0, int(progress.get("last_idx", -1)) + 1)
         if progress.get("completed", False):
-            print("[INFO] Existing reservoir run already completed. Writing snapshot and returning.")
-            write_snapshot(out_path, sampler)
+            print("[INFO] Existing reservoir run already completed. Writing dump and returning.")
+            write_state_dump(out_path, samplers, progress.get("last_idx", -1), True, args, seed, progress.get("processed_docs", 0))
             return
 
     total_rows = len(corpus)
     if start_idx >= total_rows:
-        write_snapshot(out_path, sampler)
-        write_progress(progress_path, sampler, total_rows - 1, True, args, seed)
+        write_state_dump(out_path, samplers, total_rows - 1, True, args, seed, total_rows)
+        write_progress(progress_path, samplers, total_rows - 1, True, args, seed, total_rows)
         return
 
     bar = tqdm.tqdm(total=total_rows, desc="Reservoir sampling")
@@ -304,24 +313,27 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
             print(f"[WARN] Empty message skipped at sample {idx}")
         else:
             try:
-                samples = compute_samples(messages, generator, sae, tokenizer)
-                for sample in samples:
-                    sample["doc_id"] = int(idx)
-                    sampler.update(sample)
+                feature_ids, values = compute_samples(messages, generator, sae, tokenizer)
+                if feature_ids.numel() > 0:
+                    for feature_id, value in zip(feature_ids.tolist(), values.tolist()):
+                        sampler = get_sampler(samplers, int(feature_id), seed, args.max_samples)
+                        sampler.update(float(value))
             except Exception as exc:
                 print(f"[WARN] Template error at sample {idx}: {exc}")
 
         if processed_this_run % checkpoint_every == 0:
-            write_snapshot(out_path, sampler)
-            write_progress(progress_path, sampler, last_idx, completed=False, args=args, seed=seed)
+            processed_docs = last_idx + 1
+            write_state_dump(out_path, samplers, last_idx, False, args, seed, processed_docs)
+            write_progress(progress_path, samplers, last_idx, completed=False, args=args, seed=seed, processed_docs=processed_docs)
 
         if args.max_docs_per_run > 0 and processed_this_run >= args.max_docs_per_run:
             stopped_by_budget = True
             break
 
-    write_snapshot(out_path, sampler)
+    processed_docs = last_idx + 1 if last_idx >= 0 else 0
     completed = (not stopped_by_budget) and (last_idx >= total_rows - 1)
-    write_progress(progress_path, sampler, last_idx, completed=completed, args=args, seed=seed)
+    write_state_dump(out_path, samplers, last_idx, completed, args, seed, processed_docs)
+    write_progress(progress_path, samplers, last_idx, completed=completed, args=args, seed=seed, processed_docs=processed_docs)
     if stopped_by_budget:
         print(
             f"[INFO] Run budget reached ({args.max_docs_per_run} docs). Checkpoint written; rerun to continue."
@@ -352,7 +364,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--sae-path", type=str, default=None, help="SAE checkpoint path")
     parser.add_argument("--sae-layer", type=int, default=None, help="Override SAE layer ID")
-    parser.add_argument("--max-samples", type=int, default=1000, help="Reservoir size")
+    parser.add_argument("--max-samples", type=int, default=1000, help="Reservoir capacity per feature")
     parser.add_argument("--checkpoint-every", type=int, default=25, help="Checkpoint every N documents")
     parser.add_argument("--resume", type=str, default="auto", choices=["auto", "never", "require"],
                         help="Resume mode: auto, never, or require")
