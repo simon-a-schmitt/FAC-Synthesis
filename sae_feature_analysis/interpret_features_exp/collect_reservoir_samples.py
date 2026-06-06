@@ -132,7 +132,7 @@ class ReservoirSampler:
 def compute_samples(messages, model, sae, tokenizer):
     switch_mode(sae, "train")
     original_topk = sae.topk
-    sae.topk = 65536
+    sae.topk = 20
 
     try:
         enc = tokenizer.apply_chat_template(
@@ -190,6 +190,8 @@ def write_checkpoint(path, samplers, last_idx, completed, args, seed, processed_
         "max_samples": int(args.max_samples),
         "completed": bool(completed),
         "seed": int(seed),
+        "shard_id": int(getattr(args, "shard_id", 0)),
+        "shard_count": int(getattr(args, "shard_count", 1)),
         "feature_samplers": {int(feature_id): sampler.to_state() for feature_id, sampler in samplers.items()},
         "rng_state": rng_state,
     }
@@ -211,7 +213,7 @@ def get_sampler(samplers, feature_id, capacity):
     return sampler
 
 
-def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
+def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed, shard_id=0, shard_count=1):
     sae.eval()
     sae.MaskTopK = False
     generator._model.eval()
@@ -219,7 +221,7 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
     sae.early_stop = True
     rng = random.Random(int(seed))
 
-    root = os.path.join(SCRIPT_DIR, "xxx", "reservoir_samples")
+    root = os.path.join(SCRIPT_DIR, "xxx", f"reservoir_samples_shard{shard_id}_of_{shard_count}")
     os.makedirs(root, exist_ok=True)
     out_path = os.path.join(root, "reservoir_samples.pkl")
     progress_path = os.path.join(root, "reservoir_samples.checkpoint.pkl")
@@ -241,6 +243,8 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
             progress.get("data_path") == args.data_path
             and int(progress.get("max_samples", args.max_samples)) == int(args.max_samples)
             and int(progress.get("seed", seed)) == int(seed)
+            and int(progress.get("shard_id", 0)) == int(shard_id)
+            and int(progress.get("shard_count", 1)) == int(shard_count)
         )
         if not same_setup:
             print("[WARN] Existing progress file does not match current setup; restarting from scratch.")
@@ -287,6 +291,10 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed):
 
     for idx, text in enumerate(corpus):
         if idx < start_idx:
+            continue
+
+        # Shard the input corpus across multiple workers
+        if shard_count > 1 and (idx % int(shard_count)) != int(shard_id):
             continue
 
         bar.update(1)
@@ -357,6 +365,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=None,
                         help="Reservoir sampling seed. If omitted, a random seed is generated.")
     parser.add_argument("--enable-slurm", action="store_true", help="Enable SLURM integration logging")
+    parser.add_argument("--shard-id", type=int, default=0, help="Shard id (0-based) for data parallelism")
+    parser.add_argument("--shard-count", type=int, default=1, help="Total number of shards/workers")
 
     args = parser.parse_args()
 
@@ -442,7 +452,9 @@ if __name__ == "__main__":
 
         logger.info("Starting reservoir sampling over fineweb_edu...")
         with tc.no_grad():
-            collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed)
+            collect_reservoir_samples(
+                corpus, sae, generator, tokenizer, args, seed, shard_id=getattr(args, "shard_id", 0), shard_count=getattr(args, "shard_count", 1)
+            )
 
         logger.info("Completed successfully!")
 
