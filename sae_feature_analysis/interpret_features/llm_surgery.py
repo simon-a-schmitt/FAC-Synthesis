@@ -21,21 +21,40 @@ except Exception:
 KEY = "__sae_surgery"
  
  
-def _sae_forward_common(self, hidden_states, **kwargs):
-    # Alle uebrigen Argumente (attention_mask, position_ids, past_key_value,
-    # use_cache, position_embeddings, cache_position, ...) werden vom umgebenden
-    # LlamaModel.forward bereits korrekt benannt uebergeben und unveraendert an
-    # self_attn durchgereicht. Kein Umbenennen (Plural/Singular) -> keine Kollision.
+def _sae_forward_common(
+    self,
+    hidden_states,
+    attention_mask=None,
+    position_ids=None,
+    past_key_value=None,
+    output_attentions=False,
+    use_cache=False,
+    cache_position=None,
+    position_embeddings=None,
+    **kwargs,
+):
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
  
-    attn_outputs = self.self_attn(hidden_states=hidden_states, **kwargs)
+    attn_outputs = self.self_attn(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_value=past_key_value,
+        output_attentions=output_attentions,
+        use_cache=use_cache,
+        cache_position=cache_position,
+        position_embeddings=position_embeddings,
+        **kwargs,
+    )
     hidden_states = attn_outputs[0]
     hidden_states = residual + hidden_states
  
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
     hidden_states = residual + self.mlp(hidden_states)
+
+    outputs = (hidden_states,)
  
     if hasattr(self, KEY):
         sae_fn = getattr(self, KEY)
@@ -44,8 +63,17 @@ def _sae_forward_common(self, hidden_states, **kwargs):
             if isinstance(hidden_states, tuple):
                 hidden_states = hidden_states[-1]
             hidden_states = hidden_states.to(self.post_attention_layernorm.weight.dtype)
+            if hidden_states.dim() == 2 and outputs[0].dim() == 3 and outputs[0].shape[0] == 1:
+                hidden_states = hidden_states.unsqueeze(0)
+            outputs = (hidden_states,)
  
-    return hidden_states
+    if output_attentions:
+        outputs += (attn_outputs[1],)
+
+    if use_cache:
+        outputs += (attn_outputs[2 if output_attentions else 1],)
+
+    return outputs
  
  
 def sae_llama_forward(self, *args, **kwargs):
@@ -93,6 +121,13 @@ def mount_function(model, name, layer_idx, hook):
             setattr(hook, func, lambda x: x)
  
     def call_hook(x):
+        def restore_shape_and_dtype(recon):
+            if isinstance(recon, tuple):
+                recon = recon[-1]
+            if x.dim() == 3 and recon.dim() == 2 and x.shape[0] == 1:
+                recon = recon.unsqueeze(0)
+            return recon.to(dtype=x.dtype, device=x.device)
+
         if not hook.enabled:
             return x
         if hook.monitoring:
@@ -105,9 +140,9 @@ def mount_function(model, name, layer_idx, hook):
             if hook.early_stop:
                 raise RuntimeError
             if hasattr(hook, 'recons_h') and hook.recons_h is not None:
-                return hook.recons_h
+                return restore_shape_and_dtype(hook.recons_h)
             _, x_recon = hook(x)
-            return x_recon
+            return restore_shape_and_dtype(x_recon)
         return hook.generate(x)
  
     class_list, _ = ops[name]

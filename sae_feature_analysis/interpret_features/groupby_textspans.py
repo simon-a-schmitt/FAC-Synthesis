@@ -168,6 +168,7 @@ def build_deduplicated_file(input_path, dedup_path):
     print(f"Erstelle deduplizierte Datei: {dedup_path}")
     duplicated = set()
     row_count = 0
+    ansi_re = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
     with open(dedup_path, "w", encoding="utf8") as f:
         with open(input_path, encoding="utf8") as g:
             header = g.readline()
@@ -175,18 +176,31 @@ def build_deduplicated_file(input_path, dedup_path):
             is_valid, msg = validate_header(input_path)
             if not is_valid:
                 raise ValueError(f"Input-Datei {input_path} hat ungültigen Header: {msg}")
-            f.write(header)
-            
+            # Entferne mögliche ANSI-Steuersequenzen aus dem Header beim Schreiben
+            clean_header = ansi_re.sub('', header).rstrip("\n")
+            f.write(clean_header + "\n")
+
             for row in g:
                 if not row.strip():
                     continue
-                temp = row.split("\t")
+
+                # Entferne ANSI-Escape-Sequenzen und Trim
+                clean_row = ansi_re.sub('', row).rstrip("\n")
+
+                # Überspringe wiederholte Header-Zeilen (z.B. beim Konkatenieren mehrerer Dateien)
+                cols = set([c.strip() for c in clean_row.split("\t") if c.strip()])
+                if EXPECTED_COLUMNS.issubset(cols):
+                    continue
+
+                temp = clean_row.split("\t")
                 if len(temp) < 2:
                     continue
                 key = (temp[0], temp[-1])
                 if key in duplicated:
                     continue
-                f.write(row)
+
+                # Schreibe die bereinigte Zeile mit Zeilenende
+                f.write(clean_row + "\n")
                 duplicated.add(key)
                 row_count += 1
     
@@ -221,6 +235,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Group and post-process activation text spans.")
     parser.add_argument("folder", help="Folder that contains full.tsv")
+    parser.add_argument("--output-path", help="Path for the generated TSV output. Defaults to ./<folder>.tsv.")
     parser.add_argument("--checkpoint-every", type=int, default=1000,
                         help="Write a checkpoint every N features.")
     parser.add_argument("--restart", action="store_true",
@@ -238,7 +253,7 @@ if __name__ == "__main__":
     print("Loading %d deduplicated records." % len(reader.df))
     file = os.path.split(folder)[-1]
 
-    output_path = os.path.join(".", "%s.tsv" % file.replace("textspans", "TopAct"))
+    output_path = args.output_path or os.path.join(".", "%s.tsv" % file.replace("textspans", "TopAct"))
     checkpoint_path = output_path + ".checkpoint.json"
 
     start_state = {"next_idx": 0, "activated": 0}

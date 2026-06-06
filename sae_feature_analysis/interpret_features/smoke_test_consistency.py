@@ -58,7 +58,7 @@ GEN_PROMPT = (
 )
  
 TARGET_FEATURE = 94
-EXPECTED_POS = 356
+EXPECTED_POS = 355
 EXPECTED_VAL = 1.0265
 EXPECTED_SEQLEN = 554
  
@@ -73,14 +73,18 @@ def main():
  
     model_map = {"mistral": "mistral-7b", "llama": "llama3-8b", "qwen": "qwen2.5-7b"}
  
-    # --- identische Lade-/Mount-Sequenz wie collect_spans.main() ---
+    # Load SAE
     name, layer, sae = load_pretrained(args.sae_path, device=args.device)
+
     print(f"[load_pretrained] name={name}  layer(aus Dateiname)={layer}")
+    
     if args.sae_layer is not None:
         print(f"[override] layer {layer} -> {args.sae_layer}")
         layer = args.sae_layer
  
     dtype = "float32" if args.device == "cpu" else "bfloat16"
+
+    # Initialized model
     generator = Generator(model_map[args.model_key], device=args.device, dtype=dtype)
     tokenizer = generator._tokenizer
  
@@ -139,6 +143,34 @@ def main():
             print(f"    token@argmax        = {tokens[argmax]!r}   (erwartet: 'Ġcases')")
     else:
         print(f"[3] actvs hat unerwartete Form {tuple(A.shape)} - kann #94 nicht lesen!")
+ 
+    print("=" * 60)
+    print("DIAGNOSE (Lokalisierung des #94-Problems)")
+    print("=" * 60)
+ 
+    # D1: Welche Features feuern an Position 356 ('cases') am staerksten?
+    #     -> sagt uns, in WELCHER Spalte der erwartete ~1.03-Wert wirklich sitzt.
+    if A.dim() == 2 and A.shape[0] > EXPECTED_POS:
+        row = A[EXPECTED_POS]
+        topv, topi = row.topk(8)
+        print(f"D1] Top-8 Features @ idx{EXPECTED_POS} ('{tokens[EXPECTED_POS]}'):")
+        for v, i in zip(topv.tolist(), topi.tolist()):
+            print(f"     feat {i:>6}  = {v:.4f}")
+ 
+    # D2: Sitzt der #94-Wert in einer NACHBARSPALTE? (0- vs 1-basiert / off-by-one)
+    print("D2] #94 +/- Nachbarspalten, max ueber Sequenz:")
+    for f in [TARGET_FEATURE - 1, TARGET_FEATURE, TARGET_FEATURE + 1]:
+        col = A[:, f]
+        am = int(col.argmax())
+        print(f"     feat {f:>5}: max={float(col.max()):.4f} @pos{am} ('{tokens[am]}')  "
+              f"nonzero={int((col > 0).sum())}")
+ 
+    # D3: Ist actvs ueberhaupt sparse (top-k) oder dense? -> nonzero pro Token
+    nz_per_tok = (A > 0).sum(dim=1).float()
+    print(f"D3] nonzero Features/Token: mean={nz_per_tok.mean():.1f} "
+          f"min={int(nz_per_tok.min())} max={int(nz_per_tok.max())}  "
+          f"(dense erwartet >> topk; topk-maskiert ~7)")
+    print(f"    sae.topk aktuell = {getattr(sae, 'topk', 'n/a')}")
  
     print("=" * 60)
     print("Interpretation:")

@@ -194,11 +194,13 @@ def activations(messages, model, sae, tokenizer, size=32):
     return {"Neurons": idx, "Spans": spans, "Scores": act}
 
 def collect_text_spans(corpus, sae, generator, tokenizer, model_name, subgroup, ttlgroup, max_collects):
+    
     sae.eval()
     sae.MaskTopK = False
     generator._model.eval()
     switch_mode(sae, "train")
     sae.early_stop = True
+    
     dataset_name = os.path.splitext(os.path.basename(args.data_path))[0]
     root = f"./xxx/threshold_{args.threshold}"
     os.makedirs(root, exist_ok=True)
