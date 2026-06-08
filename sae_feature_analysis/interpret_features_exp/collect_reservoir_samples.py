@@ -171,22 +171,25 @@ def compute_samples(messages, model, sae, tokenizer):
         active_mask = masked_actvs > 0
         active_pairs = tc.nonzero(active_mask, as_tuple=False)
 
+        n_tokens = int(token_mask.sum().item())
+
         if active_pairs.numel() == 0:
-            return active_pairs[:, 1].to("cpu"), tc.empty((0,), device="cpu", dtype=tc.float32)
+            return active_pairs[:, 1].to("cpu"), tc.empty((0,), device="cpu", dtype=tc.float32), n_tokens
 
         feature_ids = active_pairs[:, 1].to("cpu")
         values = masked_actvs[active_mask].detach().to(device="cpu", dtype=tc.float32)
-        return feature_ids, values
+        return feature_ids, values, n_tokens
     finally:
         sae.topk = original_topk
 
 
-def write_checkpoint(path, samplers, last_idx, completed, args, seed, processed_docs, rng_state):
+def write_checkpoint(path, samplers, last_idx, completed, args, seed, processed_docs, rng_state, total_tokens=0):
     payload = {
         "version": 3,
         "data_path": args.data_path,
         "last_idx": int(last_idx),
         "processed_docs": int(processed_docs),
+        "total_tokens": int(total_tokens),
         "max_samples": int(args.max_samples),
         "completed": bool(completed),
         "seed": int(seed),
@@ -253,12 +256,14 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed, sha
     if progress is None or args.resume == "never":
         samplers = {}
         start_idx = 0
+        total_tokens = 0
     else:
         samplers = {
             int(feature_id): ReservoirSampler.from_state(feature_state)
             for feature_id, feature_state in progress.get("feature_samplers", {}).items()
         }
         start_idx = max(0, int(progress.get("last_idx", -1)) + 1)
+        total_tokens = int(progress.get("total_tokens", 0))
         rng_state = progress.get("rng_state")
         if rng_state is not None:
             rng.setstate(rng_state)
@@ -273,6 +278,7 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed, sha
                 seed,
                 progress.get("processed_docs", 0),
                 rng.getstate(),
+                total_tokens,
             )
             return
 
@@ -306,7 +312,8 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed, sha
             print(f"[WARN] Empty message skipped at sample {idx}")
         else:
             try:
-                feature_ids, values = compute_samples(messages, generator, sae, tokenizer)
+                feature_ids, values, n_tokens = compute_samples(messages, generator, sae, tokenizer)
+                total_tokens += n_tokens
                 if feature_ids.numel() > 0:
                     for feature_id, value in zip(feature_ids.tolist(), values.tolist()):
                         sampler = get_sampler(samplers, int(feature_id), args.max_samples)
@@ -316,7 +323,7 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed, sha
 
         if processed_this_run % checkpoint_every == 0:
             processed_docs = last_idx + 1
-            write_checkpoint(progress_path, samplers, last_idx, False, args, seed, processed_docs, rng.getstate())
+            write_checkpoint(progress_path, samplers, last_idx, False, args, seed, processed_docs, rng.getstate(), total_tokens)
 
         if args.max_docs_per_run > 0 and processed_this_run >= args.max_docs_per_run:
             stopped_by_budget = True
@@ -324,8 +331,8 @@ def collect_reservoir_samples(corpus, sae, generator, tokenizer, args, seed, sha
 
     processed_docs = last_idx + 1 if last_idx >= 0 else 0
     completed = (not stopped_by_budget) and (last_idx >= total_rows - 1)
-    write_checkpoint(progress_path, samplers, last_idx, completed, args, seed, processed_docs, rng.getstate())
-    write_checkpoint(out_path, samplers, last_idx, completed, args, seed, processed_docs, rng.getstate())
+    write_checkpoint(progress_path, samplers, last_idx, completed, args, seed, processed_docs, rng.getstate(), total_tokens)
+    write_checkpoint(out_path, samplers, last_idx, completed, args, seed, processed_docs, rng.getstate(), total_tokens)
     if stopped_by_budget:
         print(
             f"[INFO] Run budget reached ({args.max_docs_per_run} docs). Checkpoint written; rerun to continue."
