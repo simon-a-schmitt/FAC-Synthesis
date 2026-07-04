@@ -215,6 +215,15 @@ feature_annotation_data/fineweb_edu/fineweb_edu_sample.txt
 
 fac_test_pipeline/results.jsonl
 fac_test_pipeline/results_non_zero_latent.jsonl
+
+fac_test_pipeline/html_output
+fac_test_pipeline/input
+fac_test_pipeline/output
+
+
 sae_feature_analysis/interpret_features/xxx
+sae_feature_analysis/interpret_features_exp/xxx
+
+
 
 models--mistralai--Mistral-7B-Instruct-v0.2
