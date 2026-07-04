@@ -11,7 +11,7 @@ if str(ROOT_DIR) not in sys.path:
 from benchmark_play_ground.model_wrapper import LocalModel
 
 
-MODEL_PATH = Path("/pfs/work9/workspace/scratch/ka_ukhtw-master_thesis_experiment/models/llama-3.1-8b")
+MODEL_PATH = Path("/pfs/work9/workspace/scratch/ka_ai3967-master_thesis_exp/models/llama-3.1-70b")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = "bfloat16"
@@ -101,12 +101,16 @@ def generate_response(task_prompt: str, max_new_tokens: int, temperature: float)
 
 
 def main() -> None:
+    print(TASK_PROMPT, flush=True)
+    print("Loading model...", flush=True)
     response = generate_response(
         task_prompt=TASK_PROMPT,
-        max_new_tokens=100000,
+        max_new_tokens=512,
         temperature=0.5,
     )
-    print(response)
+    print("=== RESPONSE ===", flush=True)
+    print(response, flush=True)
+    print("=== DONE ===", flush=True)
 
 
 if __name__ == "__main__":
