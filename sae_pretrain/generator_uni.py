@@ -55,8 +55,8 @@ class UnifiedGenerator:
 
     @tc.no_grad()
     def build_model(self):
-        print(f"Initializing model: {self._name}")
-        print(f"Using device: {self._device}")
+        print(f"Initializing model: {self._name}", flush=True)
+        print(f"Using device: {self._device}", flush=True)
         maps = "cpu" if self._device == "cpu" else "auto"
 
         if self._strict_local_paths and not os.path.isdir(self._name):
@@ -86,7 +86,7 @@ class UnifiedGenerator:
 
         self._tokenizer = tok
         self._model = model
-        print(f"Loaded {self._family.upper()} model successfully.")
+        print(f"Loaded {self._family.upper()} model successfully.", flush=True)
 
     def build_messages(
         self,
@@ -161,6 +161,10 @@ class UnifiedGenerator:
         kwrds.setdefault("do_sample", True)
         kwrds.setdefault("temperature", 0.7)
         kwrds.setdefault("top_p", 0.9)
+
+        # None values override transformers' defaults (e.g. use_cache=None disables KV cache),
+        # causing attention mask / KV cache size mismatches during generation.
+        kwrds = {k: v for k, v in kwrds.items() if v is not None}
 
         outputs = self._model.generate(
             input_ids=input_ids,
