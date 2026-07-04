@@ -651,6 +651,16 @@ def _html_escape(text: str) -> str:
     )
 
 
+def _json_for_script(obj, **kwargs) -> str:
+    """JSON-encode obj for safe embedding inside an HTML <script> block.
+
+    Escapes '</' to '<\\/' so the browser's HTML parser cannot see '</script>'
+    (or any other closing tag) inside a string literal and prematurely close
+    the script block.  '<\\/' is valid JSON per RFC 8259 §7.
+    """
+    return json.dumps(obj, **kwargs).replace("</", "<\\/")
+
+
 def generate_heatmap_html(
     record: Dict[str, Any],
     output_path: str,
@@ -729,15 +739,15 @@ def generate_heatmap_html(
         "__SPARSE__": str(sparsity_pct),
         "__ACTIVE__": str(active_tokens),
         "__PROMPT_HTML__": _html_escape(prompt_preview),
-        "__TOKENS__": json.dumps(tokens, ensure_ascii=False),
-        "__FEATS__": json.dumps(rel_feats),
-        "__MATRIX__": json.dumps(rounded),
-        "__MAXVAL__": json.dumps(max_val if max_val > 0 else 1.0),
+        "__TOKENS__": _json_for_script(tokens, ensure_ascii=False),
+        "__FEATS__": _json_for_script(rel_feats),
+        "__MATRIX__": _json_for_script(rounded),
+        "__MAXVAL__": _json_for_script(max_val if max_val > 0 else 1.0),
         "__TOPK__": str(top_k),
         "__NORM_NOTE__": norm_note,
-        "__FEAT_DESCS__": json.dumps(feat_descs_json, ensure_ascii=False),
+        "__FEAT_DESCS__": _json_for_script(feat_descs_json, ensure_ascii=False),
         "__EXCLUDED_NOTE__": excluded_note,
-        "__LOG_ODDS_SE__": json.dumps(log_odds_se_json),
+        "__LOG_ODDS_SE__": _json_for_script(log_odds_se_json),
     }
 
     html = _HTML_TEMPLATE
