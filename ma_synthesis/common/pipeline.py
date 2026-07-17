@@ -38,6 +38,49 @@ def _render_template(template: str, **values: str) -> str:
     return rendered
 
 
+HOLDING_TAG_RE = re.compile(r"<\s*/?\s*holdings?\s*>", re.IGNORECASE)
+HOLDING_TAG_CANONICAL = "<HOLDING>"
+_HOLDING_PAREN_RE = re.compile(r"(\(\s*)?" + re.escape(HOLDING_TAG_CANONICAL) + r"(\s*\))?")
+
+
+def _ensure_parens_around_holding(match: re.Match) -> str:
+    has_open = match.group(1) is not None
+    has_close = match.group(2) is not None
+    if has_open == has_close:
+        # both sides already present, or both absent -> (re)wrap cleanly
+        return f"({HOLDING_TAG_CANONICAL})"
+    # only one side present -> ambiguous, leave untouched rather than guess
+    return match.group(0)
+
+
+def parse_step1_context(text: str) -> tuple[str, bool]:
+    """Post-process a raw step-1 context before it enters steps 2-4.
+
+    Strips a trailing '...' the model may have used to truncate the context,
+    normalizes any holding-tag variant (e.g. '<holding>', '</Holding>') to
+    the canonical '<HOLDING>' form, and ensures it is wrapped in parentheses
+    (inserting them when the tag is bare). Returns (parsed_text, accept),
+    where accept is False if no holding tag is present anywhere in the
+    text — such a context has no place to insert a holding and must be
+    rejected.
+    """
+    stripped = text.rstrip()
+    if stripped.endswith("..."):
+        stripped = stripped[:-3].rstrip()
+
+    accept = bool(HOLDING_TAG_RE.search(stripped))
+    normalized = HOLDING_TAG_RE.sub(HOLDING_TAG_CANONICAL, stripped)
+    parsed = _HOLDING_PAREN_RE.sub(_ensure_parens_around_holding, normalized)
+
+    return parsed, accept
+
+
+def _lowercase_start(text: str) -> str:
+    if not text:
+        return text
+    return text[0].lower() + text[1:]
+
+
 def _generate(
     model: LocalModel,
     prompt: str,
@@ -87,7 +130,6 @@ def run_pipeline(model: LocalModel, step1_output: str) -> dict:
         TARGET_REFERENCE=TARGET_REFERENCE
     )
 
-    print(step2_prompt)
 
     step2_output = _generate(
         model, step2_prompt, STEP_2_MAX_NEW_TOKENS, STEP_2_TEMPERATURE
@@ -103,7 +145,6 @@ def run_pipeline(model: LocalModel, step1_output: str) -> dict:
         DISTRACTOR_INSTRUCTION=DISTRACTOR_INSTRUCTION
     )
 
-    print(step3_prompt)
 
     step3_output = _generate(
         model, step3_prompt, STEP_3_MAX_NEW_TOKENS, STEP_3_TEMPERATURE
@@ -113,10 +154,13 @@ def run_pipeline(model: LocalModel, step1_output: str) -> dict:
     # --- Step 4: deterministic assembly ---
     distractors = _parse_distractors(step3_output)
 
-    options = [step2_output] + distractors  # index 0 is always the correct one before shuffle
+    correct_option = _lowercase_start(step2_output)
+    distractor_options = [_lowercase_start(d) for d in distractors]
+
+    options = [correct_option] + distractor_options  # index 0 is always the correct one before shuffle
     random.shuffle(options)
 
-    correct_letter = chr(ord("A") + options.index(step2_output))
+    correct_letter = chr(ord("A") + options.index(correct_option))
 
     labeled_options = " ".join(
         f"{chr(ord('A') + i)}. {opt}" for i, opt in enumerate(options)

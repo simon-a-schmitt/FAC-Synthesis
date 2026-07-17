@@ -24,7 +24,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from benchmark_play_ground.model_wrapper import LocalModel
 from ma_synthesis.blackbox.step1 import run_step1 as blackbox_step1
-from ma_synthesis.common.pipeline import run_pipeline
+from ma_synthesis.common.pipeline import parse_step1_context, run_pipeline
 from ma_synthesis.feature_guided.step1 import run_step1 as feature_guided_step1
 
 
@@ -98,6 +98,9 @@ def main() -> None:
         if not seeds:
             print("[ERROR] Seed file is empty or could not be parsed.", flush=True)
             sys.exit(1)
+        if len(seeds) < 2:
+            print("[ERROR] Blackbox path needs at least 2 seeds to sample from.", flush=True)
+            sys.exit(1)
         print(f"[INFO] Loaded {len(seeds)} seeds from {seeds_path}", flush=True)
 
     features: list[dict] = []
@@ -120,17 +123,18 @@ def main() -> None:
     print("[INFO] Model loaded.", flush=True)
 
     with open(out_path, "a", encoding="utf-8") as out_f:
-        for i in range(args.n):
-            print(f"\n[INFO] === Sample {i + 1}/{args.n} ===", flush=True)
+        accepted = 0
+        attempt = 0
+        while accepted < args.n:
+            attempt += 1
+            print(f"\n[INFO] === Attempt {attempt} (accepted {accepted}/{args.n}) ===", flush=True)
 
             # --- Step 1 (path-specific) ---
             if args.path == "blackbox":
-                seed = seeds[i % len(seeds)]
-                seed_context = seed["prompt"]
-                step1_output = blackbox_step1(model, seed_context=seed_context)
-                meta = {"path": "blackbox", "seed_index": i % len(seeds)}
+                step1_output, step1_meta = blackbox_step1(model, seeds=seeds)
+                meta = {"path": "blackbox", **step1_meta}
             else:
-                feature = features[i % len(features)]
+                feature = features[(attempt - 1) % len(features)]
                 feature_description = feature.get("description", "")
                 feature_text_spans = feature.get("text_spans", "")
                 step1_output = feature_guided_step1(
@@ -145,23 +149,31 @@ def main() -> None:
 
             print(f"[Step 1 output]\n{step1_output}\n", flush=True)
 
+            # --- Parse/validate step 1 context ---
+            step1_output, accept = parse_step1_context(step1_output)
+            if not accept:
+                reject_record = {**meta, "accept": False}
+                out_f.write(json.dumps(reject_record, ensure_ascii=False) + "\n")
+                out_f.flush()
+                print("[INFO] Rejected: no holding tag found.", flush=True)
+                continue
+
             # --- Steps 2–4 (common pipeline) ---
             outputs = run_pipeline(model, step1_output)
 
             record = {
                 **meta,
-                "sample_index": i,
-                "step_1": outputs["step_1"],
-                "step_2": outputs["step_2"],
-                "step_3": outputs["step_3"],
+                "sample_index": accepted,
                 "final_question": outputs["final_question"],
                 "final_label": outputs["final_label"],
+                "accept": True,
             }
             out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
             out_f.flush()
-            print(f"[INFO] Sample {i + 1} written to {out_path}", flush=True)
+            accepted += 1
+            print(f"[INFO] Sample {accepted}/{args.n} accepted and written to {out_path}", flush=True)
 
-    print(f"\n[INFO] Done. {args.n} samples written to {out_path}", flush=True)
+    print(f"\n[INFO] Done. {args.n} accepted samples written to {out_path}", flush=True)
 
 
 if __name__ == "__main__":

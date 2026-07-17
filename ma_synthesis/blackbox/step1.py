@@ -1,3 +1,5 @@
+import os
+import random
 import sys
 from pathlib import Path
 
@@ -7,14 +9,26 @@ if str(ROOT_DIR) not in sys.path:
 
 from benchmark_play_ground.model_wrapper import LocalModel
 from ma_synthesis.blackbox.prompt_step1 import STEP_1_PROMPT_TEMPLATE
-from ma_synthesis.common.prompt_variables import SYSTEM_PROMPT, TASK_DESCRIPTION, ADDITIONAL_INSTRUCTIONS
+from ma_synthesis.common.prompt_variables import (
+    SYSTEM_PROMPT,
+    TASK_DESCRIPTION,
+    STRUCTURAL_SIGNATURE,
+    OPERATORS,
+)
 
 
-STEP_1_MAX_NEW_TOKENS = 2048
-STEP_1_TEMPERATURE = 1.0
+STEP_1_MAX_NEW_TOKENS = 300
+STEP_1_TEMPERATURE = 0.9
 STEP_1_TOP_P = 0.9
+STEP_1_NO_REPEAT_NGRAM_SIZE = 3
+STEP_1_REPETITION_PENALTY = 1.1
 
-
+# `benchmark_play_ground.model_wrapper` pulls in `sae_pretrain.generator_uni`,
+# which calls `transformers.set_seed(42)` at import time, fixing the global
+# `random` module to the same sequence on every process start. Use a private
+# RNG seeded from OS entropy so seed/operator sampling actually varies across
+# separate script invocations.
+_rng = random.Random(os.urandom(16))
 
 
 def _render_template(template: str, **values: str) -> str:
@@ -24,21 +38,49 @@ def _render_template(template: str, **values: str) -> str:
     return rendered
 
 
-def run_step1(model: LocalModel, seed_context: str) -> str:
+def _sample_operator() -> tuple[str, dict]:
+    names = list(OPERATORS.keys())
+    weights = [OPERATORS[name]["weight"] for name in names]
+    name = _rng.choices(names, weights=weights, k=1)[0]
+    return name, OPERATORS[name]
+
+
+def run_step1(model: LocalModel, seeds: list[dict]) -> tuple[str, dict]:
+    """Run step 1 of the blackbox path.
+
+    Draws two distinct seed examples and one transformation operator
+    (weighted by OPERATORS[...]["weight"]) at random, renders the prompt
+    template, and generates the new context. Returns the generated text
+    together with the sampling metadata (seed indices, operator name) so
+    the caller can log it.
+    """
+    seed_index_1, seed_index_2 = _rng.sample(range(len(seeds)), 2)
+    operator_name, operator = _sample_operator()
+
     prompt = _render_template(
         STEP_1_PROMPT_TEMPLATE,
         TASK_DESCRIPTION=TASK_DESCRIPTION,
-        SEED_CONTEXT=seed_context,
-        ADDITIONAL_INSTRUCTIONS=ADDITIONAL_INSTRUCTIONS,
+        TRANSFORMATION_OPERATOR=operator["description"],
+        SEED_EXAMPLE_1=seeds[seed_index_1]["prompt"],
+        SEED_EXAMPLE_2=seeds[seed_index_2]["prompt"],
+        STRUCTURAL_SIGNATURE=STRUCTURAL_SIGNATURE,
     )
 
-    print(prompt) 
-    
-    return model.generate(
+
+    output = model.generate(
         prompt=prompt,
         max_new_tokens=STEP_1_MAX_NEW_TOKENS,
         do_sample=True,
         temperature=STEP_1_TEMPERATURE,
         top_p=STEP_1_TOP_P,
+        no_repeat_ngram_size=STEP_1_NO_REPEAT_NGRAM_SIZE,
+        repetition_penalty=STEP_1_REPETITION_PENALTY,
         system=SYSTEM_PROMPT,
     ).strip()
+
+    meta = {
+        "seed_index_1": seed_index_1,
+        "seed_index_2": seed_index_2,
+        "transformation_operator": operator_name,
+    }
+    return output, meta
