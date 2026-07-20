@@ -29,6 +29,7 @@ class UnifiedGenerator:
         cache_dir: str = None,
         local_files_only: bool = False,
         strict_local_paths: bool = False,
+        lora_path: Optional[str] = None,
     ):
         self._name = model_name
         # Intelligenter Fallback: Wenn CUDA angefordert aber nicht verfügbar, nutze CPU
@@ -41,6 +42,7 @@ class UnifiedGenerator:
         self._cache_dir = cache_dir if cache_dir else CACHE_DIR
         self._local_files_only = local_files_only
         self._strict_local_paths = strict_local_paths
+        self._lora_path = lora_path
         self.build_model()
 
     def detect_family(self, model_name: str) -> str:
@@ -81,6 +83,14 @@ class UnifiedGenerator:
             device_map=maps,
             local_files_only=self._local_files_only,
         )
+
+        if self._lora_path:
+            from peft import PeftModel
+
+            print(f"Loading LoRA adapter from: {self._lora_path}", flush=True)
+            model = PeftModel.from_pretrained(model, self._lora_path)
+            model = model.merge_and_unload()
+
         model.config.pad_token_id = tok.pad_token_id
         model.eval()
 
@@ -126,14 +136,13 @@ class UnifiedGenerator:
             add_generation_prompt=True,
             return_tensors="pt",
         )
-        # Handle both dict and tensor returns from apply_chat_template
-        if isinstance(enc, dict):
-            input_ids = enc["input_ids"]
-            attention_mask = enc.get("attention_mask")
-        else:
-            # enc is a tensor directly
+        # Handle both dict-like (dict / BatchEncoding) and tensor returns from apply_chat_template
+        if isinstance(enc, tc.Tensor):
             input_ids = enc
             attention_mask = None
+        else:
+            input_ids = enc["input_ids"]
+            attention_mask = enc.get("attention_mask")
 
         # ensure batch dimension: some tokenizers return shape (seq_len,) for single example
         if input_ids.dim() == 1:
@@ -195,16 +204,15 @@ class UnifiedGenerator:
                 add_generation_prompt=add_generation_prompt,
                 return_tensors="pt",
             )
-            # Handle both dict and tensor returns from apply_chat_template
-            if isinstance(enc, dict):
+            # Handle both dict-like (dict / BatchEncoding) and tensor returns from apply_chat_template
+            if isinstance(enc, tc.Tensor):
+                input_ids = enc.to(self._device)
+                attention_mask = None
+            else:
                 input_ids = enc["input_ids"].to(self._device)
                 attention_mask = enc.get("attention_mask")
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(self._device)
-            else:
-                # enc is a tensor directly
-                input_ids = enc.to(self._device)
-                attention_mask = None
         else:
             input_ids = tc.tensor([text_or_ids[:512]], device=self._device)
 
