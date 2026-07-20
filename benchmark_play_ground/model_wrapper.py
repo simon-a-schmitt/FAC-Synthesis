@@ -14,12 +14,13 @@ from sae_pretrain.generator_uni import UnifiedGenerator
 
 
 class LocalModel:
-    def __init__(self, model_path: str, device: str = "cuda", dtype: str = "bfloat16", local_files_only: bool = True, strict_local_paths: bool = True):
+    def __init__(self, model_path: str, device: str = "cuda", dtype: str = "bfloat16", local_files_only: bool = True, strict_local_paths: bool = True, lora_path: Optional[str] = None):
         self.model_path = model_path
         self.device = device
         self.dtype = dtype
         self.local_files_only = local_files_only
         self.strict_local_paths = strict_local_paths
+        self.lora_path = lora_path
         self._gen = None
 
     def load(self):
@@ -29,6 +30,7 @@ class LocalModel:
             dtype=self.dtype,
             local_files_only=self.local_files_only,
             strict_local_paths=self.strict_local_paths,
+            lora_path=self.lora_path,
         )
 
     def generate(
