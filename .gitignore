@@ -227,3 +227,6 @@ sae_feature_analysis/interpret_features_exp/xxx
 
 
 models--mistralai--Mistral-7B-Instruct-v0.2
+
+
+fine_tuning/casehold_gold_*
