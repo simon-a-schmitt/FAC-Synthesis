@@ -45,7 +45,8 @@ class LocalModel:
         max_input_tokens: Optional[int] = None,
         use_cache: Optional[bool] = None,
         system: Optional[str] = None,
-    ) -> str:
+        return_usage: bool = False,
+    ):
         if self._gen is None:
             self.load()
         gen = self._gen
@@ -62,6 +63,7 @@ class LocalModel:
                 repetition_penalty=repetition_penalty,
                 max_input_tokens=max_input_tokens,
                 use_cache=use_cache,
+                return_usage=return_usage,
             )
 
         return gen.generate(
@@ -75,4 +77,5 @@ class LocalModel:
             max_input_tokens=max_input_tokens,
             use_cache=use_cache,
             system=system,
+            return_usage=return_usage,
         )
