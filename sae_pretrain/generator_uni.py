@@ -121,8 +121,9 @@ class UnifiedGenerator:
         system: str = None,
         history: List[Dict[str, str]] = None,
         max_input_tokens: Optional[int] = None,
+        return_usage: bool = False,
         **kwrds,
-    ) -> str:
+    ) -> Union[str, tuple]:
         if isinstance(user_or_messages, str):
             messages = self.build_messages(
                 user_text=user_or_messages, system_text=system, history=history
@@ -182,7 +183,14 @@ class UnifiedGenerator:
         )
 
         gen_tokens = outputs[:, input_ids.shape[1]:]
-        return self._tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)[0]
+        text = self._tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)[0]
+        if not return_usage:
+            return text
+        usage = {
+            "input_tokens": int(input_ids.shape[1]),
+            "output_tokens": int(gen_tokens.shape[1]),
+        }
+        return text, usage
 
     def get_activates(
         self,
