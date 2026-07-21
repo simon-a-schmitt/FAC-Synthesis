@@ -1,0 +1,16 @@
+{
+  "n_prompts": 5,
+  "n_features": 2189,
+  "stats": [
+    "activation_density",
+    "peak_magnitude",
+    "log_odds"
+  ],
+  "fill_value": "NaN (feature not active on that prompt)",
+  "prompts_json": "/pfs/work9/workspace/scratch/ka_ai3967-master_thesis_exp/code/FAC-Synthesis/fac_test_pipeline/input/prompts_seed_casehold.json",
+  "baseline_tsv": "/pfs/work9/workspace/scratch/ka_ai3967-master_thesis_exp/code/FAC-Synthesis/fac_test_pipeline/feature_activation_baseline_agg.tsv",
+  "sae_ckpt_path": "/pfs/work9/workspace/scratch/ka_ai3967-master_thesis_exp/models/sae_llama_l16/TopK7_l16_h4096_epoch3.pth",
+  "layer": 16,
+  "max_mean_density": 0.5,
+  "min_max_peak": 0.3
+}
