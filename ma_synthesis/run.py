@@ -13,6 +13,7 @@ Usage examples:
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -26,9 +27,10 @@ from benchmark_play_ground.model_wrapper import LocalModel
 from ma_synthesis.blackbox.step1 import run_step1 as blackbox_step1
 from ma_synthesis.common.pipeline import parse_step1_context, run_pipeline
 from ma_synthesis.feature_guided.step1 import run_step1 as feature_guided_step1
+from ma_synthesis.log_token_usage import update_token_log
 
 
-MODEL_PATH = Path(
+MODEL_PATH_DEFAULT = Path(
     "/pfs/work9/workspace/scratch/ka_ai3967-master_thesis_exp/models/llama-3.1-70b"
 )
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -85,6 +87,22 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="(feature_guided only) Path to JSONL file with SAE feature data",
     )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=str(MODEL_PATH_DEFAULT),
+        help="Path to the local model directory (e.g. $WS_PATH/models/llama-3.1-70b)",
+    )
+    parser.add_argument(
+        "--token-log",
+        type=str,
+        default=None,
+        help=(
+            "Path to the token-usage log file, accumulated across job submissions "
+            "and keyed by --path/step. Defaults to token_usage_log.json in "
+            "$SLURM_SUBMIT_DIR (or the current directory outside SLURM)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -117,8 +135,13 @@ def main() -> None:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"[INFO] Loading model from {MODEL_PATH} ...", flush=True)
-    model = LocalModel(model_path=str(MODEL_PATH), device=DEVICE, dtype=DTYPE)
+    if args.token_log:
+        token_log_path = Path(args.token_log)
+    else:
+        token_log_path = Path(os.environ.get("SLURM_SUBMIT_DIR", Path.cwd())) / "token_usage_log.json"
+
+    print(f"[INFO] Loading model from {args.model_path} ...", flush=True)
+    model = LocalModel(model_path=args.model_path, device=DEVICE, dtype=DTYPE)
     model.load()
     print("[INFO] Model loaded.", flush=True)
 
@@ -131,13 +154,13 @@ def main() -> None:
 
             # --- Step 1 (path-specific) ---
             if args.path == "blackbox":
-                step1_output, step1_meta = blackbox_step1(model, seeds=seeds)
+                step1_output, step1_meta, step1_usage = blackbox_step1(model, seeds=seeds)
                 meta = {"path": "blackbox", **step1_meta}
             else:
                 feature = features[(attempt - 1) % len(features)]
                 feature_description = feature.get("description", "")
                 feature_text_spans = feature.get("text_spans", "")
-                step1_output = feature_guided_step1(
+                step1_output, step1_usage = feature_guided_step1(
                     model,
                     feature_description=feature_description,
                     feature_text_spans=feature_text_spans,
@@ -146,6 +169,11 @@ def main() -> None:
                     "path": "feature_guided",
                     "feature_id": feature.get("feature_id"),
                 }
+
+            update_token_log(
+                token_log_path, args.path, "step_1",
+                step1_usage["input_tokens"], step1_usage["output_tokens"],
+            )
 
             print(f"[Step 1 output]\n{step1_output}\n", flush=True)
 
@@ -160,6 +188,12 @@ def main() -> None:
 
             # --- Steps 2–4 (common pipeline) ---
             outputs = run_pipeline(model, step1_output)
+
+            for step_name, usage in outputs["token_usage"].items():
+                update_token_log(
+                    token_log_path, args.path, step_name,
+                    usage["input_tokens"], usage["output_tokens"],
+                )
 
             record = {
                 **meta,

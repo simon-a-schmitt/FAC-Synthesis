@@ -86,14 +86,16 @@ def _generate(
     prompt: str,
     max_new_tokens: int,
     temperature: float,
-) -> str:
-    return model.generate(
+) -> tuple[str, dict]:
+    output, usage = model.generate(
         prompt=prompt,
         max_new_tokens=max_new_tokens,
         do_sample=temperature > 0,
         temperature=temperature,
         system=SYSTEM_PROMPT,
-    ).strip()
+        return_usage=True,
+    )
+    return output.strip(), usage
 
 
 def _parse_distractors(raw: str) -> list[str]:
@@ -131,7 +133,7 @@ def run_pipeline(model: LocalModel, step1_output: str) -> dict:
     )
 
 
-    step2_output = _generate(
+    step2_output, step2_usage = _generate(
         model, step2_prompt, STEP_2_MAX_NEW_TOKENS, STEP_2_TEMPERATURE
     )
     outputs["step_2"] = step2_output
@@ -146,7 +148,7 @@ def run_pipeline(model: LocalModel, step1_output: str) -> dict:
     )
 
 
-    step3_output = _generate(
+    step3_output, step3_usage = _generate(
         model, step3_prompt, STEP_3_MAX_NEW_TOKENS, STEP_3_TEMPERATURE
     )
     outputs["step_3"] = step3_output
@@ -170,6 +172,7 @@ def run_pipeline(model: LocalModel, step1_output: str) -> dict:
     outputs["step_4_options"] = options
     outputs["final_question"] = final_question
     outputs["final_label"] = correct_letter
+    outputs["token_usage"] = {"step_2": step2_usage, "step_3": step3_usage}
 
     print("\n" + "=" * 60, flush=True)
     print("[Step 4 — Final Question]", flush=True)

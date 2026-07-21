@@ -51,7 +51,7 @@ def run_step1(
     model: LocalModel,
     feature_description: str,
     feature_text_spans: str,
-) -> str:
+) -> tuple[str, dict]:
     prompt = _render_template(
         STEP_1_PROMPT_TEMPLATE,
         TASK_BESCHREIBUNG=TASK_BESCHREIBUNG,
@@ -60,10 +60,12 @@ def run_step1(
         TASK_BEISPIEL=f"Prompt:\n{TASK_BEISPIEL_PROMPT}",
         WEITERE_ANWEISUNG=WEITERE_ANWEISUNG,
     )
-    return model.generate(
+    output, usage = model.generate(
         prompt=prompt,
         max_new_tokens=STEP_1_MAX_NEW_TOKENS,
         do_sample=STEP_1_TEMPERATURE > 0,
         temperature=STEP_1_TEMPERATURE,
         system=SYSTEM_PROMPT,
-    ).strip()
+        return_usage=True,
+    )
+    return output.strip(), usage

@@ -45,13 +45,14 @@ def _sample_operator() -> tuple[str, dict]:
     return name, OPERATORS[name]
 
 
-def run_step1(model: LocalModel, seeds: list[dict]) -> tuple[str, dict]:
+def run_step1(model: LocalModel, seeds: list[dict]) -> tuple[str, dict, dict]:
     """Run step 1 of the blackbox path.
 
     Draws two distinct seed examples and one transformation operator
     (weighted by OPERATORS[...]["weight"]) at random, renders the prompt
-    template, and generates the new context. Returns the generated text
-    together with the sampling metadata (seed indices, operator name) so
+    template, and generates the new context. Returns the generated text,
+    the sampling metadata (seed indices, operator name), and the token
+    usage ({"input_tokens", "output_tokens"}) for this generation call so
     the caller can log it.
     """
     seed_index_1, seed_index_2 = _rng.sample(range(len(seeds)), 2)
@@ -67,7 +68,7 @@ def run_step1(model: LocalModel, seeds: list[dict]) -> tuple[str, dict]:
     )
 
 
-    output = model.generate(
+    output, usage = model.generate(
         prompt=prompt,
         max_new_tokens=STEP_1_MAX_NEW_TOKENS,
         do_sample=True,
@@ -76,11 +77,13 @@ def run_step1(model: LocalModel, seeds: list[dict]) -> tuple[str, dict]:
         no_repeat_ngram_size=STEP_1_NO_REPEAT_NGRAM_SIZE,
         repetition_penalty=STEP_1_REPETITION_PENALTY,
         system=SYSTEM_PROMPT,
-    ).strip()
+        return_usage=True,
+    )
+    output = output.strip()
 
     meta = {
         "seed_index_1": seed_index_1,
         "seed_index_2": seed_index_2,
         "transformation_operator": operator_name,
     }
-    return output, meta
+    return output, meta, usage
