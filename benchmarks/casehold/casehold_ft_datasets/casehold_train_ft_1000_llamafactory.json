@@ -1,10 +1,5 @@
 [
   {
-    "instruction": "prompt",
-    "input": "",
-    "output": "gt holding label"
-  },
-  {
     "instruction": "Identify the single correct legal holding statement from options A-E to fill the <HOLDING> placeholder in the citation and output only the corresponding letter. plaintiff has not adequately alleged a conspiracy, nor has plaintiff put forth evidence to create a genuine issue of material fact that a conspiracy existed. In fact, plaintiff has failed to identify the purported members of the conspiracy. Plaintiff cannot simply make a conclusory allegation that a conspiracy existed; rather, plaintiff must provide facts showing agreement and concerted action. Sooner Prods. Co. v. McBride, 708 F.2d 510, 512 (10th Cir.1983). In this case, plaintiffs allegation of a conspiracy, without more, is insufficient to state a claim for conspiracy. Plaintiff has failed to allege any facts tending to show agreement or concerted action. The court finds that plaintiffs § 1985(3) claim fails as a maicer of law. Clulow v. Oklahoma, 700 F.2d 1291, 1303 (10th Cir.1983) (<HOLDING>). D. Municipal Liability Plaintiff also alleges A. holding that conclusory allegation of conspiracy without supporting factual averments insufficient to state claim B. holding that conclusory allegations without supporting factual averments are insufficient to state a claim on which relief can be based citations omitted C. holding that vague conclusory statements are insufficient D. holding conclusory assertions of intent to cause insufficient without supporting facts E. holding that allegations against nondiverse defendants must be factual not conclusory because conclusory allegations do not state a claim",
     "input": "",
     "output": "A"
