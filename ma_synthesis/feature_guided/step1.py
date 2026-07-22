@@ -7,36 +7,17 @@ if str(ROOT_DIR) not in sys.path:
 
 from benchmark_play_ground.model_wrapper import LocalModel
 from ma_synthesis.feature_guided.prompt_step1 import STEP_1_PROMPT_TEMPLATE
-from ma_synthesis.common.prompt_variables import SYSTEM_PROMPT
+from ma_synthesis.common.prompt_variables import SYSTEM_PROMPT, TASK_DESCRIPTION
 
 
-STEP_1_MAX_NEW_TOKENS = 2048
-STEP_1_TEMPERATURE = 0.5
+STEP_1_MAX_NEW_TOKENS = 300
+STEP_1_TEMPERATURE = 0.9
+STEP_1_TOP_P = 0.9
+STEP_1_NO_REPEAT_NGRAM_SIZE = 3
+STEP_1_REPETITION_PENALTY = 1.1
 
-TASK_BESCHREIBUNG = (
-    "Die Aufgabe besteht darin, einen realistischen Textausschnitt aus einer"
-    " US-Gerichtsentscheidung (einen sogenannten \"citing context\") zu generieren."
-    " Dieser Text beschreibt einen rechtlichen Sachverhalt oder die Argumentation eines"
-    " Gerichts. Der Text muss an einer strategischen Stelle abbrechen – genau dort, wo"
-    " ein verbindlicher rechtlicher Leitsatz (eine \"Holding\") eines anderen Falls"
-    " zitiert wird."
-)
-
-TASK_BEISPIEL_PROMPT = (
-    "was unable to establish a foundation for his federal claims because he could not"
-    " demonstrate Officer Ahlm's conduct violated a constitutional right. See Grubbs v."
-    " Bailes, 445 F.3d 1275, 1278 (10th Cir.2006). The conclusion was threefold. First,"
-    " Mr. Titus's malicious prosecution claim failed because \"Officer Ahlm possessed"
-    " probable cause to believe that Mr. Titus had been operating his vehicle while"
-    " intoxicated to the slightest degree,\" even after determining Mr. Titus had only a"
-    " .02% breath alcohol concentration (BAC). Aplt. App. at 131. Second, Mr. Titus's"
-    " retaliatory prosecution claim failed because Mr. Titus did not plead and prove the"
-    " absence of probable cause for charging him with DWI. See id. at 137; Hartman v."
-    " Moore, 547 U.S. 250, 265-66, 126 S.Ct. 1695, 164 L.Ed.2d 441 (2006) (<HOLDING>)"
-)
-
-WEITERE_ANWEISUNG = (
-    "Fuege an der Stelle im Text, an der das Holding stehen muss, das Tag (<HOLDING>) ein."
+STRUCTURAL_REQUIREMENTS = (
+    "The context must end with a citation to a specific court decision in standard reporter format (the case may be invented), immediately followed by the placeholder in parentheses: (<HOLDING>). The placeholder stands for the cited case's holding, never for the case name or citation itself."
 )
 
 
@@ -47,24 +28,32 @@ def _render_template(template: str, **values: str) -> str:
     return rendered
 
 
+def _format_style_directives(style_directives: list[str]) -> str:
+    if not style_directives:
+        return "(none)"
+    return "\n".join(f"- {directive}" for directive in style_directives)
+
+
 def run_step1(
     model: LocalModel,
-    feature_description: str,
-    feature_text_spans: str,
+    content_abstract: str,
+    style_directives: list[str],
 ) -> tuple[str, dict]:
     prompt = _render_template(
         STEP_1_PROMPT_TEMPLATE,
-        TASK_BESCHREIBUNG=TASK_BESCHREIBUNG,
-        FEATURE_BESCHREIBUNG=feature_description,
-        TEXT_SPANS=feature_text_spans,
-        TASK_BEISPIEL=f"Prompt:\n{TASK_BEISPIEL_PROMPT}",
-        WEITERE_ANWEISUNG=WEITERE_ANWEISUNG,
+        TASK_BESCHREIBUNG=TASK_DESCRIPTION,
+        CONTENT_ABSTRACT=content_abstract,
+        STYLE_DIRECTIVES=_format_style_directives(style_directives),
+        STRUCTURAL_REQUIREMENTS=STRUCTURAL_REQUIREMENTS,
     )
     output, usage = model.generate(
         prompt=prompt,
         max_new_tokens=STEP_1_MAX_NEW_TOKENS,
-        do_sample=STEP_1_TEMPERATURE > 0,
+        do_sample=True,
         temperature=STEP_1_TEMPERATURE,
+        top_p=STEP_1_TOP_P,
+        no_repeat_ngram_size=STEP_1_NO_REPEAT_NGRAM_SIZE,
+        repetition_penalty=STEP_1_REPETITION_PENALTY,
         system=SYSTEM_PROMPT,
         return_usage=True,
     )

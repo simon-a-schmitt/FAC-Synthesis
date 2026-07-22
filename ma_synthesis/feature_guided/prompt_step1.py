@@ -1,51 +1,54 @@
 
 STEP_1_PROMPT_TEMPLATE = """
-# Rolle
-Du bist ein hochpraeziser Daten-Synthese-Generator fuer das LLM-Fine-Tuning.
-Deine Aufgabe ist es, ausschliesslich den INPUT-KONTEXT fuer eine bestimmte Aufgabe zu
-generieren. Du generierst in diesem Schritt NOCH KEINE Antworten, Loesungen oder
-Auswahloptionen.
+# Role
+You are a highly precise data synthesis generator for LLM fine-tuning.
+Your task is to exclusively generate the INPUT CONTEXT for a specific
+task. At this stage, you do NOT generate any answers, solutions, or
+choice options.
 
-# Kontext & Ziel
-Wir generieren Trainingsdaten, die ein spezifisches neuronales Aktivierungsmuster
-(Ziel-Feature) in einem KI-Modell triggern sollen. Dafuer musst du ein vorgegebenes
-abstraktes, konzeptionelles Muster organisch und syntaktisch korrekt in einen neu
-generierten Text einbetten.
+# Context & Objective
+You receive a content abstract describing what a new task instance is
+about, and a reference example showing what task instances look like.
+Your job is to realize the abstract's content in the form of the
+reference example.
 
-# Parameter
+# Parameters
 
-1. ZIEL-TASK BESCHREIBUNG:
+1. TARGET TASK DESCRIPTION:
 {{TASK_BESCHREIBUNG}}
 
-2. ZIEL-FEATURE BESCHREIBUNG:
-{{FEATURE_BESCHREIBUNG}}
+2. CONTENT ABSTRACT (binding for content):
+{{CONTENT_ABSTRACT}}
 
-3. ZIEL-FEATURE TEXT SPANS:
-Diese Textausschnitte sind Beispiele aus einem allgemeinen Textkorpus, bei denen das
-Ziel-Feature extrem stark aktiviert wird. Analysiere diese Spans, um das abstrakte
-sprachliche, semantische oder logische Muster hinter dem Feature zu verstehen.
-{{TEXT_SPANS}}
+3. STYLE DIRECTIVES (binding, may be empty):
+{{STYLE_DIRECTIVES}}
 
-4. STIL- UND FORMAT-REFERENZ:
-Nutze dieses Beispiel als Referenz fuer die uebergeordnete Fachdomaene.
-- BEIBEHALTEN: Die Tonalitaet, den Fachjargon, die Komplexitaet und die ungefaehre Textlaenge dieser Domaene.
-- STRUKTURELL AENDERN: Der konkrete Sachverhalt, die konkreten Inhalte aus der Referenz.
-{{TASK_BEISPIEL}}
+4. STYLE AND FORMAT REFERENCE (binding for form only):
+Use this example exclusively as a reference for form:
+- RETAIN: the tone, jargon, register, structural conventions, and
+  approximate text length of this example.
+- DO NOT TAKE OVER: its factual content, its specific subject matter,
+  or its wording. All content must come from the CONTENT ABSTRACT.
 
-5. WEITERE ANWEISUNGEN:
-{{WEITERE_ANWEISUNG}}
+claim for damages many times what the statute permitted, Urban made a motion for partial summary judgment to limit Baker’s damages to $3,896, the amount of Urban’s profit on the plastic frames in which the Paper Insert was used. Urban seeks $21,248, a portion of the fees and costs incurred in making that motion. Based on Weingrad’s conduct and my review of Urban’s lawyers’ timesheets, that amount is entirely reasonable. 4. Withholding of Licensing Evidence As noted above, Baker and Weingrad acted in bad faith and unreasonably and vexatiously multiplied these proceedings with respect to the licensing evidence. Initially, Weingrad objected to production of documents on this issue on the ground that they were irrelevant — a position entirely without merit. See On Davis, 246 F.3d at 164-66 (<HOLDING>). Then, after production was ordered, Weingrad
 
-# Ziel
-Generiere genau 1 neuen, einzigartigen Kontext-Text, der folgende Kriterien strikt erfuellt:
-- Er orientiert sich stilistisch perfekt an der "Stil- und Format-Referenz".
-- Er ist inhaltlich komplett neu (kein blosses Umformulieren des Beispiels).
-- Er ist so konstruiert, dass er das Ziel-Feature stark aktiviert, indem er das aus
-  ZIEL-FEATURE BESCHREIBUNG und ZIEL-FEATURE TEXT SPANS abgeleitete abstrakte Prinzip
-  praezise umsetzt.
+5. STRUCTURAL REQUIREMENTS:
+{{STRUCTURAL_REQUIREMENTS}}
 
-# WICHTIGE EINSCHRAENKUNGEN
-- Generiere KEINE Antwortoptionen oder Musterloesungen.
-- Gib KEINE Erklaerungen oder Einleitungen ("Hier ist dein Text...") aus.
-- Deine Ausgabe darf AUSSCHLIESSLICH der generierte Kontext-Text sein.
-- Falls du Textstrukturen oder Optionen aus der Referenz kopierst, ist das ein fataler Fehler.
+# Goal
+Generate ONE input context that:
+- realizes the situation described in the CONTENT ABSTRACT concretely
+  and completely, rather than as a summary ABOUT
+  the CONTENT ABSTRACT — you may add supporting details consistent with it, but
+  must not replace or drop its core content
+- expresses the abstract's characteristic subject matter naturally
+  and prominently throughout the text, without unnatural repetition
+  of individual words,
+- matches the form of the reference example,
+- satisfies all STYLE DIRECTIVES and STRUCTURAL REQUIREMENTS.
+
+# IMPORTANT CONSTRAINTS
+- Output EXCLUSIVELY the raw input context. No introduction, no
+  explanation, no answer.
+- Do NOT copy phrases from the reference example.
 """.strip()

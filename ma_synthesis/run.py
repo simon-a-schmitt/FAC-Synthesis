@@ -7,8 +7,8 @@ Usage examples:
   # blackbox path with explicit seed file
   python run.py --path blackbox --n 10 --seeds data/seeds/prompts_seed_casehold.json --out output/blackbox.jsonl
 
-  # feature-guided path, generate 5 samples from a feature file
-  python run.py --path feature_guided --n 5 --features data/features.jsonl --out output/feature_guided.jsonl
+  # feature-guided path, generate 5 samples (uses default feature file)
+  python run.py --path feature_guided --n 5 --out output/feature_guided.jsonl
 """
 
 import argparse
@@ -26,6 +26,8 @@ if str(ROOT_DIR) not in sys.path:
 from benchmark_play_ground.model_wrapper import LocalModel
 from ma_synthesis.blackbox.step1 import run_step1 as blackbox_step1
 from ma_synthesis.common.pipeline import parse_step1_context, run_pipeline
+from ma_synthesis.feature_guided.feature_pool import load_feature_pool, sample_two_features
+from ma_synthesis.feature_guided.step0 import run_step0 as feature_guided_step0
 from ma_synthesis.feature_guided.step1 import run_step1 as feature_guided_step1
 from ma_synthesis.log_token_usage import update_token_log
 
@@ -38,21 +40,12 @@ DTYPE = "bfloat16"
 
 
 SEEDS_DEFAULT = Path(__file__).parent / "data" / "seeds" / "prompts_seed_casehold.json"
+FEATURES_DEFAULT = Path(__file__).parent / "data" / "seeds" / "feature_seed_casehold.jsonl"
 
 
 def load_seeds(path: Path) -> list[dict]:
     with open(path, encoding="utf-8") as f:
         return json.load(f)
-
-
-def load_features(path: Path) -> list[dict]:
-    features = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                features.append(json.loads(line))
-    return features
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,7 +78,10 @@ def parse_args() -> argparse.Namespace:
         "--features",
         type=str,
         default=None,
-        help="(feature_guided only) Path to JSONL file with SAE feature data",
+        help=(
+            "(feature_guided only) Path to JSONL file with SAE feature data. "
+            "Defaults to data/seeds/feature_seed_casehold.jsonl"
+        ),
     )
     parser.add_argument(
         "--model-path",
@@ -121,16 +117,14 @@ def main() -> None:
             sys.exit(1)
         print(f"[INFO] Loaded {len(seeds)} seeds from {seeds_path}", flush=True)
 
-    features: list[dict] = []
+    feature_pool: list[dict] = []
     if args.path == "feature_guided":
-        if args.features is None:
-            print("[ERROR] --features is required for the feature_guided path.", flush=True)
-            sys.exit(1)
-        features = load_features(Path(args.features))
-        if not features:
+        features_path = Path(args.features) if args.features else FEATURES_DEFAULT
+        feature_pool = load_feature_pool(features_path)
+        if not feature_pool:
             print("[ERROR] Feature file is empty or could not be parsed.", flush=True)
             sys.exit(1)
-        print(f"[INFO] Loaded {len(features)} features from {args.features}", flush=True)
+        print(f"[INFO] Loaded {len(feature_pool)} features from {features_path}", flush=True)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,18 +151,53 @@ def main() -> None:
                 step1_output, step1_meta, step1_usage = blackbox_step1(model, seeds=seeds)
                 meta = {"path": "blackbox", **step1_meta}
             else:
-                feature = features[(attempt - 1) % len(features)]
-                feature_description = feature.get("description", "")
-                feature_text_spans = feature.get("text_spans", "")
-                step1_output, step1_usage = feature_guided_step1(
-                    model,
-                    feature_description=feature_description,
-                    feature_text_spans=feature_text_spans,
+                # --- Step 0: draw two features (from different seed
+                # examples) and turn them into a content abstract ---
+                feature_1, feature_2 = sample_two_features(feature_pool)
+                print(
+                    f"[INFO] Drawn feature 1: seed_index={feature_1['seed_index']}, "
+                    f"feature_id={feature_1['feature_id']}, top_tokens={feature_1['top_tokens']}, "
+                    f"reference_spans={feature_1['reference_spans']}",
+                    flush=True,
                 )
+                print(
+                    f"[INFO] Drawn feature 2: seed_index={feature_2['seed_index']}, "
+                    f"feature_id={feature_2['feature_id']}, top_tokens={feature_2['top_tokens']}, "
+                    f"reference_spans={feature_2['reference_spans']}",
+                    flush=True,
+                )
+                step0_output, step0_accept, step0_usage = feature_guided_step0(
+                    model, feature_1, feature_2,
+                )
+                update_token_log(
+                    token_log_path, args.path, "step_0",
+                    step0_usage["input_tokens"], step0_usage["output_tokens"],
+                )
+
                 meta = {
                     "path": "feature_guided",
-                    "feature_id": feature.get("feature_id"),
+                    "seed_index_1": feature_1["seed_index"],
+                    "feature_id_1": feature_1["feature_id"],
+                    "seed_index_2": feature_2["seed_index"],
+                    "feature_id_2": feature_2["feature_id"],
                 }
+
+                if not step0_accept:
+                    reject_record = {**meta, "accept": False, "step_0_error": step0_output}
+                    out_f.write(json.dumps(reject_record, ensure_ascii=False) + "\n")
+                    out_f.flush()
+                    print(f"[INFO] Rejected: step 0 failed ({step0_output}).", flush=True)
+                    continue
+
+                print(f"[Step 0 output]\n{step0_output}\n", flush=True)
+                meta["content_abstract"] = step0_output["abstract"]
+                meta["style_directives"] = step0_output["style_directives"]
+
+                step1_output, step1_usage = feature_guided_step1(
+                    model,
+                    content_abstract=step0_output["abstract"],
+                    style_directives=step0_output["style_directives"],
+                )
 
             update_token_log(
                 token_log_path, args.path, "step_1",
