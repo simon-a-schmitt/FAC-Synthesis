@@ -76,3 +76,32 @@ def load_casehold_tsv(path: str, instruction_prompt: Optional[str] = None) -> Li
         return records
 
     raise ValueError(f"Unrecognized CaseHold TSV format for file: {path}")
+
+
+PUBMEDQA_LABELS = ("yes", "no", "maybe")
+
+
+def map_pubmedqa_label(label) -> str:
+    label = str(label).strip().lower()
+    return label if label in PUBMEDQA_LABELS else label
+
+
+def load_pubmedqa_tsv(path: str) -> List[Dict[str, str]]:
+    """Load a PubMedQA-style TSV and return list of records with keys: prompt, gt
+
+    Produced by benchmarks/pubmedqa/transform_pubmedqa_to_tsv.py: each row holds a
+    fully-formed prompt (context + question + answer instruction) and a gt label
+    of "yes", "no", or "maybe". The file has no header row, so column names are
+    assigned positionally.
+    """
+    df = pd.read_csv(path, sep="\t", dtype=str, header=None, names=["prompt", "gt"], quoting=3).fillna("")
+
+    # If the first row is actually a header (e.g. "prompt"/"gt label"), drop it.
+    if df.iloc[0]["prompt"].strip().lower() == "prompt":
+        df = df.iloc[1:].reset_index(drop=True)
+
+    records = []
+    for _, r in df.iterrows():
+        prompt = str(r["prompt"]).replace("\\n", "\n")
+        records.append({"prompt": prompt, "gt": map_pubmedqa_label(r["gt"])})
+    return records

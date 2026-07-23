@@ -51,3 +51,42 @@ def build_icl_prompt(examples: List[dict], query_prompt: str, instruction: str =
         ]
     )
     return "\n".join(sections)
+
+
+PUBMEDQA_INSTRUCTION_PROMPT = (
+    "Answer each biomedical research question with exactly one word: yes, no, or maybe."
+)
+
+
+def build_pubmedqa_icl_prompt(examples: List[dict], query_prompt: str, instruction: str = PUBMEDQA_INSTRUCTION_PROMPT) -> str:
+    """Build a few-shot PubMedQA prompt.
+
+    Each PubMedQA record's `prompt` already ends in "...\\nAnswer:\\n", so examples
+    are rendered by simply appending their gt label after that trailing "Answer:".
+    """
+    sections = [
+        "# Instruction",
+        instruction,
+        "",
+    ]
+
+    for idx, ex in enumerate(examples, start=1):
+        context = ex.get("prompt", "").rstrip()
+        label = ex.get("label", ex.get("gt", ""))
+        sections.extend(
+            [
+                f"## Example {idx}",
+                f"{context} {label}",
+                "",
+                "---",
+                "",
+            ]
+        )
+
+    sections.extend(
+        [
+            "## Target Task",
+            query_prompt.rstrip(),
+        ]
+    )
+    return "\n".join(sections)
