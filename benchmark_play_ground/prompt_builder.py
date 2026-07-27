@@ -90,3 +90,47 @@ def build_pubmedqa_icl_prompt(examples: List[dict], query_prompt: str, instructi
         ]
     )
     return "\n".join(sections)
+
+
+CTI_VSP_INSTRUCTION_PROMPT = (
+    "Analyze each CVE description and determine the CVSS v3.1 base metric values "
+    "(AV, AC, PR, UI, S, C, I, A). End your response with the final CVSS v3.1 "
+    "vector string, e.g. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H."
+)
+
+
+def build_cti_vsp_icl_prompt(
+    examples: List[dict], query_prompt: str, instruction: str = CTI_VSP_INSTRUCTION_PROMPT
+) -> str:
+    """Build a few-shot CTI-VSP prompt.
+
+    Each CTI-VSP record's `prompt` is already a fully-formed instruction + CVE
+    description, so examples are rendered by appending their gt CVSS vector
+    string directly after it, mirroring `build_pubmedqa_icl_prompt`.
+    """
+    sections = [
+        "# Instruction",
+        instruction,
+        "",
+    ]
+
+    for idx, ex in enumerate(examples, start=1):
+        context = ex.get("prompt", "").rstrip()
+        label = ex.get("label", ex.get("gt", ""))
+        sections.extend(
+            [
+                f"## Example {idx}",
+                f"{context} {label}",
+                "",
+                "---",
+                "",
+            ]
+        )
+
+    sections.extend(
+        [
+            "## Target Task",
+            query_prompt.rstrip(),
+        ]
+    )
+    return "\n".join(sections)

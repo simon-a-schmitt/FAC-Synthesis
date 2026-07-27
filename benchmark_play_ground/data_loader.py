@@ -1,3 +1,4 @@
+import json
 import pandas as pd
 from typing import List, Dict, Tuple, Optional
 
@@ -105,3 +106,37 @@ def load_pubmedqa_tsv(path: str) -> List[Dict[str, str]]:
         prompt = str(r["prompt"]).replace("\\n", "\n")
         records.append({"prompt": prompt, "gt": map_pubmedqa_label(r["gt"])})
     return records
+
+
+def load_cti_vsp_tsv(path: str) -> List[Dict[str, str]]:
+    """Load a CTI-VSP-style TSV and return list of records with keys: prompt, gt
+
+    Produced by benchmarks/cti_vsp/build_benchmark.py: each row holds a fully-formed
+    prompt (CVSS instructions + CVE description) and a gt CVSS v3.1 vector string
+    such as "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N". The file has no header
+    row, so column names are assigned positionally.
+    """
+    df = pd.read_csv(path, sep="\t", dtype=str, header=None, names=["prompt", "gt"], quoting=3).fillna("")
+
+    # If the first row is actually a header (e.g. "Prompt"/"GT"), drop it.
+    if df.iloc[0]["prompt"].strip().lower() == "prompt":
+        df = df.iloc[1:].reset_index(drop=True)
+
+    records = []
+    for _, r in df.iterrows():
+        prompt = str(r["prompt"]).replace("\\n", "\n")
+        records.append({"prompt": prompt, "gt": str(r["gt"]).strip()})
+    return records
+
+
+def load_cti_vsp_metric_classes(path: str) -> Dict[str, List[str]]:
+    """Load the per-metric class list from cti_vsp_gt_metric_distribution.json.
+
+    Returns e.g. {"AV": ["N", "L", "A", "P"], "AC": ["L", "H"], ...} — the set of
+    classes observed in the ground truth for each CVSS base metric, used as the
+    `labels` argument to macro-F1 so scores don't depend on classes a model
+    happens to predict but that never occur in the ground truth.
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    return {metric: list(classes.keys()) for metric, classes in data["metric_distribution"].items()}
