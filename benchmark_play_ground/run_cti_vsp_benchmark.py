@@ -63,6 +63,7 @@ def main():
     lora_path = args.lora_path if args.mode == "fine_tuned" else None
     model = LocalModel(args.model_path, device=args.device, dtype=args.dtype, lora_path=lora_path)
     model.load()
+    tokenizer = model.tokenizer
 
     out_path = Path(args.output_jsonl)
     results = []
@@ -103,14 +104,15 @@ def main():
             prompt = query_prompt
 
         print(prompt)
+        print(repr(prompt[-40:]))
 
         try:
             raw = model.generate(
                 prompt,
                 max_new_tokens=args.max_new_tokens,
                 do_sample=False,
-                temperature=1.0,
-                top_p=1.0,
+                stop_strings=["\nCVE Description:", "\n\n"],
+                tokenizer=tokenizer,
                 use_cache=True,
                 max_input_tokens=args.max_input_tokens,
             )
@@ -133,8 +135,8 @@ def main():
                 prompt,
                 max_new_tokens=args.max_new_tokens,
                 do_sample=False,
-                temperature=1.0,
-                top_p=1.0,
+                stop_strings=["\nCVE Description:", "\n\n"],
+                tokenizer=tokenizer,
                 use_cache=True,
                 max_input_tokens=fallback_max_input,
             )

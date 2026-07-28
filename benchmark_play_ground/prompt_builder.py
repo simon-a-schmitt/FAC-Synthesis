@@ -93,10 +93,37 @@ def build_pubmedqa_icl_prompt(examples: List[dict], query_prompt: str, instructi
 
 
 CTI_VSP_INSTRUCTION_PROMPT = (
-    "Analyze each CVE description and determine the CVSS v3.1 base metric values "
-    "(AV, AC, PR, UI, S, C, I, A). End your response with the final CVSS v3.1 "
-    "vector string, e.g. CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H."
+    "Analyze each CVE description and output the CVSS v3.1 Base vector string. Do not explain your reasoning. Output only the vector string and nothing else.\n"
+    "\n"
+    "Valid options for each metric:\n"
+    "- Attack Vector (AV): N, A, L, P\n"
+    "- Attack Complexity (AC): L, H\n"
+    "- Privileges Required (PR): N, L, H\n"
+    "- User Interaction (UI): N, R\n"
+    "- Scope (S): U, C\n"
+    "- Confidentiality (C): N, L, H\n"
+    "- Integrity (I): N, L, H\n"
+    "- Availability (A): N, L, H\n"
+    "\n"
+    "Output format (exactly this, no other text):\n"
+    "CVSS:3.1/AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_"
 )
+
+_CVE_DESCRIPTION_MARKER = "CVE Description:"
+
+
+def _extract_cve_description_block(prompt: str) -> str:
+    """Strip any baked-in instruction preamble, keeping from "CVE Description:" onward.
+
+    Records in this benchmark's TSVs store `prompt` as the full instruction text
+    concatenated with the CVE description, so this trims each example (and the
+    query) down to just its "CVE Description: ..." block before it is placed
+    under a single shared instruction.
+    """
+    idx = prompt.find(_CVE_DESCRIPTION_MARKER)
+    if idx == -1:
+        return prompt.strip()
+    return prompt[idx:].strip()
 
 
 def build_cti_vsp_icl_prompt(
@@ -104,33 +131,18 @@ def build_cti_vsp_icl_prompt(
 ) -> str:
     """Build a few-shot CTI-VSP prompt.
 
-    Each CTI-VSP record's `prompt` is already a fully-formed instruction + CVE
-    description, so examples are rendered by appending their gt CVSS vector
-    string directly after it, mirroring `build_pubmedqa_icl_prompt`.
+    Renders the instruction once, followed by "CVE Description: ..." / CVSS
+    vector pairs for each few-shot example, then the query's CVE description
+    for the model to complete.
     """
-    sections = [
-        "# Instruction",
-        instruction,
-        "",
-    ]
+    sections = [instruction, ""]
 
-    for idx, ex in enumerate(examples, start=1):
-        context = ex.get("prompt", "").rstrip()
+    for ex in examples:
+        context = _extract_cve_description_block(ex.get("prompt", ""))
         label = ex.get("label", ex.get("gt", ""))
-        sections.extend(
-            [
-                f"## Example {idx}",
-                f"{context} {label}",
-                "",
-                "---",
-                "",
-            ]
-        )
+        sections.append(f"{context}\n{label}")
+        sections.append("")
 
-    sections.extend(
-        [
-            "## Target Task",
-            query_prompt.rstrip(),
-        ]
-    )
+    query_context = _extract_cve_description_block(query_prompt)
+    sections.append(f"{query_context}\nCVSS:3.1/")
     return "\n".join(sections)

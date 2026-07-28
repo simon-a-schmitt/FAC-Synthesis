@@ -1,6 +1,6 @@
 import os
 import sys
-from typing import Optional
+from typing import Any, List, Optional
 
 import torch as tc
 
@@ -33,6 +33,12 @@ class LocalModel:
             lora_path=self.lora_path,
         )
 
+    @property
+    def tokenizer(self):
+        if self._gen is None:
+            self.load()
+        return self._gen.tokenizer
+
     def generate(
         self,
         prompt: str,
@@ -44,6 +50,8 @@ class LocalModel:
         repetition_penalty: Optional[float] = None,
         max_input_tokens: Optional[int] = None,
         use_cache: Optional[bool] = None,
+        stop_strings: Optional[List[str]] = None,
+        tokenizer: Optional[Any] = None,
         system: Optional[str] = None,
         return_usage: bool = False,
     ):
@@ -52,22 +60,7 @@ class LocalModel:
         gen = self._gen
         assert gen is not None
 
-        if system is None:
-            return gen.generate(
-                prompt,
-                max_new_tokens=max_new_tokens,
-                do_sample=do_sample,
-                temperature=temperature,
-                top_p=top_p,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-                repetition_penalty=repetition_penalty,
-                max_input_tokens=max_input_tokens,
-                use_cache=use_cache,
-                return_usage=return_usage,
-            )
-
-        return gen.generate(
-            prompt,
+        kwargs = dict(
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
             temperature=temperature,
@@ -76,6 +69,11 @@ class LocalModel:
             repetition_penalty=repetition_penalty,
             max_input_tokens=max_input_tokens,
             use_cache=use_cache,
-            system=system,
+            stop_strings=stop_strings,
+            tokenizer=tokenizer,
             return_usage=return_usage,
         )
+        if system is not None:
+            kwargs["system"] = system
+
+        return gen.generate(prompt, **kwargs)
