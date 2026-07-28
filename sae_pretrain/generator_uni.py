@@ -98,6 +98,10 @@ class UnifiedGenerator:
         self._model = model
         print(f"Loaded {self._family.upper()} model successfully.", flush=True)
 
+    @property
+    def tokenizer(self):
+        return self._tokenizer
+
     def build_messages(
         self,
         user_text: str = None,
