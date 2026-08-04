@@ -1,16 +1,8 @@
-import os
-import sys
 from typing import Any, List, Optional
 
 import torch as tc
 
-# Ensure repo-local imports like UnifiedGenerator are available
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SAE_PRETRAIN_DIR = os.path.join(ROOT_DIR, "..", "sae_pretrain")
-if SAE_PRETRAIN_DIR not in sys.path:
-    sys.path.insert(0, SAE_PRETRAIN_DIR)
-
-from sae_pretrain.generator_uni import UnifiedGenerator
+from benchmark_play_ground.generator_uni import UnifiedGenerator
 
 
 class LocalModel:
@@ -54,6 +46,7 @@ class LocalModel:
         tokenizer: Optional[Any] = None,
         system: Optional[str] = None,
         return_usage: bool = False,
+        use_chat_template: bool = True,
     ):
         if self._gen is None:
             self.load()
@@ -72,8 +65,56 @@ class LocalModel:
             stop_strings=stop_strings,
             tokenizer=tokenizer,
             return_usage=return_usage,
+            use_chat_template=use_chat_template,
         )
         if system is not None:
             kwargs["system"] = system
 
         return gen.generate(prompt, **kwargs)
+
+    def render_prompt(
+        self,
+        prompt: str,
+        system: Optional[str] = None,
+        history: Optional[List[dict]] = None,
+        use_chat_template: bool = True,
+    ) -> str:
+        """Return the exact prompt text (incl. special/template tokens) that
+        `generate()` would feed to the model for this input.
+
+        Re-runs only the chat-template + tokenize step (no forward pass), so
+        this is cheap to call for logging/debugging before a real generate().
+        """
+        if self._gen is None:
+            self.load()
+        gen = self._gen
+        assert gen is not None
+
+        if not use_chat_template:
+            enc = gen.tokenizer(prompt, return_tensors="pt")
+            input_ids = enc["input_ids"]
+        else:
+            messages = gen.build_messages(user_text=prompt, system_text=system, history=history)
+            if gen._family == "gemma":
+                inputs = gen._processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+                input_ids = inputs["input_ids"]
+            else:
+                enc = gen.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                )
+                input_ids = enc if isinstance(enc, tc.Tensor) else enc["input_ids"]
+
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+
+        return gen.tokenizer.decode(input_ids[0], skip_special_tokens=False)

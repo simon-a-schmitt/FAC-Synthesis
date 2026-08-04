@@ -139,6 +139,14 @@ def extract_cvss_metrics_from_text(text: str) -> Dict[str, str]:
     return metrics
 
 
+def metrics_match(predicted_metrics: Dict[str, str], gt_metrics: Dict[str, str]) -> bool:
+    """True if every CVSS base metric was extracted and matches the ground truth."""
+    return all(
+        predicted_metrics.get(m, "") != "" and predicted_metrics.get(m, "") == gt_metrics.get(m, "")
+        for m in CVSS_METRICS
+    )
+
+
 def evaluate_cti_vsp_predictions(
     records: List[Dict], metric_classes: Dict[str, List[str]], output_path: str = None
 ) -> Dict:
@@ -163,9 +171,7 @@ def evaluate_cti_vsp_predictions(
         per_metric_macro_f1[metric] = float(f1)
 
     overall_macro_f1 = sum(per_metric_macro_f1.values()) / len(per_metric_macro_f1) if per_metric_macro_f1 else 0.0
-    exact_match = sum(
-        1 for r in records if r.get("predicted_vector") and r.get("predicted_vector") == r.get("gt")
-    )
+    exact_match = sum(1 for r in records if metrics_match(r.get("predicted_metrics", {}), r.get("gt_metrics", {})))
 
     summary = {
         "total": total,

@@ -92,27 +92,10 @@ def build_pubmedqa_icl_prompt(examples: List[dict], query_prompt: str, instructi
     return "\n".join(sections)
 
 
-CTI_VSP_INSTRUCTION_PROMPT = (
-    "Analyze each CVE description and output the CVSS v3.1 Base vector string. Do not explain your reasoning. Output only the vector string and nothing else.\n"
-    "\n"
-    "Valid options for each metric:\n"
-    "- Attack Vector (AV): N, A, L, P\n"
-    "- Attack Complexity (AC): L, H\n"
-    "- Privileges Required (PR): N, L, H\n"
-    "- User Interaction (UI): N, R\n"
-    "- Scope (S): U, C\n"
-    "- Confidentiality (C): N, L, H\n"
-    "- Integrity (I): N, L, H\n"
-    "- Availability (A): N, L, H\n"
-    "\n"
-    "Output format (exactly this, no other text):\n"
-    "CVSS:3.1/AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_"
-)
-
 _CVE_DESCRIPTION_MARKER = "CVE Description:"
 
 
-def _extract_cve_description_block(prompt: str) -> str:
+def extract_cve_description_block(prompt: str) -> str:
     """Strip any baked-in instruction preamble, keeping from "CVE Description:" onward.
 
     Records in this benchmark's TSVs store `prompt` as the full instruction text
@@ -124,25 +107,3 @@ def _extract_cve_description_block(prompt: str) -> str:
     if idx == -1:
         return prompt.strip()
     return prompt[idx:].strip()
-
-
-def build_cti_vsp_icl_prompt(
-    examples: List[dict], query_prompt: str, instruction: str = CTI_VSP_INSTRUCTION_PROMPT
-) -> str:
-    """Build a few-shot CTI-VSP prompt.
-
-    Renders the instruction once, followed by "CVE Description: ..." / CVSS
-    vector pairs for each few-shot example, then the query's CVE description
-    for the model to complete.
-    """
-    sections = [instruction, ""]
-
-    for ex in examples:
-        context = _extract_cve_description_block(ex.get("prompt", ""))
-        label = ex.get("label", ex.get("gt", ""))
-        sections.append(f"{context}\n{label}")
-        sections.append("")
-
-    query_context = _extract_cve_description_block(query_prompt)
-    sections.append(f"{query_context}\nCVSS:3.1/")
-    return "\n".join(sections)
