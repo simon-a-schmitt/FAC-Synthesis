@@ -21,7 +21,7 @@ def transform_llamafactory(sample_tsv, output_json):
             prompt, label = row[0], row[1]
             records.append({
                 "system": CTI_VSP_SYSTEM_PROMPT,
-                "instruction": extract_cve_description_block(prompt),
+                "instruction": "CVE Description: " + prompt,
                 "input": "",
                 "output": label.strip()
             })
