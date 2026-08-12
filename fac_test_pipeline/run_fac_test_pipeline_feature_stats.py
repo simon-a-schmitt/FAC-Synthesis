@@ -219,6 +219,43 @@ def _find_user_content_start(token_ids: Sequence[int], tokens: Sequence[str], to
     return content_start
 
 
+def _advance_past_opening_phrase(
+    token_ids: Sequence[int],
+    content_start: int,
+    tokenizer,
+    opening_phrase: str,
+) -> int:
+    """Return a token index >= content_start that skips past `opening_phrase`
+    (the phrase itself excluded) within the decoded prompt content.
+
+    Falls back to `content_start` (i.e. the whole content is used) if the
+    phrase cannot be located in the decoded text.
+    """
+    remaining_ids = list(token_ids[content_start:])
+    if not remaining_ids:
+        return content_start
+
+    content_text = tokenizer.decode(remaining_ids, skip_special_tokens=True)
+    match_idx = content_text.find(opening_phrase)
+    if match_idx < 0:
+        print(
+            f"Warning: opening phrase {opening_phrase!r} not found in prompt content; "
+            "using full content instead."
+        )
+        return content_start
+    phrase_end_offset = match_idx + len(opening_phrase)
+
+    lo, hi = 0, len(remaining_ids)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        decoded_len = len(tokenizer.decode(remaining_ids[:mid], skip_special_tokens=True))
+        if decoded_len >= phrase_end_offset:
+            hi = mid
+        else:
+            lo = mid + 1
+    return content_start + lo
+
+
 # ---------------------------------------------------------------------------
 # Log-odds computation (identical to run_fac_test_pipeline_log_odds.py)
 # ---------------------------------------------------------------------------
@@ -247,6 +284,7 @@ def compute_feature_stats_for_prompt(
     collector: Collector,
     sae: TopKSAE,
     baseline_full: Dict[int, Dict[str, float]],
+    opening_phrase: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return per-feature (activation_density, peak_magnitude, log_odds) for one prompt."""
     collector.cache = None
@@ -275,6 +313,10 @@ def compute_feature_stats_for_prompt(
 
     special_ids = _special_token_id_set(model._tokenizer)  # noqa: SLF001
     content_start = _find_user_content_start(token_ids, tokens, model._tokenizer)  # noqa: SLF001
+    if opening_phrase:
+        content_start = _advance_past_opening_phrase(
+            token_ids, content_start, model._tokenizer, opening_phrase  # noqa: SLF001
+        )
     token_mask = tc.tensor(
         [idx >= content_start and token_id not in special_ids for idx, token_id in enumerate(token_ids)],
         device=sparse_features.device,
@@ -543,6 +585,19 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="TSV with columns FeatureID and Words. Used to annotate output.",
     )
+    parser.add_argument(
+        "--opening-phrase",
+        type=str,
+        default="",
+        help=(
+            "If set, only tokens after this phrase (excluding the phrase itself) "
+            "within each prompt's content are considered for feature-activation "
+            "stats. Useful to skip a fixed instruction that precedes the actual "
+            "prompt content. The prompt is still processed as a whole; only the "
+            "considered token range changes. If the phrase is not found in a "
+            "prompt, the full content is used for that prompt."
+        ),
+    )
 
     # Intermediate per-example output (optional).
     parser.add_argument(
@@ -621,7 +676,10 @@ def main() -> None:
     records: List[Dict[str, Any]] = []
     with tc.no_grad():
         for idx, prompt in enumerate(tqdm.tqdm(prompts, desc="Processing prompts")):
-            record = compute_feature_stats_for_prompt(prompt, model, collector, sae, baseline_full)
+            record = compute_feature_stats_for_prompt(
+                prompt, model, collector, sae, baseline_full,
+                opening_phrase=args.opening_phrase or None,
+            )
             record["index"] = idx
             records.append(record)
 
