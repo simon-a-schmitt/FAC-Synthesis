@@ -33,6 +33,7 @@ if SAE_PRETRAIN_DIR not in sys.path:
 from autoencoder import TopKSAE  # noqa: E402
 from generator_uni import UnifiedGenerator  # noqa: E402
 from llm_surgery_uni import mount_function, switch_mode  # noqa: E402
+import cvss_prompt as cp  # noqa: E402
 
 
 tc.manual_seed(42)
@@ -42,17 +43,6 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_BASELINE_TSV = os.path.join(_SCRIPT_DIR, "feature_activation_baseline_agg.tsv")
 _DEFAULT_INPUT_JSON = os.path.join(_SCRIPT_DIR, "input", "cti_vsp_fg_examples.json")
 _DEFAULT_OUTPUT_JSONL = os.path.join(_SCRIPT_DIR, "output", "cvss_feature_check.jsonl")
-
-CVSS_TEMPLATE = (
-    "Analyze the following CVE description and output the CVSS v3.1 Base vector string. "
-    "Do not explain your reasoning. Output only the vector string and nothing else.  "
-    "Valid options for each metric: - Attack Vector (AV): N, A, L, P - Attack Complexity (AC): L, H - "
-    "Privileges Required (PR): N, L, H - User Interaction (UI): N, R - Scope (S): U, C - "
-    "Confidentiality (C): N, L, H - Integrity (I): N, L, H - Availability (A): N, L, H  "
-    "Output format (exactly this, no other text): CVSS:3.1/AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_  "
-    "CVE Description:"
-)
-
 
 # ---------------------------------------------------------------------------
 # Hook collector
@@ -143,8 +133,10 @@ def load_processed_keys(output_jsonl: str) -> Set[Tuple[int, int]]:
 # Tokenisation helpers (identical to run_fac_test_pipeline_feature_stats.py)
 # ---------------------------------------------------------------------------
 
-def _encode_prompt_tokens(prompt: str, model: UnifiedGenerator) -> Tuple[tc.Tensor, List[int], List[str]]:
-    messages = model.build_messages(user_text=prompt)
+def _encode_prompt_tokens(
+    prompt: str, model: UnifiedGenerator, system: Optional[str] = None
+) -> Tuple[tc.Tensor, List[int], List[str]]:
+    messages = model.build_messages(user_text=prompt, system_text=system)
     enc = model._tokenizer.apply_chat_template(  # noqa: SLF001
         messages,
         tokenize=True,
@@ -250,18 +242,21 @@ def compute_feature_activation_for_description(
     collector: Collector,
     sae: TopKSAE,
     baseline_full: Dict[int, Dict[str, float]],
-    template: str = CVSS_TEMPLATE,
+    system: str = cp.CVSS_SYSTEM_PROMPT,
+    opening_phrase: str = cp.CVSS_OPENING_PHRASE,
 ) -> Dict[str, Any]:
-    """Build the CVSS prompt for `description`, run it through the model + SAE,
-    mask out the template tokens, and report whether `feature_id` is active on
-    the remaining (description) tokens, with per-token normalised magnitude."""
-    prompt = f"{template} {description.strip()}"
+    """Build the two-turn CVSS prompt (system=CVSS_SYSTEM_PROMPT, user="CVE
+    Description: " + description) for `description`, run it through the
+    model + SAE, mask out everything up to and including `opening_phrase`
+    within the user turn, and report whether `feature_id` is active on the
+    remaining (description) tokens, with per-token normalised magnitude."""
+    user_content = cp.build_cvss_user_content(description)
 
     collector.cache = None
-    _, token_ids, tokens = _encode_prompt_tokens(prompt, model)
+    _, token_ids, tokens = _encode_prompt_tokens(user_content, model, system=system)
 
     try:
-        model.get_activates(prompt)
+        model.get_activates(user_content, system=system)
     except RuntimeError:
         pass
 
@@ -283,11 +278,14 @@ def compute_feature_activation_for_description(
 
     special_ids = _special_token_id_set(model._tokenizer)  # noqa: SLF001
     content_start = _find_user_content_start(token_ids, tokens, model._tokenizer)  # noqa: SLF001
-    # Mask out the fixed template tokens: only tokens past the template phrase
-    # (i.e. the CVE description itself) count as "content" from here on.
-    content_start = _advance_past_opening_phrase(
-        token_ids, content_start, model._tokenizer, template  # noqa: SLF001
-    )
+    # The system turn (the actual instruction) is already excluded, because
+    # _find_user_content_start only returns positions from the user-turn
+    # header onward. This just trims the residual "CVE Description:" label
+    # itself from the user turn's content tokens.
+    if opening_phrase:
+        content_start = _advance_past_opening_phrase(
+            token_ids, content_start, model._tokenizer, opening_phrase  # noqa: SLF001
+        )
     token_mask = tc.tensor(
         [idx >= content_start and token_id not in special_ids for idx, token_id in enumerate(token_ids)],
         device=sparse_features.device,

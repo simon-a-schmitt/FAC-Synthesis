@@ -38,6 +38,7 @@ if _PIPELINE_DIR not in sys.path:
     sys.path.insert(0, _PIPELINE_DIR)
 
 import run_fac_test_pipeline_feature_stats as fs  # noqa: E402
+import cvss_prompt as cp  # noqa: E402
 
 _DEFAULT_INPUT_TSV = os.path.join(_SCRIPT_DIR, "input", "cti_vsp_ft_200.tsv")
 
@@ -126,14 +127,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--opening-phrase",
         type=str,
-        default="",
+        default=cp.CVSS_OPENING_PHRASE,
         help=(
-            "If set, only tokens after this phrase (excluding the phrase itself) "
-            "within each prompt's content are considered for feature-activation "
-            "stats. Useful to skip a fixed instruction that precedes the actual "
-            "prompt content. The prompt is still processed as a whole; only the "
-            "considered token range changes. If the phrase is not found in a "
-            "prompt, the full content is used for that prompt."
+            "Only tokens after this phrase (excluding the phrase itself) within "
+            "each prompt's content are considered for feature-activation stats. "
+            f"Defaults to {cp.CVSS_OPENING_PHRASE!r}, i.e. the fixed CVSS-classification "
+            "instruction preceding the CVE description is excluded, matching "
+            "feature_coverage_filter's default. Pass an empty string to disable "
+            "content restriction and use the whole prompt. If the phrase is not "
+            "found in a prompt, the full content is used for that prompt."
         ),
     )
 
@@ -182,6 +184,7 @@ def main() -> None:
     prompts = load_prompts_tsv(args.input_tsv)
     if args.max_prompts > 0:
         prompts = prompts[: args.max_prompts]
+    prompts = [cp.normalize_cvss_prompt(p) for p in prompts]
     print(f"Loaded {len(prompts)} prompts from {args.input_tsv}")
 
     sae_ckpt = fs.resolve_sae_checkpoint(local_path=args.sae_ckpt_path or None)
@@ -209,10 +212,11 @@ def main() -> None:
     # -----------------------------------------------------------------------
     records: List[Dict[str, Any]] = []
     with tc.no_grad():
-        for idx, prompt in enumerate(tqdm.tqdm(prompts, desc="Processing prompts")):
+        for idx, (system, user_content) in enumerate(tqdm.tqdm(prompts, desc="Processing prompts")):
             record = fs.compute_feature_stats_for_prompt(
-                prompt, model, collector, sae, baseline_full,
+                user_content, model, collector, sae, baseline_full,
                 opening_phrase=args.opening_phrase or None,
+                system=system,
             )
             record["index"] = idx
             records.append(record)

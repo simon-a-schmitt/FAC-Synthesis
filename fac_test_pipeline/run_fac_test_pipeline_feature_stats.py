@@ -158,8 +158,10 @@ def load_prompts(prompts_json: str) -> List[str]:
 # Tokenisation helpers
 # ---------------------------------------------------------------------------
 
-def _encode_prompt_tokens(prompt: str, model: UnifiedGenerator) -> Tuple[tc.Tensor, List[int], List[str]]:
-    messages = model.build_messages(user_text=prompt)
+def _encode_prompt_tokens(
+    prompt: str, model: UnifiedGenerator, system: Optional[str] = None
+) -> Tuple[tc.Tensor, List[int], List[str]]:
+    messages = model.build_messages(user_text=prompt, system_text=system)
     enc = model._tokenizer.apply_chat_template(  # noqa: SLF001
         messages,
         tokenize=True,
@@ -285,13 +287,20 @@ def compute_feature_stats_for_prompt(
     sae: TopKSAE,
     baseline_full: Dict[int, Dict[str, float]],
     opening_phrase: Optional[str] = None,
+    system: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Return per-feature (activation_density, peak_magnitude, log_odds) for one prompt."""
+    """Return per-feature (activation_density, peak_magnitude, log_odds) for one prompt.
+
+    `system`, if given, is prepended as a system turn ahead of `prompt` (the
+    user turn) before tokenization/encoding. Default None reproduces the
+    previous single-flat-user-turn behaviour exactly (non-CVSS callers of
+    this function stay unaffected).
+    """
     collector.cache = None
-    _, token_ids, tokens = _encode_prompt_tokens(prompt, model)
+    _, token_ids, tokens = _encode_prompt_tokens(prompt, model, system=system)
 
     try:
-        model.get_activates(prompt)
+        model.get_activates(prompt, system=system)
     except RuntimeError:
         pass
 

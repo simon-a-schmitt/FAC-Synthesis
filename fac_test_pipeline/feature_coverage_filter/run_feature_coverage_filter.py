@@ -54,26 +54,9 @@ if _PIPELINE_DIR not in sys.path:
     sys.path.insert(0, _PIPELINE_DIR)
 
 import run_fac_test_pipeline_feature_stats as fs  # noqa: E402
+import cvss_prompt as cp  # noqa: E402
 
 _DEFAULT_INPUT_JSON = os.path.join(_SCRIPT_DIR, "input", "cti_vsp_bb_pool_deepseek_1025.json")
-
-INSTRUCTION = (
-    "Analyze the following CVE description and output the CVSS v3.1 Base vector string. "
-    "Do not explain your reasoning. Output only the vector string and nothing else.\n\n"
-    "Valid options for each metric:\n"
-    "- Attack Vector (AV): N, A, L, P\n"
-    "- Attack Complexity (AC): L, H\n"
-    "- Privileges Required (PR): N, L, H\n"
-    "- User Interaction (UI): N, R\n"
-    "- Scope (S): U, C\n"
-    "- Confidentiality (C): N, L, H\n"
-    "- Integrity (I): N, L, H\n"
-    "- Availability (A): N, L, H\n\n"
-    "Output format (exactly this, no other text):\n"
-    "CVSS:3.1/AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_\n\n"
-    "CVE Description:\n"
-)
-OPENING_PHRASE = "CVE Description:"
 
 
 # ---------------------------------------------------------------------------
@@ -165,11 +148,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--opening-phrase",
         type=str,
-        default=OPENING_PHRASE,
+        default=cp.CVSS_OPENING_PHRASE,
         help=(
             "Only tokens after this phrase (excluding the phrase itself) within "
             "each prompt's content are considered for feature-activation stats. "
-            f"Defaults to {OPENING_PHRASE!r}, i.e. the fixed instruction preceding "
+            f"Defaults to {cp.CVSS_OPENING_PHRASE!r}, i.e. the fixed instruction preceding "
             "the CVE description is excluded."
         ),
     )
@@ -249,10 +232,11 @@ def main() -> None:
     records: List[Dict[str, Any]] = []
     with tc.no_grad():
         for item in tqdm.tqdm(items, desc="Processing prompts"):
-            prompt = INSTRUCTION + item["text"]
+            user_content = cp.build_cvss_user_content(item["text"])
             record = fs.compute_feature_stats_for_prompt(
-                prompt, model, collector, sae, baseline_full,
+                user_content, model, collector, sae, baseline_full,
                 opening_phrase=args.opening_phrase or None,
+                system=cp.CVSS_SYSTEM_PROMPT,
             )
             records.append(record)
 
