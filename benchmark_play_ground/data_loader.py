@@ -129,6 +129,26 @@ def load_cti_vsp_tsv(path: str) -> List[Dict[str, str]]:
     return records
 
 
+def load_claudette_tsv(path: str) -> List[Dict[str, str]]:
+    """Load a CLAUDETTE-TOS-style TSV and return list of records with keys: prompt, gt
+
+    Each row holds a single ToS sentence and a gt unfairness-type vector string
+    such as "LTD:N|TER:N|CH:N|CR:N|USE:N|LAW:N|J:N|ARB:Y|". The file has no header
+    row, so column names are assigned positionally.
+    """
+    df = pd.read_csv(path, sep="\t", dtype=str, header=None, names=["prompt", "gt"], quoting=3).fillna("")
+
+    # If the first row is actually a header (e.g. "sentence"/"labels"), drop it.
+    if df.iloc[0]["prompt"].strip().lower() == "prompt":
+        df = df.iloc[1:].reset_index(drop=True)
+
+    records = []
+    for _, r in df.iterrows():
+        prompt = str(r["prompt"]).replace("\\n", "\n")
+        records.append({"prompt": prompt, "gt": str(r["gt"]).strip()})
+    return records
+
+
 def load_cti_vsp_metric_classes(path: str) -> Dict[str, List[str]]:
     """Load the per-metric class list from cti_vsp_gt_metric_distribution.json.
 
