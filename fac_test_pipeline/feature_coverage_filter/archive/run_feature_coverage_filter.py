@@ -3,18 +3,21 @@ Build a pool_id -> active-feature mapping for a CVSS-vector prompt pool.
 
 Input
 -----
-A headerless TSV file (feature_coverage_filter/input) with exactly two
-tab-separated columns per line, as produced e.g. by
-input/cti_vsp_bb_deepseek_06_pool.tsv:
+A JSON list of pool items (feature_coverage_filter/input), each shaped like:
 
-    <CVE description>\t<CVSS:3.1/... vector string>
-
-There is no id column, so each line's 1-based line number is used as its
-pool_id.
+    {
+      "pool_id": 3,
+      "type": "synthetic",
+      "text": "The JNews WordPress theme through 10.0.1 does not validate ...",
+      "seed_example_id": 3,
+      "batch_id": null,
+      "run_id": null,
+      "added_at": "2026-08-11T14:17:57.175538+00:00"
+    }
 
 Processing
 ----------
-Each row's description is appended to a fixed CVSS-classification
+Each item's "text" field is appended to a fixed CVSS-classification
 instruction (ending in the literal phrase "CVE Description:") to form the
 full prompt that is run through Llama-3.1-8B-Instruct + the SAE hook exactly
 as in run_fac_test_pipeline_feature_stats.py. The opening-phrase mechanism
@@ -28,16 +31,15 @@ is recorded.
 
 Output
 ------
-A JSONL file (feature_coverage_filter/output) with one line per input row:
+A JSONL file (feature_coverage_filter/output) with one line per input item:
 
     {"pool_id": 3, "n_content_tokens": 41, "features": {"1234": 0.8123, ...}}
 
-`pool_id` is the 1-based line number of the row in the input TSV, so this
-file can later be used to filter/join back against the original input file.
+`pool_id` matches the `pool_id` field in the input JSON, so this file can
+later be used to filter/join back against the original input file.
 """
 
 import argparse
-import csv
 import json
 import os
 import sys
@@ -54,33 +56,33 @@ if _PIPELINE_DIR not in sys.path:
 import run_fac_test_pipeline_feature_stats as fs  # noqa: E402
 import cvss_prompt as cp  # noqa: E402
 
-_DEFAULT_INPUT_TSV = os.path.join(_SCRIPT_DIR, "input", "cti_vsp_bb_deepseek_06_pool.tsv")
+_DEFAULT_INPUT_JSON = os.path.join(_SCRIPT_DIR, "input", "cti_vsp_bb_pool_deepseek_1025.json")
 
 
 # ---------------------------------------------------------------------------
 # Loading helpers
 # ---------------------------------------------------------------------------
 
-def load_pool_items(input_tsv: str) -> List[Dict[str, Any]]:
-    """Read pool items (pool_id + text) from a headerless <description>\\t<cvss> TSV."""
+def load_pool_items(input_json: str) -> List[Dict[str, Any]]:
+    """Read pool items (pool_id + text) from the input JSON list."""
+    with open(input_json, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if not isinstance(payload, list):
+        raise ValueError(f"Expected a JSON list of pool items in {input_json}")
+
     items: List[Dict[str, Any]] = []
-    with open(input_tsv, "r", encoding="utf-8", newline="") as f:
-        reader = csv.reader(f, delimiter="\t")
-        for line_no, row in enumerate(reader, start=1):
-            if not row or all(not field.strip() for field in row):
-                continue
-            if len(row) < 2:
-                raise ValueError(
-                    f"{input_tsv}:{line_no}: expected 2 tab-separated columns "
-                    f"(description, cvss_vector), got {len(row)}"
-                )
-            text = row[0]
-            if not text.strip():
-                continue
-            items.append({"pool_id": line_no, "text": text})
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        pool_id = entry.get("pool_id")
+        text = entry.get("text")
+        if pool_id is None or not isinstance(text, str) or not text.strip():
+            continue
+        items.append({"pool_id": pool_id, "text": text})
 
     if not items:
-        raise ValueError(f"No valid pool rows (description + cvss_vector) found in {input_tsv}")
+        raise ValueError(f"No valid pool items (pool_id + text) found in {input_json}")
     return items
 
 
@@ -137,16 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer", type=int, default=16)
     parser.add_argument("--sae-ckpt-path", type=str, default="")
 
-    parser.add_argument(
-        "--input-tsv",
-        type=str,
-        default=_DEFAULT_INPUT_TSV,
-        help=(
-            "Headerless TSV with two tab-separated columns per line: "
-            "<CVE description>\\t<CVSS:3.1/... vector string>. Each line's "
-            "1-based line number is used as its pool_id."
-        ),
-    )
+    parser.add_argument("--input-json", type=str, default=_DEFAULT_INPUT_JSON)
     parser.add_argument("--max-prompts", type=int, default=0, help="0 = all")
     parser.add_argument("--hf-cache-dir", type=str, default=fs._default_cache_dir())
 
@@ -169,7 +162,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Destination JSONL. Defaults to "
-        "feature_coverage_filter/output/<input-tsv-stem>_feature_magnitudes.jsonl.",
+        "feature_coverage_filter/output/<input-json-stem>_feature_magnitudes.jsonl.",
     )
     return parser.parse_args()
 
@@ -198,18 +191,18 @@ def main() -> None:
     if not args.baseline_tsv or not os.path.isfile(args.baseline_tsv):
         raise FileNotFoundError(f"Baseline TSV not found: {args.baseline_tsv}")
 
-    if not os.path.isfile(args.input_tsv):
-        raise FileNotFoundError(f"Input TSV not found: {args.input_tsv}")
+    if not os.path.isfile(args.input_json):
+        raise FileNotFoundError(f"Input JSON not found: {args.input_json}")
 
     output_jsonl = args.output_jsonl
     if not output_jsonl:
-        stem = os.path.splitext(os.path.basename(args.input_tsv))[0]
+        stem = os.path.splitext(os.path.basename(args.input_json))[0]
         output_jsonl = os.path.join(_SCRIPT_DIR, "output", f"{stem}_feature_magnitudes.jsonl")
 
-    items = load_pool_items(args.input_tsv)
+    items = load_pool_items(args.input_json)
     if args.max_prompts > 0:
         items = items[: args.max_prompts]
-    print(f"Loaded {len(items)} pool items from {args.input_tsv}")
+    print(f"Loaded {len(items)} pool items from {args.input_json}")
 
     sae_ckpt = fs.resolve_sae_checkpoint(local_path=args.sae_ckpt_path or None)
     baseline_full = fs.load_baseline_full(args.baseline_tsv)
