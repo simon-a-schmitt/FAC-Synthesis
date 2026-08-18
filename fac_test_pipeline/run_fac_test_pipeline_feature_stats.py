@@ -288,6 +288,7 @@ def compute_feature_stats_for_prompt(
     baseline_full: Dict[int, Dict[str, float]],
     opening_phrase: Optional[str] = None,
     system: Optional[str] = None,
+    raw_magnitude: bool = False,
 ) -> Dict[str, Any]:
     """Return per-feature (activation_density, peak_magnitude, log_odds) for one prompt.
 
@@ -295,6 +296,11 @@ def compute_feature_stats_for_prompt(
     user turn) before tokenization/encoding. Default None reproduces the
     previous single-flat-user-turn behaviour exactly (non-CVSS callers of
     this function stay unaffected).
+
+    `raw_magnitude`, if True, skips the p95-baseline normalisation and
+    reports the raw SAE activation magnitudes instead (peak_magnitude and
+    the per-token top-token values are then raw activations, not
+    p95-normalised ones).
     """
     collector.cache = None
     _, token_ids, tokens = _encode_prompt_tokens(prompt, model, system=system)
@@ -360,12 +366,15 @@ def compute_feature_stats_for_prompt(
 
     raw_counts = (content_features[:, active_feature_indices] > 0).sum(dim=0)
 
-    p95_vals = tc.tensor(
-        [baseline_full[fid]["p95"] for fid in fid_list],
-        dtype=tc.float32,
-        device=content_features.device,
-    ).clamp(min=1e-9)
-    norm_features = content_features[:, active_feature_indices] / p95_vals.unsqueeze(0)
+    if raw_magnitude:
+        norm_features = content_features[:, active_feature_indices]
+    else:
+        p95_vals = tc.tensor(
+            [baseline_full[fid]["p95"] for fid in fid_list],
+            dtype=tc.float32,
+            device=content_features.device,
+        ).clamp(min=1e-9)
+        norm_features = content_features[:, active_feature_indices] / p95_vals.unsqueeze(0)
     peak_magnitudes = norm_features.max(dim=0).values
 
     _TOP_TOKEN_K = 10
