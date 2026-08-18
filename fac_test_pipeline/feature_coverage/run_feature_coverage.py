@@ -12,14 +12,17 @@ Processing
 Every prompt is run through Llama-3.1-8B-Instruct + the SAE hook exactly as
 in run_fac_test_pipeline_feature_stats.py, giving per-feature
 (activation_density, peak_magnitude, log_odds) for that prompt.
-peak_magnitude is already the p95-baseline-normalised activation magnitude.
+peak_magnitude is already the p95-baseline-normalised activation magnitude,
+unless --raw-magnitude is passed, in which case the p95 normalisation is
+skipped and the raw (unnormalised) SAE activation magnitudes are used
+instead.
 
 Output
 ------
 For every feature that was active on at least one prompt, the maximum
 peak_magnitude observed across the whole corpus is written to a TSV in
-feature_coverage/output: columns feature_id, max_normalized_magnitude,
-n_prompts_active.
+feature_coverage/output: columns feature_id, max_normalized_magnitude (or
+max_raw_magnitude with --raw-magnitude), n_prompts_active.
 """
 
 import argparse
@@ -85,13 +88,15 @@ def compute_max_magnitude_per_feature(
 def write_coverage_tsv(
     output_tsv: str,
     stats: Dict[int, Tuple[float, int]],
+    raw_magnitude: bool = False,
 ) -> None:
     out_dir = os.path.dirname(os.path.abspath(output_tsv))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+    magnitude_col = "max_raw_magnitude" if raw_magnitude else "max_normalized_magnitude"
     with open(output_tsv, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f, delimiter="\t")
-        writer.writerow(["feature_id", "max_normalized_magnitude", "n_prompts_active"])
+        writer.writerow(["feature_id", magnitude_col, "n_prompts_active"])
         for fid in sorted(stats):
             max_mag, n = stats[fid]
             writer.writerow([fid, round(max_mag, 6), n])
@@ -136,6 +141,15 @@ def parse_args() -> argparse.Namespace:
             "feature_coverage_filter's default. Pass an empty string to disable "
             "content restriction and use the whole prompt. If the phrase is not "
             "found in a prompt, the full content is used for that prompt."
+        ),
+    )
+
+    parser.add_argument(
+        "--raw-magnitude",
+        action="store_true",
+        help=(
+            "Skip the p95-baseline normalisation and extract the raw "
+            "(unnormalised) SAE activation magnitudes instead."
         ),
     )
 
@@ -217,6 +231,7 @@ def main() -> None:
                 user_content, model, collector, sae, baseline_full,
                 opening_phrase=args.opening_phrase or None,
                 system=system,
+                raw_magnitude=args.raw_magnitude,
             )
             record["index"] = idx
             records.append(record)
@@ -227,7 +242,7 @@ def main() -> None:
     stats = compute_max_magnitude_per_feature(records)
     print(f"{len(stats)} features active across {len(records)} prompts.")
 
-    write_coverage_tsv(output_tsv, stats)
+    write_coverage_tsv(output_tsv, stats, raw_magnitude=args.raw_magnitude)
     print(f"Wrote max-magnitude coverage for {len(stats)} features to {output_tsv}")
 
 
