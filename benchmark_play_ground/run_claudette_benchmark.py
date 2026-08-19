@@ -147,9 +147,67 @@ def parse_args():
     p.add_argument("--max-input-tokens", type=int, default=None, help="Optional cap for prompt tokens before generation; omit to keep the full prompt")
     p.add_argument("--max-new-tokens", type=int, default=64, help="Max new tokens to generate per prompt (answers are a single short label line)")
     p.add_argument("--max-prompts", type=int, default=0, help="Limit number of prompts (0 = all)")
+    p.add_argument("--batch-size", type=int, default=32, help="Number of prompts to generate in a single batched forward pass")
     p.add_argument("--output-jsonl", default="claudette_benchmark_results.jsonl", help="Per-example JSONL output")
     p.add_argument("--resume", action="store_true", help="Resume from existing output JSONL if present")
     return p.parse_args()
+
+
+def build_chat_messages(args, query_prompt: str, few_shots: list[dict]) -> list[dict]:
+    if args.mode == "plain":
+        return [
+            {"role": "system", "content": CLAUDETTE_SYSTEM_PROMPT},
+            {"role": "user", "content": query_prompt},
+        ]
+    if args.mode == "icl":
+        k = min(args.icl_k, len(few_shots))
+        examples = few_shots[:k]
+        messages = [{"role": "system", "content": CLAUDETTE_SYSTEM_PROMPT}]
+        for ex in examples:
+            ex_sentence = ex.get("prompt", "")
+            ex_vector = ex.get("label", ex.get("gt", ""))
+            messages.append({"role": "user", "content": ex_sentence})
+            messages.append({"role": "assistant", "content": ex_vector})
+        messages.append({"role": "user", "content": query_prompt})
+        return messages
+    # "fine_tuned" queries the model directly, without few-shot examples
+    return [{"role": "user", "content": query_prompt}]
+
+
+def render_chat_text(tokenizer, chat_messages: list[dict]) -> str:
+    return tokenizer.apply_chat_template(
+        chat_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
+def generate_batch(hf_model, tokenizer, texts: list[str], *, max_new_tokens: int, max_input_tokens: int | None, device: str) -> list[str]:
+    # `texts` were already rendered through the chat template (tokenize=False), so the
+    # special/control tokens (BOS, header tokens, ...) are already present as literal text.
+    # add_special_tokens=False avoids the tokenizer prepending a second BOS on top of that.
+    encoded = [tokenizer(text, add_special_tokens=False)["input_ids"] for text in texts]
+    if max_input_tokens:
+        encoded = [ids[-max_input_tokens:] for ids in encoded]
+
+    # tokenizer.padding_side is "left" (set in generator_uni.build_model), so this left-pads
+    # the batch, which is what a causal LM needs for correct batched generation.
+    padded = tokenizer.pad({"input_ids": encoded}, padding=True, return_tensors="pt")
+    input_ids = padded["input_ids"].to(device)
+    attention_mask = padded["attention_mask"].to(device)
+
+    outputs = hf_model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        stop_strings=["\n\n"],
+        tokenizer=tokenizer,
+        use_cache=True,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    gen_tokens = outputs[:, input_ids.shape[1]:]
+    return tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
 
 
 def main():
@@ -170,6 +228,10 @@ def main():
     model = LocalModel(args.model_path, device=args.device, dtype=args.dtype, lora_path=lora_path)
     model.load()
     tokenizer = model.tokenizer
+    # Batched generation needs direct access to the underlying HF model (LocalModel/UnifiedGenerator
+    # only expose a single-prompt generate() call), without touching the shared wrapper used by the
+    # other benchmark scripts.
+    hf_model = model._gen._model
 
     out_path = Path(args.output_jsonl)
     results = []
@@ -197,49 +259,27 @@ def main():
     mode = "a" if (args.resume and out_path.exists()) else "w"
     fh = out_path.open(mode, encoding="utf-8")
 
-    for idx in range(start_idx, len(records)):
-        rec = records[idx]
-        query_prompt = rec["prompt"]
-        if args.mode == "plain":
-            prompt = [
-                {"role": "system", "content": CLAUDETTE_SYSTEM_PROMPT},
-                {"role": "user", "content": query_prompt},
-            ]
-        elif args.mode == "icl":
-            # choose up to k few-shot examples
-            k = min(args.icl_k, len(few_shots))
-            examples = few_shots[:k]
-            prompt = [{"role": "system", "content": CLAUDETTE_SYSTEM_PROMPT}]
-            for ex in examples:
-                ex_sentence = ex.get("prompt", "")
-                ex_vector = ex.get("label", ex.get("gt", ""))
-                prompt.append({"role": "user", "content": ex_sentence})
-                prompt.append({"role": "assistant", "content": ex_vector})
-            prompt.append({"role": "user", "content": query_prompt})
-        else:
-            # "fine_tuned" queries the model directly, without few-shot examples
-            prompt = query_prompt
+    batch_size = max(1, args.batch_size)
+    idx = start_idx
+    while idx < len(records):
+        batch_records = records[idx: idx + batch_size]
+        batch_query_prompts = [rec["prompt"] for rec in batch_records]
+        batch_chat_messages = [build_chat_messages(args, qp, few_shots) for qp in batch_query_prompts]
+        batch_texts = [render_chat_text(tokenizer, cm) for cm in batch_chat_messages]
 
-        chat_messages = prompt if isinstance(prompt, list) else [{"role": "user", "content": prompt}]
-        final_model_input = tokenizer.apply_chat_template(
-            chat_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        print("=== Final model input (incl. special tokens) ===")
-        print(final_model_input)
-        print("=== End final model input ===")
+        for final_model_input in batch_texts:
+            print("=== Final model input (incl. special tokens) ===")
+            print(final_model_input)
+            print("=== End final model input ===")
 
         try:
-            raw = model.generate(
-                prompt,
+            batch_raw = generate_batch(
+                hf_model,
+                tokenizer,
+                batch_texts,
                 max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                stop_strings=["\n\n"],
-                tokenizer=tokenizer,
-                use_cache=True,
                 max_input_tokens=args.max_input_tokens,
-                use_chat_template=True,
+                device=args.device,
             )
         except RuntimeError as e:
             msg = str(e)
@@ -253,37 +293,38 @@ def main():
             fallback_max_input = args.max_input_tokens if args.max_input_tokens else 2048
             fallback_max_input = min(fallback_max_input, 2048)
             print(
-                f"CUDA generation failed at index {idx}. Retrying with max_input_tokens={fallback_max_input}, use_cache=True..."
+                f"CUDA generation failed for batch starting at index {idx}. Retrying with max_input_tokens={fallback_max_input}..."
             )
 
-            raw = model.generate(
-                prompt,
+            batch_raw = generate_batch(
+                hf_model,
+                tokenizer,
+                batch_texts,
                 max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                stop_strings=["\n\n"],
-                tokenizer=tokenizer,
-                use_cache=True,
                 max_input_tokens=fallback_max_input,
-                use_chat_template=True,
+                device=args.device,
             )
 
-        gt = rec.get("gt", "")
-        pred_vector = extract_claudette_vector_from_text(raw)
-        predicted_metrics = extract_claudette_metrics_from_text(raw)
-        gt_metrics = extract_claudette_metrics_from_text(gt)
-        result = {
-            "index": idx,
-            "prompt": query_prompt,
-            "raw_output": raw,
-            "predicted_vector": pred_vector,
-            "predicted_metrics": predicted_metrics,
-            "gt": gt,
-            "gt_metrics": gt_metrics,
-            "correct": metrics_match(predicted_metrics, gt_metrics),
-        }
-        fh.write(json.dumps(result, ensure_ascii=False) + "\n")
-        fh.flush()
-        results.append(result)
+        for offset, (rec, query_prompt, raw) in enumerate(zip(batch_records, batch_query_prompts, batch_raw)):
+            gt = rec.get("gt", "")
+            pred_vector = extract_claudette_vector_from_text(raw)
+            predicted_metrics = extract_claudette_metrics_from_text(raw)
+            gt_metrics = extract_claudette_metrics_from_text(gt)
+            result = {
+                "index": idx + offset,
+                "prompt": query_prompt,
+                "raw_output": raw,
+                "predicted_vector": pred_vector,
+                "predicted_metrics": predicted_metrics,
+                "gt": gt,
+                "gt_metrics": gt_metrics,
+                "correct": metrics_match(predicted_metrics, gt_metrics),
+            }
+            fh.write(json.dumps(result, ensure_ascii=False) + "\n")
+            fh.flush()
+            results.append(result)
+
+        idx += batch_size
 
     fh.close()
 
