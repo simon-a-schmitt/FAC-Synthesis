@@ -180,9 +180,89 @@ def parse_args():
     p.add_argument("--max-input-tokens", type=int, default=None, help="Optional cap for prompt tokens before generation; omit to keep the full prompt")
     p.add_argument("--max-new-tokens", type=int, default=256, help="Max new tokens to generate per prompt (CVSS answers may include per-metric reasoning before the final vector)")
     p.add_argument("--max-prompts", type=int, default=0, help="Limit number of prompts (0 = all)")
+    p.add_argument("--batch-size", type=int, default=32, help="Number of prompts to generate in a single batched forward pass")
     p.add_argument("--output-jsonl", default="cti_vsp_benchmark_results.jsonl", help="Per-example JSONL output")
     p.add_argument("--resume", action="store_true", help="Resume from existing output JSONL if present")
     return p.parse_args()
+
+
+CTI_VSP_STOP_STRINGS = ["\nCVE Description:", "\n\n"]
+
+
+def build_chat_messages(args, query_prompt: str, few_shots: list[dict]) -> list[dict]:
+    if args.mode == "plain":
+        user_content = extract_cve_description_block(query_prompt)
+        return [
+            {"role": "system", "content": CTI_VSP_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+    if args.mode == "icl":
+        k = min(args.icl_k, len(few_shots))
+        examples = few_shots[:k]
+        user_content = extract_cve_description_block(query_prompt)
+        messages = [{"role": "system", "content": CTI_VSP_SYSTEM_PROMPT}]
+        for ex in examples:
+            ex_description = extract_cve_description_block(ex.get("prompt", ""))
+            ex_vector = ex.get("label", ex.get("gt", ""))
+            messages.append({"role": "user", "content": ex_description})
+            messages.append({"role": "assistant", "content": ex_vector})
+        messages.append({"role": "user", "content": user_content})
+        return messages
+    # "fine_tuned" queries the model directly, without few-shot examples
+    return [{"role": "user", "content": query_prompt}]
+
+
+def render_chat_text(tokenizer, chat_messages: list[dict]) -> str:
+    return tokenizer.apply_chat_template(
+        chat_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
+def generate_batch(hf_model, tokenizer, texts: list[str], *, max_new_tokens: int, max_input_tokens: int | None, device: str) -> list[str]:
+    # `texts` were already rendered through the chat template (tokenize=False), so the
+    # special/control tokens (BOS, header tokens, ...) are already present as literal text.
+    # add_special_tokens=False avoids the tokenizer prepending a second BOS on top of that.
+    encoded = [tokenizer(text, add_special_tokens=False)["input_ids"] for text in texts]
+    if max_input_tokens:
+        encoded = [ids[-max_input_tokens:] for ids in encoded]
+
+    # tokenizer.padding_side is "left" (set in generator_uni.build_model), so this left-pads
+    # the batch, which is what a causal LM needs for correct batched generation.
+    padded = tokenizer.pad({"input_ids": encoded}, padding=True, return_tensors="pt")
+    input_ids = padded["input_ids"].to(device)
+    attention_mask = padded["attention_mask"].to(device)
+
+    try:
+        outputs = hf_model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            stop_strings=CTI_VSP_STOP_STRINGS,
+            tokenizer=tokenizer,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    except torch.cuda.OutOfMemoryError:
+        # This transformers version computes logits over the *full* padded sequence
+        # (no logits_to_keep slicing), so peak memory scales with batch_size * seq_len *
+        # vocab_size. Long CTI-VSP prompts can blow this up well before the requested
+        # batch size is actually reachable, independent of --max-input-tokens. Splitting
+        # the batch in half and retrying is the standard fallback for that.
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        if len(texts) <= 1:
+            raise
+        mid = len(texts) // 2
+        print(f"CUDA OOM at batch size {len(texts)}. Splitting into sub-batches of {mid} and {len(texts) - mid}...")
+        first = generate_batch(hf_model, tokenizer, texts[:mid], max_new_tokens=max_new_tokens, max_input_tokens=max_input_tokens, device=device)
+        second = generate_batch(hf_model, tokenizer, texts[mid:], max_new_tokens=max_new_tokens, max_input_tokens=max_input_tokens, device=device)
+        return first + second
+
+    gen_tokens = outputs[:, input_ids.shape[1]:]
+    return tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
 
 
 def main():
@@ -205,6 +285,10 @@ def main():
     model = LocalModel(args.model_path, device=args.device, dtype=args.dtype, lora_path=lora_path)
     model.load()
     tokenizer = model.tokenizer
+    # Batched generation needs direct access to the underlying HF model (LocalModel/UnifiedGenerator
+    # only expose a single-prompt generate() call), without touching the shared wrapper used by the
+    # other benchmark scripts.
+    hf_model = model._gen._model
 
     out_path = Path(args.output_jsonl)
     results = []
@@ -228,101 +312,99 @@ def main():
         except Exception as e:
             print("Warning: failed to read existing output to resume:", e)
 
-    # Open output file: append if resuming, otherwise overwrite
-    mode = "a" if (args.resume and out_path.exists()) else "w"
-    fh = out_path.open(mode, encoding="utf-8")
+    batch_size = max(1, args.batch_size)
 
-    for idx in range(start_idx, len(records)):
-        rec = records[idx]
-        query_prompt = rec["prompt"]
-        if args.mode == "plain":
-            user_content = extract_cve_description_block(query_prompt)
-            prompt = [
-                {"role": "system", "content": CTI_VSP_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ]
-        elif args.mode == "icl":
-            # choose up to k few-shot examples
-            k = min(args.icl_k, len(few_shots))
-            examples = few_shots[:k]
-            user_content = extract_cve_description_block(query_prompt)
-            prompt = [{"role": "system", "content": CTI_VSP_SYSTEM_PROMPT}]
-            for ex in examples:
-                ex_description = extract_cve_description_block(ex.get("prompt", ""))
-                ex_vector = ex.get("label", ex.get("gt", ""))
-                prompt.append({"role": "user", "content": ex_description})
-                prompt.append({"role": "assistant", "content": ex_vector})
-            prompt.append({"role": "user", "content": user_content})
-        else:
-            # "fine_tuned" queries the model directly, without few-shot examples
-            prompt = query_prompt
-
-        chat_messages = prompt if isinstance(prompt, list) else [{"role": "user", "content": prompt}]
-        final_model_input = tokenizer.apply_chat_template(
-            chat_messages,
-            tokenize=False,
-            add_generation_prompt=True,
+    # Keep batch boundaries identical to an uninterrupted run: if the resume point falls
+    # mid-batch (e.g. the previous run was killed while writing a batch), re-align to the
+    # start of that batch and recompute it in full, so results are grouped exactly as they
+    # would be in one continuous run with this --batch-size.
+    aligned_start = (start_idx // batch_size) * batch_size
+    if aligned_start < start_idx:
+        print(
+            f"Resume point index {start_idx} is not aligned to batch_size={batch_size}; "
+            f"re-aligning to batch start {aligned_start} and recomputing that batch for "
+            f"consistent batch grouping."
         )
-        print("=== Final model input (incl. special tokens) ===")
-        print(final_model_input)
-        print("=== End final model input ===")
+        results = results[:aligned_start]
+        start_idx = aligned_start
+
+    # Rewrite the output file to hold exactly the kept results, then continue appending
+    # from there. This truncates away any partial-batch tail from an interrupted run.
+    with out_path.open("w", encoding="utf-8") as wfh:
+        for r in results:
+            wfh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    fh = out_path.open("a", encoding="utf-8")
+
+    idx = start_idx
+    while idx < len(records):
+        batch_records = records[idx: idx + batch_size]
+        batch_query_prompts = [rec["prompt"] for rec in batch_records]
+        batch_chat_messages = [build_chat_messages(args, qp, few_shots) for qp in batch_query_prompts]
+        batch_texts = [render_chat_text(tokenizer, cm) for cm in batch_chat_messages]
+
+        for final_model_input in batch_texts:
+            print("=== Final model input (incl. special tokens) ===")
+            print(final_model_input)
+            print("=== End final model input ===")
 
         try:
-            raw = model.generate(
-                prompt,
+            batch_raw = generate_batch(
+                hf_model,
+                tokenizer,
+                batch_texts,
                 max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                stop_strings=["\nCVE Description:", "\n\n"],
-                tokenizer=tokenizer,
-                use_cache=True,
                 max_input_tokens=args.max_input_tokens,
-                use_chat_template=True,
+                device=args.device,
             )
         except RuntimeError as e:
             msg = str(e)
-            if "CUDA error" not in msg:
+            is_oom = isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in msg.lower()
+            if "CUDA error" not in msg and not is_oom:
                 raise
 
-            # Retry once with a tighter context window to avoid transient GPU kernel failures.
+            # Retry once with a tighter context window to avoid transient GPU kernel failures
+            # (or, for OOM, after generate_batch() has already halved the batch down to a
+            # single prompt and still couldn't fit it).
             if args.device == "cuda" and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
             fallback_max_input = args.max_input_tokens if args.max_input_tokens else 2048
             fallback_max_input = min(fallback_max_input, 2048)
             print(
-                f"CUDA generation failed at index {idx}. Retrying with max_input_tokens={fallback_max_input}, use_cache=True..."
+                f"CUDA generation failed for batch starting at index {idx}. Retrying with max_input_tokens={fallback_max_input}..."
             )
 
-            raw = model.generate(
-                prompt,
+            batch_raw = generate_batch(
+                hf_model,
+                tokenizer,
+                batch_texts,
                 max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                stop_strings=["\nCVE Description:", "\n\n"],
-                tokenizer=tokenizer,
-                use_cache=True,
                 max_input_tokens=fallback_max_input,
-                use_chat_template=True,
+                device=args.device,
             )
 
-        gt = rec.get("gt", "")
-        pred_vector = extract_cvss_vector_from_text(raw)
-        predicted_metrics = extract_cvss_metrics_from_text(raw)
-        gt_metrics = extract_cvss_metrics_from_text(gt)
-        result = {
-            "index": idx,
-            "prompt": query_prompt,
-            "raw_output": raw,
-            "predicted_vector": pred_vector,
-            "predicted_metrics": predicted_metrics,
-            "predicted_score": cvss3_base_score(predicted_metrics),
-            "gt": gt,
-            "gt_metrics": gt_metrics,
-            "gt_score": cvss3_base_score(gt_metrics),
-            "correct": metrics_match(predicted_metrics, gt_metrics),
-        }
-        fh.write(json.dumps(result, ensure_ascii=False) + "\n")
-        fh.flush()
-        results.append(result)
+        for offset, (rec, query_prompt, raw) in enumerate(zip(batch_records, batch_query_prompts, batch_raw)):
+            gt = rec.get("gt", "")
+            pred_vector = extract_cvss_vector_from_text(raw)
+            predicted_metrics = extract_cvss_metrics_from_text(raw)
+            gt_metrics = extract_cvss_metrics_from_text(gt)
+            result = {
+                "index": idx + offset,
+                "prompt": query_prompt,
+                "raw_output": raw,
+                "predicted_vector": pred_vector,
+                "predicted_metrics": predicted_metrics,
+                "predicted_score": cvss3_base_score(predicted_metrics),
+                "gt": gt,
+                "gt_metrics": gt_metrics,
+                "gt_score": cvss3_base_score(gt_metrics),
+                "correct": metrics_match(predicted_metrics, gt_metrics),
+            }
+            fh.write(json.dumps(result, ensure_ascii=False) + "\n")
+            fh.flush()
+            results.append(result)
+
+        idx += batch_size
 
     fh.close()
 

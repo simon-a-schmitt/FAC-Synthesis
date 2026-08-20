@@ -196,16 +196,33 @@ def generate_batch(hf_model, tokenizer, texts: list[str], *, max_new_tokens: int
     input_ids = padded["input_ids"].to(device)
     attention_mask = padded["attention_mask"].to(device)
 
-    outputs = hf_model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        stop_strings=["\n\n"],
-        tokenizer=tokenizer,
-        use_cache=True,
-        pad_token_id=tokenizer.pad_token_id,
-    )
+    try:
+        outputs = hf_model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            stop_strings=["\n\n"],
+            tokenizer=tokenizer,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    except torch.cuda.OutOfMemoryError:
+        # This transformers version computes logits over the *full* padded sequence
+        # (no logits_to_keep slicing), so peak memory scales with batch_size * seq_len *
+        # vocab_size. Long prompts can blow this up well before the requested batch size
+        # is actually reachable, independent of --max-input-tokens. Splitting the batch
+        # in half and retrying is the standard fallback for that.
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        if len(texts) <= 1:
+            raise
+        mid = len(texts) // 2
+        print(f"CUDA OOM at batch size {len(texts)}. Splitting into sub-batches of {mid} and {len(texts) - mid}...")
+        first = generate_batch(hf_model, tokenizer, texts[:mid], max_new_tokens=max_new_tokens, max_input_tokens=max_input_tokens, device=device)
+        second = generate_batch(hf_model, tokenizer, texts[mid:], max_new_tokens=max_new_tokens, max_input_tokens=max_input_tokens, device=device)
+        return first + second
+
     gen_tokens = outputs[:, input_ids.shape[1]:]
     return tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
 
@@ -255,11 +272,29 @@ def main():
         except Exception as e:
             print("Warning: failed to read existing output to resume:", e)
 
-    # Open output file: append if resuming, otherwise overwrite
-    mode = "a" if (args.resume and out_path.exists()) else "w"
-    fh = out_path.open(mode, encoding="utf-8")
-
     batch_size = max(1, args.batch_size)
+
+    # Keep batch boundaries identical to an uninterrupted run: if the resume point falls
+    # mid-batch (e.g. the previous run was killed while writing a batch), re-align to the
+    # start of that batch and recompute it in full, so results are grouped exactly as they
+    # would be in one continuous run with this --batch-size.
+    aligned_start = (start_idx // batch_size) * batch_size
+    if aligned_start < start_idx:
+        print(
+            f"Resume point index {start_idx} is not aligned to batch_size={batch_size}; "
+            f"re-aligning to batch start {aligned_start} and recomputing that batch for "
+            f"consistent batch grouping."
+        )
+        results = results[:aligned_start]
+        start_idx = aligned_start
+
+    # Rewrite the output file to hold exactly the kept results, then continue appending
+    # from there. This truncates away any partial-batch tail from an interrupted run.
+    with out_path.open("w", encoding="utf-8") as wfh:
+        for r in results:
+            wfh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    fh = out_path.open("a", encoding="utf-8")
+
     idx = start_idx
     while idx < len(records):
         batch_records = records[idx: idx + batch_size]
@@ -283,10 +318,13 @@ def main():
             )
         except RuntimeError as e:
             msg = str(e)
-            if "CUDA error" not in msg:
+            is_oom = isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in msg.lower()
+            if "CUDA error" not in msg and not is_oom:
                 raise
 
-            # Retry once with a tighter context window to avoid transient GPU kernel failures.
+            # Retry once with a tighter context window to avoid transient GPU kernel failures
+            # (or, for OOM, after generate_batch() has already halved the batch down to a
+            # single prompt and still couldn't fit it).
             if args.device == "cuda" and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
