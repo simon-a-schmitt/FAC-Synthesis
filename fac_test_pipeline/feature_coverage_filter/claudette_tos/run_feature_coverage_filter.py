@@ -1,34 +1,44 @@
 """
-Build a pool_id -> active-feature mapping for a CVSS-vector prompt pool.
+Build a pool_id -> active-feature mapping for a CLAUDETTE-TOS prompt pool.
 
 Input
 -----
-A headerless TSV file (feature_coverage_filter/input) with exactly two
-tab-separated columns per line, as produced e.g. by
-input/cti_vsp_bb_deepseek_06_pool.tsv:
+A headerless TSV file (feature_coverage_filter/claudette_tos/input) with
+exactly two tab-separated columns per line, as produced e.g. by
+input/claudette_tos_train.tsv:
 
-    <CVE description>\t<CVSS:3.1/... vector string>
+    <ToS sentence>\t<LTD:Y|TER:N|...|ARB:N| unfairness-type vector string>
 
 There is no id column, so each line's 1-based line number is used as its
 pool_id.
 
 Processing
 ----------
-Each row's description is appended to a fixed CVSS-classification
-instruction (ending in the literal phrase "CVE Description:") to form the
-full prompt that is run through Llama-3.1-8B-Instruct + the SAE hook exactly
-as in run_fac_test_pipeline_feature_stats.py. The opening-phrase mechanism
-from that module is used so only tokens *after* "CVE Description:" (i.e. the
-CVE description text itself, not the fixed instruction) are treated as
-content tokens and considered for feature-activation stats.
+Each row's sentence is run, unmodified, as the USER turn of the CLAUDETTE-TOS
+classification prompt (SYSTEM turn = CLAUDETTE_SYSTEM_PROMPT), through
+Llama-3.1-8B-Instruct + the SAE hook exactly as in
+run_fac_test_pipeline_feature_stats.py. This is completely analogous to
+feature_coverage_filter/cti_vsp/run_feature_coverage_filter.py, with prompt
+construction delegated to claudette_prompt.py (the CLAUDETTE counterpart of
+cvss_prompt.py) instead of cvss_prompt.py, so the same processing logic
+(SYSTEM/USER prompt structure, model + SAE call, feature-stats extraction) is
+shared with benchmark_play_ground/run_claudette_benchmark.py's "plain" mode.
+
+Unlike the CVSS pipeline, the CLAUDETTE user turn has no fixed opening phrase
+preceding the content (the user turn *is* the ToS sentence verbatim), so
+every token of the user turn is treated as a content token - no
+--opening-phrase is used.
 
 For every feature that fired on those content tokens, the maximum
 p95-baseline-normalised activation magnitude (peak_magnitude) on that prompt
-is recorded.
+is recorded, unless --raw-magnitude is passed, in which case the p95
+normalisation is skipped and the raw (unnormalised) SAE activation
+magnitudes are used instead.
 
 Output
 ------
-A JSONL file (feature_coverage_filter/output) with one line per input row:
+A JSONL file (feature_coverage_filter/claudette_tos/output) with one line per
+input row:
 
     {"pool_id": 3, "n_content_tokens": 41, "features": {"1234": 0.8123, ...}}
 
@@ -47,14 +57,14 @@ import torch as tc
 import tqdm
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_PIPELINE_DIR = os.path.dirname(_SCRIPT_DIR)
+_PIPELINE_DIR = os.path.dirname(os.path.dirname(_SCRIPT_DIR))
 if _PIPELINE_DIR not in sys.path:
     sys.path.insert(0, _PIPELINE_DIR)
 
 import run_fac_test_pipeline_feature_stats as fs  # noqa: E402
-import cvss_prompt as cp  # noqa: E402
+import claudette_prompt as clp  # noqa: E402
 
-_DEFAULT_INPUT_TSV = os.path.join(_SCRIPT_DIR, "input", "cti_vsp_bb_deepseek_06_pool.tsv")
+_DEFAULT_INPUT_TSV = os.path.join(_SCRIPT_DIR, "input", "claudette_tos_train.tsv")
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +72,7 @@ _DEFAULT_INPUT_TSV = os.path.join(_SCRIPT_DIR, "input", "cti_vsp_bb_deepseek_06_
 # ---------------------------------------------------------------------------
 
 def load_pool_items(input_tsv: str) -> List[Dict[str, Any]]:
-    """Read pool items (pool_id + text) from a headerless <description>\\t<cvss> TSV."""
+    """Read pool items (pool_id + text) from a headerless <sentence>\\t<vector> TSV."""
     items: List[Dict[str, Any]] = []
     with open(input_tsv, "r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f, delimiter="\t")
@@ -72,7 +82,7 @@ def load_pool_items(input_tsv: str) -> List[Dict[str, Any]]:
             if len(row) < 2:
                 raise ValueError(
                     f"{input_tsv}:{line_no}: expected 2 tab-separated columns "
-                    f"(description, cvss_vector), got {len(row)}"
+                    f"(sentence, unfairness_vector), got {len(row)}"
                 )
             text = row[0]
             if not text.strip():
@@ -80,7 +90,7 @@ def load_pool_items(input_tsv: str) -> List[Dict[str, Any]]:
             items.append({"pool_id": line_no, "text": text})
 
     if not items:
-        raise ValueError(f"No valid pool rows (description + cvss_vector) found in {input_tsv}")
+        raise ValueError(f"No valid pool rows (sentence + unfairness_vector) found in {input_tsv}")
     return items
 
 
@@ -123,10 +133,10 @@ def write_pool_records_jsonl(records: List[Dict[str, Any]], output_jsonl: str) -
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "FAC feature-coverage-filter pipeline: build the CVSS-classification "
-            "prompt for every pool item, run it through Llama-3.1-8B-Instruct + the "
-            "SAE, and record the active features and their max p95-normalised "
-            "magnitude, keyed by pool_id."
+            "FAC feature-coverage-filter pipeline: build the CLAUDETTE-TOS "
+            "classification prompt for every pool item, run it through "
+            "Llama-3.1-8B-Instruct + the SAE, and record the active features and "
+            "their max p95-normalised magnitude, keyed by pool_id."
         )
     )
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
@@ -143,7 +153,7 @@ def parse_args() -> argparse.Namespace:
         default=_DEFAULT_INPUT_TSV,
         help=(
             "Headerless TSV with two tab-separated columns per line: "
-            "<CVE description>\\t<CVSS:3.1/... vector string>. Each line's "
+            "<ToS sentence>\\t<unfairness-type vector string>. Each line's "
             "1-based line number is used as its pool_id."
         ),
     )
@@ -153,14 +163,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-tsv", type=str, default=fs._DEFAULT_BASELINE_TSV)
 
     parser.add_argument(
-        "--opening-phrase",
-        type=str,
-        default=cp.CVSS_OPENING_PHRASE,
+        "--raw-magnitude",
+        action="store_true",
         help=(
-            "Only tokens after this phrase (excluding the phrase itself) within "
-            "each prompt's content are considered for feature-activation stats. "
-            f"Defaults to {cp.CVSS_OPENING_PHRASE!r}, i.e. the fixed instruction preceding "
-            "the CVE description is excluded."
+            "Skip the p95-baseline normalisation and extract the raw "
+            "(unnormalised) SAE activation magnitudes instead."
         ),
     )
 
@@ -169,7 +176,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Destination JSONL. Defaults to "
-        "feature_coverage_filter/output/<input-tsv-stem>_feature_magnitudes.jsonl.",
+        "feature_coverage_filter/claudette_tos/output/<input-tsv-stem>_feature_magnitudes.jsonl.",
     )
     return parser.parse_args()
 
@@ -232,18 +239,19 @@ def main() -> None:
     sae.eval()
 
     # -----------------------------------------------------------------------
-    # Step 1: build the CVSS-classification prompt for every pool item and
-    # extract per-prompt feature stats (identical to feature-stats pipeline),
-    # restricted to tokens after --opening-phrase ("CVE Description:").
+    # Step 1: build the CLAUDETTE-TOS classification prompt for every pool
+    # item and extract per-prompt feature stats (identical to feature-stats
+    # pipeline). The user turn is the ToS sentence verbatim, so there is no
+    # opening phrase to skip past - the whole user turn is content.
     # -----------------------------------------------------------------------
     records: List[Dict[str, Any]] = []
     with tc.no_grad():
         for item in tqdm.tqdm(items, desc="Processing prompts"):
-            user_content = cp.build_cvss_user_content(item["text"])
+            user_content = clp.build_claudette_user_content(item["text"])
             record = fs.compute_feature_stats_for_prompt(
                 user_content, model, collector, sae, baseline_full,
-                opening_phrase=args.opening_phrase or None,
-                system=cp.CVSS_SYSTEM_PROMPT,
+                system=clp.CLAUDETTE_SYSTEM_PROMPT,
+                raw_magnitude=args.raw_magnitude,
             )
             records.append(record)
 

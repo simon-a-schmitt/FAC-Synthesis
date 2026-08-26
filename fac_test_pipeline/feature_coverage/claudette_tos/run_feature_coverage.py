@@ -1,11 +1,27 @@
 """
 Compute, for every SAE feature, the maximum normalised (peak) magnitude
-observed anywhere across a corpus of prompts.
+observed anywhere across a corpus of CLAUDETTE-TOS prompts.
 
 Input
 -----
-A two-column TSV (prompt <TAB> expected_answer, no header) from
-feature_coverage/input. Only the first column (the prompt) is used.
+A headerless TSV (feature_coverage/claudette_tos/input) with exactly two
+tab-separated columns per line, as produced e.g. by
+input/claudette_tos_test.tsv:
+
+    <ToS sentence>\\t<LTD:Y|TER:N|...|ARB:N| unfairness-type vector string>
+
+Only the first column (the sentence) is used.
+
+Unlike the CVSS/CTI-VSP TSVs consumed by
+feature_coverage/cti_vsp/run_feature_coverage.py, these sentences do NOT
+already contain the classification instruction, so there is nothing to
+extract via a normalize_cvss_prompt()-style split. Instead the fixed
+CLAUDETTE-TOS instruction (CLAUDETTE_SYSTEM_PROMPT from claudette_prompt.py)
+is added here as a SYSTEM turn, with the sentence run verbatim (via
+claudette_prompt.build_claudette_user_content()) as the USER turn - matching
+the genuine two-turn chat structure used by
+feature_coverage_filter/claudette_tos/run_feature_coverage_filter.py and
+benchmark_play_ground/run_claudette_benchmark.py ("plain" mode).
 
 Processing
 ----------
@@ -15,14 +31,17 @@ in run_fac_test_pipeline_feature_stats.py, giving per-feature
 peak_magnitude is already the p95-baseline-normalised activation magnitude,
 unless --raw-magnitude is passed, in which case the p95 normalisation is
 skipped and the raw (unnormalised) SAE activation magnitudes are used
-instead.
+instead. The user turn is the ToS sentence verbatim, so there is no opening
+phrase to skip past - the whole user turn is treated as content tokens (no
+--opening-phrase option, unlike the CVSS pipelines).
 
 Output
 ------
 For every feature that was active on at least one prompt, the maximum
 peak_magnitude observed across the whole corpus is written to a TSV in
-feature_coverage/output: columns feature_id, max_normalized_magnitude (or
-max_raw_magnitude with --raw-magnitude), n_prompts_active.
+feature_coverage/claudette_tos/output: columns feature_id,
+max_normalized_magnitude (or max_raw_magnitude with --raw-magnitude),
+n_prompts_active.
 """
 
 import argparse
@@ -36,14 +55,14 @@ import torch as tc
 import tqdm
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_PIPELINE_DIR = os.path.dirname(_SCRIPT_DIR)
+_PIPELINE_DIR = os.path.dirname(os.path.dirname(_SCRIPT_DIR))
 if _PIPELINE_DIR not in sys.path:
     sys.path.insert(0, _PIPELINE_DIR)
 
 import run_fac_test_pipeline_feature_stats as fs  # noqa: E402
-import cvss_prompt as cp  # noqa: E402
+import claudette_prompt as clp  # noqa: E402
 
-_DEFAULT_INPUT_TSV = os.path.join(_SCRIPT_DIR, "input", "cti_vsp_ft_200.tsv")
+_DEFAULT_INPUT_TSV = os.path.join(_SCRIPT_DIR, "input", "claudette_tos_test.tsv")
 
 
 # ---------------------------------------------------------------------------
@@ -51,19 +70,25 @@ _DEFAULT_INPUT_TSV = os.path.join(_SCRIPT_DIR, "input", "cti_vsp_ft_200.tsv")
 # ---------------------------------------------------------------------------
 
 def load_prompts_tsv(tsv_path: str) -> List[str]:
-    """Read the first column (prompt) of a headerless TSV."""
-    prompts: List[str] = []
-    with open(tsv_path, "r", encoding="utf-8") as f:
+    """Read the ToS sentences (first column) of a headerless
+    <sentence>\\t<unfairness_vector> TSV."""
+    sentences: List[str] = []
+    with open(tsv_path, "r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f, delimiter="\t")
-        for row in reader:
-            if not row:
+        for line_no, row in enumerate(reader, start=1):
+            if not row or all(not field.strip() for field in row):
                 continue
-            prompt = row[0].strip()
-            if prompt:
-                prompts.append(prompt)
-    if not prompts:
+            if len(row) < 2:
+                raise ValueError(
+                    f"{tsv_path}:{line_no}: expected 2 tab-separated columns "
+                    f"(sentence, unfairness_vector), got {len(row)}"
+                )
+            sentence = row[0].strip()
+            if sentence:
+                sentences.append(sentence)
+    if not sentences:
         raise ValueError(f"No prompts found in {tsv_path}")
-    return prompts
+    return sentences
 
 
 # ---------------------------------------------------------------------------
@@ -109,10 +134,10 @@ def write_coverage_tsv(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "FAC feature-coverage pipeline: run every prompt in a TSV through "
-            "Llama-3.1-8B-Instruct + the SAE, and record the maximum "
-            "p95-normalised magnitude reached by each feature across the "
-            "whole corpus."
+            "FAC feature-coverage pipeline: run every CLAUDETTE-TOS sentence "
+            "in a TSV through Llama-3.1-8B-Instruct + the SAE, and record "
+            "the maximum p95-normalised magnitude reached by each feature "
+            "across the whole corpus."
         )
     )
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
@@ -123,26 +148,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layer", type=int, default=16)
     parser.add_argument("--sae-ckpt-path", type=str, default="")
 
-    parser.add_argument("--input-tsv", type=str, default=_DEFAULT_INPUT_TSV)
+    parser.add_argument(
+        "--input-tsv",
+        type=str,
+        default=_DEFAULT_INPUT_TSV,
+        help=(
+            "Headerless TSV with two tab-separated columns per line: "
+            "<ToS sentence>\\t<unfairness-type vector string>. Only the "
+            "sentence column is used."
+        ),
+    )
     parser.add_argument("--max-prompts", type=int, default=0, help="0 = all")
     parser.add_argument("--hf-cache-dir", type=str, default=fs._default_cache_dir())
 
     parser.add_argument("--baseline-tsv", type=str, default=fs._DEFAULT_BASELINE_TSV)
-
-    parser.add_argument(
-        "--opening-phrase",
-        type=str,
-        default=cp.CVSS_OPENING_PHRASE,
-        help=(
-            "Only tokens after this phrase (excluding the phrase itself) within "
-            "each prompt's content are considered for feature-activation stats. "
-            f"Defaults to {cp.CVSS_OPENING_PHRASE!r}, i.e. the fixed CVSS-classification "
-            "instruction preceding the CVE description is excluded, matching "
-            "feature_coverage_filter's default. Pass an empty string to disable "
-            "content restriction and use the whole prompt. If the phrase is not "
-            "found in a prompt, the full content is used for that prompt."
-        ),
-    )
 
     parser.add_argument(
         "--raw-magnitude",
@@ -158,7 +177,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Destination TSV. Defaults to "
-        "feature_coverage/output/<input-tsv-stem>_max_magnitude.tsv.",
+        "feature_coverage/claudette_tos/output/<input-tsv-stem>_max_magnitude.tsv.",
     )
     return parser.parse_args()
 
@@ -195,11 +214,10 @@ def main() -> None:
         stem = os.path.splitext(os.path.basename(args.input_tsv))[0]
         output_tsv = os.path.join(_SCRIPT_DIR, "output", f"{stem}_max_magnitude.tsv")
 
-    prompts = load_prompts_tsv(args.input_tsv)
+    sentences = load_prompts_tsv(args.input_tsv)
     if args.max_prompts > 0:
-        prompts = prompts[: args.max_prompts]
-    prompts = [cp.normalize_cvss_prompt(p) for p in prompts]
-    print(f"Loaded {len(prompts)} prompts from {args.input_tsv}")
+        sentences = sentences[: args.max_prompts]
+    print(f"Loaded {len(sentences)} prompts from {args.input_tsv}")
 
     sae_ckpt = fs.resolve_sae_checkpoint(local_path=args.sae_ckpt_path or None)
     baseline_full = fs.load_baseline_full(args.baseline_tsv)
@@ -222,15 +240,19 @@ def main() -> None:
     sae.eval()
 
     # -----------------------------------------------------------------------
-    # Step 1: extract per-prompt feature stats (identical to feature-stats pipeline)
+    # Step 1: build the CLAUDETTE-TOS classification prompt for every
+    # sentence and extract per-prompt feature stats (identical to
+    # feature-stats pipeline). The user turn is the ToS sentence verbatim,
+    # so there is no opening phrase to skip past - the whole user turn is
+    # content.
     # -----------------------------------------------------------------------
     records: List[Dict[str, Any]] = []
     with tc.no_grad():
-        for idx, (system, user_content) in enumerate(tqdm.tqdm(prompts, desc="Processing prompts")):
+        for idx, sentence in enumerate(tqdm.tqdm(sentences, desc="Processing prompts")):
+            user_content = clp.build_claudette_user_content(sentence)
             record = fs.compute_feature_stats_for_prompt(
                 user_content, model, collector, sae, baseline_full,
-                opening_phrase=args.opening_phrase or None,
-                system=system,
+                system=clp.CLAUDETTE_SYSTEM_PROMPT,
                 raw_magnitude=args.raw_magnitude,
             )
             record["index"] = idx
