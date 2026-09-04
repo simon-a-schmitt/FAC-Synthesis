@@ -115,17 +115,73 @@ class UnifiedGenerator:
             from peft import PeftModel, LoraConfig
 
             print(f"Loading LoRA adapter from: {self._lora_path}", flush=True)
-            # The adapter was saved with a newer peft version whose LoraConfig
-            # has extra fields (e.g. alora_invocation_tokens, arrow_config)
-            # unknown to the peft version installed in this env. Those extra
-            # fields are inactive (null/false) here, so drop anything the
-            # installed LoraConfig doesn't recognize before instantiating it.
-            with open(os.path.join(self._lora_path, "adapter_config.json")) as f:
+            adapter_config_path = os.path.join(self._lora_path, "adapter_config.json")
+            with open(adapter_config_path) as f:
                 raw_config = json.load(f)
+
+            # The adapter may have been saved with a newer peft whose LoraConfig
+            # carries extra fields (e.g. alora_invocation_tokens, arrow_config)
+            # unknown to the peft version installed here. Such a field may only be
+            # dropped if it is genuinely inactive - dropping an *active* one would
+            # silently load a different adapter than the one that was saved.
             known_fields = {f.name for f in dataclasses.fields(LoraConfig)}
+            # Unknown keys that only ever carry provenance metadata or the scalar
+            # default of a feature that is not in use. They have no effect on how the
+            # adapter loads, so they are safe to drop even when non-null.
+            ignorable_unknown_fields = {"peft_version", "qalora_group_size"}
+            unknown_fields = {
+                k: v for k, v in raw_config.items()
+                if k not in known_fields and k not in ignorable_unknown_fields
+            }
+
+            def _is_inactive(value):
+                return value is None or value is False or value == [] or value == {} or value == ""
+
+            active_unknown = {k: v for k, v in unknown_fields.items() if not _is_inactive(v)}
+            if active_unknown:
+                raise RuntimeError(
+                    f"{adapter_config_path} contains fields unknown to the installed peft that "
+                    f"carry active (non-null / non-false / non-empty) values: {active_unknown!r}. "
+                    f"Dropping them would silently change which adapter is loaded. Upgrade peft to "
+                    f"a version that understands these fields, or vet and remove them explicitly."
+                )
             filtered_config = {k: v for k, v in raw_config.items() if k in known_fields}
+
+            # Guard against the filter (or a hand-edited adapter_config.json) having
+            # removed a field that PeftModel.from_pretrained needs to reconstruct the
+            # adapter faithfully.
+            required_fields = ("peft_type", "r", "lora_alpha", "target_modules")
+            missing_required = [
+                k for k in required_fields
+                if k not in filtered_config or filtered_config[k] in (None, "", [], {})
+            ]
+            if missing_required:
+                raise RuntimeError(
+                    f"{adapter_config_path} is missing fields required to load the adapter after "
+                    f"filtering unknown keys: {missing_required!r}. Kept keys: {sorted(filtered_config)!r}."
+                )
+
             lora_config = LoraConfig(**filtered_config)
             model = PeftModel.from_pretrained(model, self._lora_path, config=lora_config)
+
+            # PeftModel.from_pretrained only *warns* (never raises) on missing/unexpected
+            # keys in the adapter checkpoint, so a stale path or an incompatible adapter
+            # would leave every LoRA weight at its zero init and merge_and_unload() would
+            # then silently hand back the untouched base model. Verify the adapter really
+            # loaded before merging.
+            lora_b_params = [p for n, p in model.named_parameters() if "lora_B" in n]
+            if not lora_b_params:
+                raise RuntimeError(
+                    f"No LoRA parameters were created when loading the adapter from {self._lora_path}; "
+                    f"the adapter did not attach to the base model."
+                )
+            if not any(bool(p.any()) for p in lora_b_params):
+                raise RuntimeError(
+                    f"All lora_B weights are zero after loading the adapter from {self._lora_path}; "
+                    f"the checkpoint most likely failed to load (path / format / key mismatch). "
+                    f"Refusing to merge a no-op adapter."
+                )
+
             model = model.merge_and_unload()
 
         model.config.pad_token_id = tok.pad_token_id

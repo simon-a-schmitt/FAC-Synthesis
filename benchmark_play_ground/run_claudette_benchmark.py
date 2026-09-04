@@ -5,6 +5,7 @@ import os
 import sys
 import argparse
 import json
+import math
 import re
 from pathlib import Path
 import torch
@@ -20,11 +21,16 @@ CLAUDETTE_METRICS = ["LTD", "TER", "CH", "CR", "USE", "LAW", "J", "ARB"]
 CLAUDETTE_NEG_CLASS = "N"
 CLAUDETTE_ALL_CLASSES = CLAUDETTE_METRICS + [CLAUDETTE_NEG_CLASS]
 
-# Fallback log-odds assigned to a slot whose Y/N answer token position could not be
-# located in the generated output (e.g. malformed/truncated generation). Such a slot
-# is scored as a maximally confident "N" so it doesn't produce a NaN/undefined point
-# on the precision-recall curve.
-CLAUDETTE_MISSING_LOG_ODDS = -1e9
+# A slot's log-odds score is read off the generation step at which the model emitted
+# that slot's Y/N answer character. If that position cannot be located (malformed or
+# truncated generation), compute_slot_log_odds() raises ClaudetteScoringError instead
+# of guessing a per-slot score itself. The caller (generate_batch) catches this and
+# records the example as unscored (slot_log_odds=None); evaluate_claudette_predictions()
+# then applies an explicit, documented fallback for such examples: p(Y)=0 for every
+# slot in the AUPRC curves, and an all-N prediction for F1 (see _slot_instance_labels
+# and _slot_probability_matrix). Nothing here is silently dropped from the metrics.
+class ClaudetteScoringError(Exception):
+    """Raised when a per-slot log-odds score cannot be computed for a generation."""
 
 CLAUDETTE_VECTOR_RE = re.compile(
     r"LTD:[YN]\|TER:[YN]\|CH:[YN]\|CR:[YN]\|USE:[YN]\|LAW:[YN]\|J:[YN]\|ARB:[YN]\|?"
@@ -143,18 +149,27 @@ def compute_slot_log_odds(tokenizer, token_ids: list[int], step_scores: tuple, b
 
     `step_scores` is the `scores` tuple from `model.generate(..., output_scores=True,
     return_dict_in_generate=True)`: one [vocab] logit row per generation step, shared
-    across the batch. Missing slots (answer token position not found) get
-    CLAUDETTE_MISSING_LOG_ODDS.
+    across the batch. If any slot's answer token position cannot be located (malformed
+    or truncated generation), this raises ClaudetteScoringError rather than emitting a
+    fallback score.
     """
-    result = {m: CLAUDETTE_MISSING_LOG_ODDS for m in CLAUDETTE_METRICS}
+    result = {}
     positions = locate_slot_char_positions(raw_text)
     char_lengths = _token_char_lengths(tokenizer, token_ids)
-    for m, char_offset in positions.items():
+    for m in CLAUDETTE_METRICS:
+        char_offset = positions.get(m)
         if char_offset is None:
-            continue
+            raise ClaudetteScoringError(
+                f"Could not locate the {m!r} Y/N answer character in the model output "
+                f"(batch_idx={batch_idx}); raw text: {raw_text!r}"
+            )
         tok_idx = _char_offset_to_token_index(char_lengths, char_offset)
         if tok_idx is None or tok_idx >= len(step_scores):
-            continue
+            raise ClaudetteScoringError(
+                f"Slot {m!r} answer at char offset {char_offset} maps to generation step "
+                f"{tok_idx!r}, which has no logits ({len(step_scores)} steps available); "
+                f"raw text: {raw_text!r}"
+            )
         logits = step_scores[tok_idx][batch_idx].float()
         log_probs = torch.log_softmax(logits, dim=-1)
         result[m] = (log_probs[y_id] - log_probs[n_id]).item()
@@ -169,13 +184,23 @@ def _slot_instance_labels(results: list[dict]) -> tuple[list[str], list[str]]:
     This reframes the 8-slot multi-label vector as a single 8+1-way multi-class
     classification problem, with every "no" across every slot pooled into one
     negative class rather than 8 separate per-slot negatives.
+
+    For an example where scoring failed (scoring_failed=True; see
+    ClaudetteScoringError), the prediction for every one of its 8 slots is forced to
+    the negative class "N", regardless of what a partial/loose text extraction may
+    have put in predicted_metrics: the model did not produce a usable answer, so it is
+    scored as if it had predicted "N" everywhere.
     """
     true_labels = []
     pred_labels = []
     for r in results:
+        parse_failed = r.get("scoring_failed", False)
         for slot in CLAUDETTE_METRICS:
             true_labels.append(slot if r["gt_metrics"].get(slot) == "Y" else CLAUDETTE_NEG_CLASS)
-            pred_labels.append(slot if r["predicted_metrics"].get(slot) == "Y" else CLAUDETTE_NEG_CLASS)
+            if parse_failed:
+                pred_labels.append(CLAUDETTE_NEG_CLASS)
+            else:
+                pred_labels.append(slot if r["predicted_metrics"].get(slot) == "Y" else CLAUDETTE_NEG_CLASS)
     return true_labels, pred_labels
 
 
@@ -209,19 +234,40 @@ def _macro_f1(stats_by_class: dict, classes: list[str]) -> float:
     return sum(stats_by_class[c]["f1"] for c in classes) / len(classes)
 
 
-def _slot_log_odds_matrix(results: list[dict]) -> tuple[list[list[int]], list[list[float]]]:
-    """Build the (n_results x 8) ground-truth and log-odds-score matrices used for AUPRC.
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _slot_probability_matrix(results: list[dict]) -> tuple[list[list[int]], list[list[float]]]:
+    """Build the (n_results x 8) ground-truth and score matrices used for AUPRC.
 
     Row i, column k is slot CLAUDETTE_METRICS[k] of result i: y_true is 1 if that slot
-    is "Y" in the ground truth, y_score is s_k(x) = log p(Y|position k) - log p(N|position k)
-    (falls back to CLAUDETTE_MISSING_LOG_ODDS if the result has no "slot_log_odds").
+    is "Y" in the ground truth. y_score is p(Y|position k) = sigmoid(s_k(x)), i.e. the
+    log-odds score s_k(x) = log p(Y|position k) - log p(N|position k) mapped back into
+    an actual Y-vs-N probability.
+
+    Every result contributes a row, including examples where scoring failed
+    (scoring_failed=True; see ClaudetteScoringError): those are not excluded from the
+    AUPRC curves, but scored with p(Y)=0 for all 8 slots, since the model produced no
+    usable evidence for "Y" at any slot. Scores are computed in probability space
+    (rather than raw log-odds) specifically so that this p(Y)=0 fallback is guaranteed
+    to sit below every real prediction's score (sigmoid never reaches exactly 0),
+    instead of colliding with real log-odds values that can themselves be negative.
     """
     y_true = []
     y_score = []
     for r in results:
-        slot_log_odds = r.get("slot_log_odds") or {}
         y_true.append([1 if r["gt_metrics"].get(m) == "Y" else 0 for m in CLAUDETTE_METRICS])
-        y_score.append([slot_log_odds.get(m, CLAUDETTE_MISSING_LOG_ODDS) for m in CLAUDETTE_METRICS])
+        slot_log_odds = r.get("slot_log_odds")
+        if slot_log_odds is None:
+            y_score.append([0.0] * len(CLAUDETTE_METRICS))
+            continue
+        missing = [m for m in CLAUDETTE_METRICS if m not in slot_log_odds]
+        if missing:
+            raise ClaudetteScoringError(
+                f"Result at index {r.get('index')!r} is missing slot_log_odds entries for {missing!r}."
+            )
+        y_score.append([_sigmoid(slot_log_odds[m]) for m in CLAUDETTE_METRICS])
     return y_true, y_score
 
 
@@ -237,11 +283,27 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
     predicts "N" for every slot would score, as a baseline for comparison.
 
     Additionally computes micro/macro AUPRC over the 8 clause-type slots, treated as
-    an 8-label multi-label problem: for each slot k, the score is the log-odds
-    s_k(x) = log p(Y|position k) - log p(N|position k) pulled from the model's output
-    distribution at the generation step where it answered that slot (see
-    compute_slot_log_odds). Micro-AUPRC pools all 8*n slot instances into a single
-    precision-recall curve; macro-AUPRC averages the per-slot AUPRC across the 8 slots.
+    an 8-label multi-label problem: for each slot k, the score is p(Y|position k) =
+    sigmoid(s_k(x)) with s_k(x) = log p(Y|position k) - log p(N|position k), pulled
+    from the model's output distribution at the generation step where it answered
+    that slot (see compute_slot_log_odds). Micro-AUPRC pools all 8*n slot instances
+    into a single precision-recall curve; macro-AUPRC averages the per-slot AUPRC
+    across the 8 slots.
+
+    Also reports a trivial-classifier AUPRC baseline: a classifier that assigns every
+    slot instance the same (non-discriminating) score has a precision-recall curve
+    flat at that slot's positive prevalence, so its AUPRC equals that prevalence. Since
+    every one of the 8 slots has the same number of instances (n, one per example),
+    the macro average of the 8 per-slot prevalences equals the single prevalence
+    pooled over all 8*n slot instances -- so both the micro and macro trivial-AUPRC
+    baselines reduce to that one pooled positive prevalence.
+
+    Examples where the model produced no parseable Y/N vector for every slot
+    (refusal / truncation) are recorded with slot_log_odds=None ("scoring_failed").
+    They are not filtered out of either metric: for F1, every one of their 8 slots is
+    forced to an "N" prediction (see _slot_instance_labels); for AUPRC, p(Y) is set to
+    0 for every slot instead of excluding the example (see _slot_probability_matrix).
+    The number of such examples is reported as "parse_failures".
     """
     from sklearn.metrics import average_precision_score
 
@@ -253,11 +315,20 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
     stats = {cls: _class_stats(true_labels, pred_labels, cls) for cls in CLAUDETTE_ALL_CLASSES}
     trivial_stats = {cls: _class_stats(true_labels, trivial_pred_labels, cls) for cls in CLAUDETTE_ALL_CLASSES}
 
-    y_true, y_score = _slot_log_odds_matrix(results)
-    micro_auprc = average_precision_score(y_true, y_score, average="micro") if total else 0.0
-    macro_auprc = average_precision_score(y_true, y_score, average="macro") if total else 0.0
-    per_slot_auprc_values = average_precision_score(y_true, y_score, average=None) if total else [0.0] * len(CLAUDETTE_METRICS)
+    n_parse_failures = sum(1 for r in results if r.get("scoring_failed"))
+    if results:
+        y_true, y_score = _slot_probability_matrix(results)
+        micro_auprc = average_precision_score(y_true, y_score, average="micro")
+        macro_auprc = average_precision_score(y_true, y_score, average="macro")
+        per_slot_auprc_values = average_precision_score(y_true, y_score, average=None)
+    else:
+        micro_auprc = 0.0
+        macro_auprc = 0.0
+        per_slot_auprc_values = [0.0] * len(CLAUDETTE_METRICS)
     per_slot_auprc = {m: float(v) for m, v in zip(CLAUDETTE_METRICS, per_slot_auprc_values)}
+
+    n_positive_slot_instances = sum(1 for t in true_labels if t != CLAUDETTE_NEG_CLASS)
+    auprc_trivial_all_N = n_positive_slot_instances / len(true_labels) if true_labels else 0.0
 
     classes_out = {}
     for cls in CLAUDETTE_ALL_CLASSES:
@@ -278,6 +349,7 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
     return {
         "total": total,
         "total_slot_instances": len(true_labels),
+        "parse_failures": n_parse_failures,
         "micro_f1_8": _micro_f1(stats, CLAUDETTE_METRICS),
         "macro_f1_8": _macro_f1(stats, CLAUDETTE_METRICS),
         "micro_f1_8_trivial_all_N": _micro_f1(trivial_stats, CLAUDETTE_METRICS),
@@ -288,6 +360,8 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
         "macro_f1_8plus1_trivial_all_N": _macro_f1(trivial_stats, CLAUDETTE_ALL_CLASSES),
         "micro_auprc_8": float(micro_auprc),
         "macro_auprc_8": float(macro_auprc),
+        "micro_auprc_8_trivial_all_N": auprc_trivial_all_N,
+        "macro_auprc_8_trivial_all_N": auprc_trivial_all_N,
         "classes": classes_out,
     }
 
@@ -328,8 +402,12 @@ def build_chat_messages(args, query_prompt: str, few_shots: list[dict]) -> list[
             messages.append({"role": "assistant", "content": ex_vector})
         messages.append({"role": "user", "content": query_prompt})
         return messages
-    # "fine_tuned" queries the model directly, without few-shot examples
-    return [{"role": "user", "content": query_prompt}]
+    # "fine_tuned" queries the model directly, without few-shot examples, but still
+    # with the same system prompt as the other arms.
+    return [
+        {"role": "system", "content": CLAUDETTE_SYSTEM_PROMPT},
+        {"role": "user", "content": query_prompt},
+    ]
 
 
 def render_chat_text(tokenizer, chat_messages: list[dict]) -> str:
@@ -386,10 +464,20 @@ def generate_batch(hf_model, tokenizer, texts: list[str], *, max_new_tokens: int
     gen_tokens = outputs.sequences[:, input_ids.shape[1]:]
     decoded = tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
 
-    slot_log_odds_batch = [
-        compute_slot_log_odds(tokenizer, gen_tokens[b].tolist(), outputs.scores, b, decoded[b], y_id, n_id)
-        for b in range(len(texts))
-    ]
+    slot_log_odds_batch = []
+    for b in range(len(texts)):
+        try:
+            slot_log_odds_batch.append(
+                compute_slot_log_odds(tokenizer, gen_tokens[b].tolist(), outputs.scores, b, decoded[b], y_id, n_id)
+            )
+        except ClaudetteScoringError:
+            # The model did not emit a parseable Y/N vector for every slot (refusal,
+            # truncation, ...). That is model behaviour, not a scoring-pipeline bug:
+            # record this example as unscored (slot_log_odds=None) and let the run
+            # continue. evaluate_claudette_predictions() does not exclude it: it is
+            # scored with p(Y)=0 for every slot in the AUPRC curves and an all-N
+            # prediction for F1.
+            slot_log_odds_batch.append(None)
     return decoded, slot_log_odds_batch
 
 
@@ -530,6 +618,7 @@ def main():
                 "gt_metrics": gt_metrics,
                 "correct": metrics_match(predicted_metrics, gt_metrics),
                 "slot_log_odds": slot_log_odds,
+                "scoring_failed": slot_log_odds is None,
             }
             fh.write(json.dumps(result, ensure_ascii=False) + "\n")
             fh.flush()
@@ -543,6 +632,10 @@ def main():
     print("Summary:")
     print(f"  total: {summary['total']}")
     print(f"  total_slot_instances: {summary['total_slot_instances']}")
+    print(
+        f"  parse_failures: {summary['parse_failures']}  "
+        f"(no parseable answer vector: p(Y)=0 assumed for AUPRC, all-N assumed for F1)"
+    )
     print()
     print("  8-class scenario (LTD, TER, CH, CR, USE, LAW, J, ARB):")
     print(
@@ -553,8 +646,14 @@ def main():
         f"    macro_f1: {summary['macro_f1_8']:.4f}  "
         f"(trivial all-N baseline: {summary['macro_f1_8_trivial_all_N']:.4f})"
     )
-    print(f"    micro_auprc: {summary['micro_auprc_8']:.4f}")
-    print(f"    macro_auprc: {summary['macro_auprc_8']:.4f}")
+    print(
+        f"    micro_auprc: {summary['micro_auprc_8']:.4f}  "
+        f"(trivial all-N baseline: {summary['micro_auprc_8_trivial_all_N']:.4f})"
+    )
+    print(
+        f"    macro_auprc: {summary['macro_auprc_8']:.4f}  "
+        f"(trivial all-N baseline: {summary['macro_auprc_8_trivial_all_N']:.4f})"
+    )
     print()
     print("  8+1-class scenario (adds pooled negative class 'N'):")
     print(
