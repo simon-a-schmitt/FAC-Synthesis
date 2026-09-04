@@ -234,6 +234,45 @@ def _macro_f1(stats_by_class: dict, classes: list[str]) -> float:
     return sum(stats_by_class[c]["f1"] for c in classes) / len(classes)
 
 
+def _slot_label_matrices(results: list[dict]) -> tuple[list[list[int]], list[list[int]]]:
+    """Build the (n_examples x 9) multi-label ground-truth and prediction matrices used
+    for the LexGLUE-consistent micro/macro F1 (CLAUDETTE-TOS is the UNFAIR-ToS task in
+    the LexGLUE benchmark, which scores this kind of multi-label task by running
+    sklearn's multilabel-indicator F1 directly over a per-example label matrix).
+
+    One row per example. Columns 0..7 are the 8 clause types (1 if that clause type
+    applies to the example, 0 otherwise); column 8 is the negative class "no clause
+    type applies", set to 1 iff all of columns 0..7 are 0. Every row therefore has at
+    least one 1, matching LexGLUE's convention of an explicit 9th "no label" label
+    rather than the absence of the other 8.
+
+    This differs from _slot_instance_labels, which flattens the 8 slots into 8*n
+    single-label instances and pools every "no" answer -- across every slot and every
+    example -- into one shared negative class, so that class's support scales with
+    8*n and swamps the 8 positive classes; here the negative class has exactly one
+    instance per example, like the other 8.
+
+    For an example where scoring failed (scoring_failed=True; see
+    ClaudetteScoringError), the predicted row is forced to all-zero across the 8
+    clause-type columns, so the derived negative column comes out 1 -- a parse failure
+    is scored as an explicit "N" prediction, not excluded.
+    """
+    y_true = []
+    y_pred = []
+    for r in results:
+        true_row = [1 if r["gt_metrics"].get(m) == "Y" else 0 for m in CLAUDETTE_METRICS]
+        true_row.append(1 if sum(true_row) == 0 else 0)
+        y_true.append(true_row)
+
+        if r.get("scoring_failed"):
+            pred_row = [0] * len(CLAUDETTE_METRICS)
+        else:
+            pred_row = [1 if r["predicted_metrics"].get(m) == "Y" else 0 for m in CLAUDETTE_METRICS]
+        pred_row.append(1 if sum(pred_row) == 0 else 0)
+        y_pred.append(pred_row)
+    return y_true, y_pred
+
+
 def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
@@ -276,8 +315,17 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
 
     8-class scenario: the 8 clause types (LTD, TER, ... ARB) are the classes;
     micro/macro F1 are computed over those 8 classes only.
-    8+1-class scenario: adds a single pooled negative class "N" (every slot
-    that is "no", across all 8 slots and all sentences) as a 9th class.
+    8+1-class scenario: adds a negative class "N" as a 9th class, computed two ways:
+      - "micro_f1_8plus1" / "macro_f1_8plus1": the LexGLUE-consistent implementation
+        (see _slot_label_matrices) -- one row per example, "N" is a per-example label
+        that is 1 iff none of the 8 clause types apply to that example, and micro/macro
+        F1 are the standard sklearn multilabel-indicator F1 over the resulting
+        (n_examples x 9) matrices.
+      - "micro_f1_8plus1_slot_pair" / "macro_f1_8plus1_slot_pair": the original
+        implementation (see _slot_instance_labels) -- the 8 slots are flattened into
+        8*n single-label (sentence, slot) instances, and "N" pools every "no" answer
+        across every slot and every example into one shared negative class, so its
+        support scales with 8*n rather than n.
 
     For every metric, also reports how a trivial classifier that always
     predicts "N" for every slot would score, as a baseline for comparison.
@@ -305,7 +353,7 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
     0 for every slot instead of excluding the example (see _slot_probability_matrix).
     The number of such examples is reported as "parse_failures".
     """
-    from sklearn.metrics import average_precision_score
+    from sklearn.metrics import average_precision_score, f1_score
 
     total = len(results)
 
@@ -329,6 +377,19 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
 
     n_positive_slot_instances = sum(1 for t in true_labels if t != CLAUDETTE_NEG_CLASS)
     auprc_trivial_all_N = n_positive_slot_instances / len(true_labels) if true_labels else 0.0
+
+    y_true_matrix, y_pred_matrix = _slot_label_matrices(results)
+    if results:
+        trivial_pred_matrix = [[0] * len(CLAUDETTE_METRICS) + [1] for _ in results]
+        micro_f1_8plus1 = f1_score(y_true_matrix, y_pred_matrix, average="micro", zero_division=0)
+        macro_f1_8plus1 = f1_score(y_true_matrix, y_pred_matrix, average="macro", zero_division=0)
+        micro_f1_8plus1_trivial_all_N = f1_score(y_true_matrix, trivial_pred_matrix, average="micro", zero_division=0)
+        macro_f1_8plus1_trivial_all_N = f1_score(y_true_matrix, trivial_pred_matrix, average="macro", zero_division=0)
+    else:
+        micro_f1_8plus1 = 0.0
+        macro_f1_8plus1 = 0.0
+        micro_f1_8plus1_trivial_all_N = 0.0
+        macro_f1_8plus1_trivial_all_N = 0.0
 
     classes_out = {}
     for cls in CLAUDETTE_ALL_CLASSES:
@@ -354,10 +415,14 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
         "macro_f1_8": _macro_f1(stats, CLAUDETTE_METRICS),
         "micro_f1_8_trivial_all_N": _micro_f1(trivial_stats, CLAUDETTE_METRICS),
         "macro_f1_8_trivial_all_N": _macro_f1(trivial_stats, CLAUDETTE_METRICS),
-        "micro_f1_8plus1": _micro_f1(stats, CLAUDETTE_ALL_CLASSES),
-        "macro_f1_8plus1": _macro_f1(stats, CLAUDETTE_ALL_CLASSES),
-        "micro_f1_8plus1_trivial_all_N": _micro_f1(trivial_stats, CLAUDETTE_ALL_CLASSES),
-        "macro_f1_8plus1_trivial_all_N": _macro_f1(trivial_stats, CLAUDETTE_ALL_CLASSES),
+        "micro_f1_8plus1_slot_pair": _micro_f1(stats, CLAUDETTE_ALL_CLASSES),
+        "macro_f1_8plus1_slot_pair": _macro_f1(stats, CLAUDETTE_ALL_CLASSES),
+        "micro_f1_8plus1_slot_pair_trivial_all_N": _micro_f1(trivial_stats, CLAUDETTE_ALL_CLASSES),
+        "macro_f1_8plus1_slot_pair_trivial_all_N": _macro_f1(trivial_stats, CLAUDETTE_ALL_CLASSES),
+        "micro_f1_8plus1": float(micro_f1_8plus1),
+        "macro_f1_8plus1": float(macro_f1_8plus1),
+        "micro_f1_8plus1_trivial_all_N": float(micro_f1_8plus1_trivial_all_N),
+        "macro_f1_8plus1_trivial_all_N": float(macro_f1_8plus1_trivial_all_N),
         "micro_auprc_8": float(micro_auprc),
         "macro_auprc_8": float(macro_auprc),
         "micro_auprc_8_trivial_all_N": auprc_trivial_all_N,
@@ -655,7 +720,7 @@ def main():
         f"(trivial all-N baseline: {summary['macro_auprc_8_trivial_all_N']:.4f})"
     )
     print()
-    print("  8+1-class scenario (adds pooled negative class 'N'):")
+    print("  8+1-class scenario (adds negative class 'N'), LexGLUE-style (per-example, 9 labels):")
     print(
         f"    micro_f1: {summary['micro_f1_8plus1']:.4f}  "
         f"(trivial all-N baseline: {summary['micro_f1_8plus1_trivial_all_N']:.4f})"
@@ -663,6 +728,16 @@ def main():
     print(
         f"    macro_f1: {summary['macro_f1_8plus1']:.4f}  "
         f"(trivial all-N baseline: {summary['macro_f1_8plus1_trivial_all_N']:.4f})"
+    )
+    print()
+    print("  8+1-class scenario (adds pooled negative class 'N'), slot-pair style (legacy):")
+    print(
+        f"    micro_f1: {summary['micro_f1_8plus1_slot_pair']:.4f}  "
+        f"(trivial all-N baseline: {summary['micro_f1_8plus1_slot_pair_trivial_all_N']:.4f})"
+    )
+    print(
+        f"    macro_f1: {summary['macro_f1_8plus1_slot_pair']:.4f}  "
+        f"(trivial all-N baseline: {summary['macro_f1_8plus1_slot_pair_trivial_all_N']:.4f})"
     )
     print()
     print("  per_class:")
