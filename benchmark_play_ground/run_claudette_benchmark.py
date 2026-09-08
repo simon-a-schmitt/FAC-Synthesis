@@ -15,27 +15,26 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from benchmark_play_ground.data_loader import load_claudette_tsv
 from benchmark_play_ground.model_wrapper import LocalModel
+from benchmark_play_ground.slot_scoring import score_slots
 
 
 CLAUDETTE_METRICS = ["LTD", "TER", "CH", "CR", "USE", "LAW", "J", "ARB"]
 CLAUDETTE_NEG_CLASS = "N"
 CLAUDETTE_ALL_CLASSES = CLAUDETTE_METRICS + [CLAUDETTE_NEG_CLASS]
 
-# A slot's log-odds score is read off the generation step at which the model emitted
-# that slot's Y/N answer character. If that position cannot be located (malformed or
-# truncated generation), compute_slot_log_odds() raises ClaudetteScoringError instead
-# of guessing a per-slot score itself. The caller (generate_batch) catches this and
-# records the example as unscored (slot_log_odds=None); evaluate_claudette_predictions()
-# then applies an explicit, documented fallback for such examples: p(Y)=0 for every
-# slot in the AUPRC curves, and an all-N prediction for F1 (see _slot_instance_labels
-# and _slot_probability_matrix). Nothing here is silently dropped from the metrics.
-class ClaudetteScoringError(Exception):
-    """Raised when a per-slot log-odds score cannot be computed for a generation."""
+# The scaffold fragment forced immediately before each slot's Y/N value token, in
+# slot order. Concatenating scaffold + chosen value char across all 8 slots
+# reproduces exactly the vector format described in CLAUDETTE_SYSTEM_PROMPT
+# ("LTD:?|TER:?|CH:?|CR:?|USE:?|LAW:?|J:?|ARB:?"), e.g. "LTD:N|TER:N|...|ARB:Y".
+CLAUDETTE_SCAFFOLD_FRAGMENTS = ["LTD:", "|TER:", "|CH:", "|CR:", "|USE:", "|LAW:", "|J:", "|ARB:"]
 
+# Every slot's answer token is now forced by construction (see slot_scoring.score_slots):
+# the model is never free to emit anything other than one of the candidate tokens, so
+# there is no "could not locate/parse the answer" failure mode anymore. Scoring can no
+# longer fail.
 CLAUDETTE_VECTOR_RE = re.compile(
     r"LTD:[YN]\|TER:[YN]\|CH:[YN]\|CR:[YN]\|USE:[YN]\|LAW:[YN]\|J:[YN]\|ARB:[YN]\|?"
 )
-CLAUDETTE_LOOSE_RE = re.compile(r"LTD:[A-Za-z:|]+")
 
 
 CLAUDETTE_SYSTEM_PROMPT = (
@@ -69,11 +68,15 @@ def extract_claudette_vector_from_text(text: str) -> str | None:
 
 
 def extract_claudette_metrics_from_text(text: str) -> dict:
+    """Parse an "LTD:Y|TER:N|..." vector string into a per-metric Y/N dict.
+
+    Used for the ground-truth vector loaded verbatim from the TSV, and for
+    turning a predicted vector (composed by generate_batch from scaffold +
+    chosen value tokens, see CLAUDETTE_SCAFFOLD_FRAGMENTS) back into the
+    same per-metric dict shape as gt_metrics.
+    """
     metrics = {m: None for m in CLAUDETTE_METRICS}
     vector = extract_claudette_vector_from_text(text)
-    if vector is None:
-        loose = CLAUDETTE_LOOSE_RE.search(text)
-        vector = loose.group(0) if loose else None
     if not vector:
         return metrics
     for segment in vector.split("|"):
@@ -88,92 +91,20 @@ def metrics_match(predicted_metrics: dict, gt_metrics: dict) -> bool:
     return all(predicted_metrics.get(m) == gt_metrics.get(m) for m in CLAUDETTE_METRICS)
 
 
-def locate_slot_char_positions(text: str) -> dict:
-    """Find, for each of the 8 metric slots, the character offset of its Y/N value
-    within `text` (the raw decoded model output).
-
-    Mirrors extract_claudette_metrics_from_text's parsing (same vector extraction,
-    same "|"-split) but additionally tracks *where* each value character sits, so it
-    can be mapped back to the generation step that produced it.
-    """
-    positions = {m: None for m in CLAUDETTE_METRICS}
-    vector = extract_claudette_vector_from_text(text)
-    if vector is None:
-        loose = CLAUDETTE_LOOSE_RE.search(text)
-        vector = loose.group(0) if loose else None
-    if not vector:
-        return positions
-    vector_start = text.find(vector)
-    if vector_start == -1:
-        return positions
-    offset = vector_start
-    for segment in vector.split("|"):
-        key, sep, value = segment.partition(":")
-        key = key.strip()
-        if key in positions and value:
-            positions[key] = offset + len(key) + len(sep)
-        offset += len(segment) + 1  # +1 accounts for the "|" separator
-    return positions
-
-
 def _single_char_token_id(tokenizer, ch: str) -> int:
+    """Look up `ch`'s token id, asserting it tokenizes to exactly one token.
+
+    Called once at startup for "Y" and "N" (see main()). Because the value token
+    at each slot is now forced by construction (the model picks only among
+    candidate_token_ids, never free-generates it -- see slot_scoring.score_slots),
+    this assertion is what rules out the old token-merge risk path (e.g. ":Y" or
+    "Y|" tokenizing as one merged token): every scored decision is guaranteed to be
+    an actual choice between the single-token ids asserted here.
+    """
     ids = tokenizer.encode(ch, add_special_tokens=False)
     if len(ids) != 1:
         raise ValueError(f"Expected {ch!r} to tokenize to a single token, got {ids!r}")
     return ids[0]
-
-
-def _token_char_lengths(tokenizer, token_ids: list[int]) -> list[int]:
-    """Cumulative length (in characters) of the decoded text after each token.
-
-    Decoding is redone incrementally (rather than per-token) so that tokenizer
-    spacing/merge quirks match exactly how the full generated text was decoded.
-    """
-    lengths = []
-    for i in range(1, len(token_ids) + 1):
-        lengths.append(len(tokenizer.decode(token_ids[:i], skip_special_tokens=True)))
-    return lengths
-
-
-def _char_offset_to_token_index(char_lengths: list[int], char_offset: int) -> int | None:
-    for i, length in enumerate(char_lengths):
-        if char_offset < length:
-            return i
-    return None
-
-
-def compute_slot_log_odds(tokenizer, token_ids: list[int], step_scores: tuple, batch_idx: int, raw_text: str, y_id: int, n_id: int) -> dict:
-    """Compute s_k(x) = log p(Y | position k) - log p(N | position k) for each of the
-    8 metric slots, where "position k" is the generation step at which the model
-    produced slot k's Y/N answer character.
-
-    `step_scores` is the `scores` tuple from `model.generate(..., output_scores=True,
-    return_dict_in_generate=True)`: one [vocab] logit row per generation step, shared
-    across the batch. If any slot's answer token position cannot be located (malformed
-    or truncated generation), this raises ClaudetteScoringError rather than emitting a
-    fallback score.
-    """
-    result = {}
-    positions = locate_slot_char_positions(raw_text)
-    char_lengths = _token_char_lengths(tokenizer, token_ids)
-    for m in CLAUDETTE_METRICS:
-        char_offset = positions.get(m)
-        if char_offset is None:
-            raise ClaudetteScoringError(
-                f"Could not locate the {m!r} Y/N answer character in the model output "
-                f"(batch_idx={batch_idx}); raw text: {raw_text!r}"
-            )
-        tok_idx = _char_offset_to_token_index(char_lengths, char_offset)
-        if tok_idx is None or tok_idx >= len(step_scores):
-            raise ClaudetteScoringError(
-                f"Slot {m!r} answer at char offset {char_offset} maps to generation step "
-                f"{tok_idx!r}, which has no logits ({len(step_scores)} steps available); "
-                f"raw text: {raw_text!r}"
-            )
-        logits = step_scores[tok_idx][batch_idx].float()
-        log_probs = torch.log_softmax(logits, dim=-1)
-        result[m] = (log_probs[y_id] - log_probs[n_id]).item()
-    return result
 
 
 def _slot_instance_labels(results: list[dict]) -> tuple[list[str], list[str]]:
@@ -184,23 +115,13 @@ def _slot_instance_labels(results: list[dict]) -> tuple[list[str], list[str]]:
     This reframes the 8-slot multi-label vector as a single 8+1-way multi-class
     classification problem, with every "no" across every slot pooled into one
     negative class rather than 8 separate per-slot negatives.
-
-    For an example where scoring failed (scoring_failed=True; see
-    ClaudetteScoringError), the prediction for every one of its 8 slots is forced to
-    the negative class "N", regardless of what a partial/loose text extraction may
-    have put in predicted_metrics: the model did not produce a usable answer, so it is
-    scored as if it had predicted "N" everywhere.
     """
     true_labels = []
     pred_labels = []
     for r in results:
-        parse_failed = r.get("scoring_failed", False)
         for slot in CLAUDETTE_METRICS:
             true_labels.append(slot if r["gt_metrics"].get(slot) == "Y" else CLAUDETTE_NEG_CLASS)
-            if parse_failed:
-                pred_labels.append(CLAUDETTE_NEG_CLASS)
-            else:
-                pred_labels.append(slot if r["predicted_metrics"].get(slot) == "Y" else CLAUDETTE_NEG_CLASS)
+            pred_labels.append(slot if r["predicted_metrics"].get(slot) == "Y" else CLAUDETTE_NEG_CLASS)
     return true_labels, pred_labels
 
 
@@ -251,11 +172,6 @@ def _slot_label_matrices(results: list[dict]) -> tuple[list[list[int]], list[lis
     example -- into one shared negative class, so that class's support scales with
     8*n and swamps the 8 positive classes; here the negative class has exactly one
     instance per example, like the other 8.
-
-    For an example where scoring failed (scoring_failed=True; see
-    ClaudetteScoringError), the predicted row is forced to all-zero across the 8
-    clause-type columns, so the derived negative column comes out 1 -- a parse failure
-    is scored as an explicit "N" prediction, not excluded.
     """
     y_true = []
     y_pred = []
@@ -264,10 +180,7 @@ def _slot_label_matrices(results: list[dict]) -> tuple[list[list[int]], list[lis
         true_row.append(1 if sum(true_row) == 0 else 0)
         y_true.append(true_row)
 
-        if r.get("scoring_failed"):
-            pred_row = [0] * len(CLAUDETTE_METRICS)
-        else:
-            pred_row = [1 if r["predicted_metrics"].get(m) == "Y" else 0 for m in CLAUDETTE_METRICS]
+        pred_row = [1 if r["predicted_metrics"].get(m) == "Y" else 0 for m in CLAUDETTE_METRICS]
         pred_row.append(1 if sum(pred_row) == 0 else 0)
         y_pred.append(pred_row)
     return y_true, y_pred
@@ -281,31 +194,17 @@ def _slot_probability_matrix(results: list[dict]) -> tuple[list[list[int]], list
     """Build the (n_results x 8) ground-truth and score matrices used for AUPRC.
 
     Row i, column k is slot CLAUDETTE_METRICS[k] of result i: y_true is 1 if that slot
-    is "Y" in the ground truth. y_score is p(Y|position k) = sigmoid(s_k(x)), i.e. the
-    log-odds score s_k(x) = log p(Y|position k) - log p(N|position k) mapped back into
-    an actual Y-vs-N probability.
-
-    Every result contributes a row, including examples where scoring failed
-    (scoring_failed=True; see ClaudetteScoringError): those are not excluded from the
-    AUPRC curves, but scored with p(Y)=0 for all 8 slots, since the model produced no
-    usable evidence for "Y" at any slot. Scores are computed in probability space
-    (rather than raw log-odds) specifically so that this p(Y)=0 fallback is guaranteed
-    to sit below every real prediction's score (sigmoid never reaches exactly 0),
-    instead of colliding with real log-odds values that can themselves be negative.
+    is "Y" in the ground truth. y_score is p(Y|slot k) = sigmoid(s_k(x)), i.e. the
+    log-odds score s_k(x) = log p(Y|slot k) - log p(N|slot k) mapped back into an
+    actual Y-vs-N probability. Every result contributes a row: slot_log_odds always
+    has all 8 entries, since each slot's Y/N decision is forced by construction (see
+    slot_scoring.score_slots) and can no longer be missing.
     """
     y_true = []
     y_score = []
     for r in results:
         y_true.append([1 if r["gt_metrics"].get(m) == "Y" else 0 for m in CLAUDETTE_METRICS])
-        slot_log_odds = r.get("slot_log_odds")
-        if slot_log_odds is None:
-            y_score.append([0.0] * len(CLAUDETTE_METRICS))
-            continue
-        missing = [m for m in CLAUDETTE_METRICS if m not in slot_log_odds]
-        if missing:
-            raise ClaudetteScoringError(
-                f"Result at index {r.get('index')!r} is missing slot_log_odds entries for {missing!r}."
-            )
+        slot_log_odds = r["slot_log_odds"]
         y_score.append([_sigmoid(slot_log_odds[m]) for m in CLAUDETTE_METRICS])
     return y_true, y_score
 
@@ -331,12 +230,15 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
     predicts "N" for every slot would score, as a baseline for comparison.
 
     Additionally computes micro/macro AUPRC over the 8 clause-type slots, treated as
-    an 8-label multi-label problem: for each slot k, the score is p(Y|position k) =
-    sigmoid(s_k(x)) with s_k(x) = log p(Y|position k) - log p(N|position k), pulled
-    from the model's output distribution at the generation step where it answered
-    that slot (see compute_slot_log_odds). Micro-AUPRC pools all 8*n slot instances
+    an 8-label multi-label problem: for each slot k, the score is p(Y|slot k) =
+    sigmoid(s_k(x)) with s_k(x) = log p(Y|slot k) - log p(N|slot k), read directly off
+    the model's output distribution at the (a priori known) position where it decided
+    that slot (see slot_scoring.score_slots). Micro-AUPRC pools all 8*n slot instances
     into a single precision-recall curve; macro-AUPRC averages the per-slot AUPRC
-    across the 8 slots.
+    across the 8 slots. predicted_metrics -- the Y/N vector used for the F1 metrics --
+    is itself derived as sign(s_k(x)) per slot (see main()), the same quantity that
+    feeds the AUPRC scores, so F1 and AUPRC are consistent by construction: a slot
+    counted "Y" for F1 always has p(Y|slot k) > 0.5 in the AUPRC curve, and vice versa.
 
     Also reports a trivial-classifier AUPRC baseline: a classifier that assigns every
     slot instance the same (non-discriminating) score has a precision-recall curve
@@ -346,12 +248,11 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
     pooled over all 8*n slot instances -- so both the micro and macro trivial-AUPRC
     baselines reduce to that one pooled positive prevalence.
 
-    Examples where the model produced no parseable Y/N vector for every slot
-    (refusal / truncation) are recorded with slot_log_odds=None ("scoring_failed").
-    They are not filtered out of either metric: for F1, every one of their 8 slots is
-    forced to an "N" prediction (see _slot_instance_labels); for AUPRC, p(Y) is set to
-    0 for every slot instead of excluding the example (see _slot_probability_matrix).
-    The number of such examples is reported as "parse_failures".
+    "parse_failures" is always 0: every slot's Y/N answer token is forced by
+    construction (see slot_scoring.score_slots), so there is no longer a code path
+    that can fail to produce a usable answer for a slot. The field is kept, constant,
+    purely for schema compatibility with existing downstream evaluation scripts that
+    read it.
     """
     from sklearn.metrics import average_precision_score, f1_score
 
@@ -363,7 +264,9 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
     stats = {cls: _class_stats(true_labels, pred_labels, cls) for cls in CLAUDETTE_ALL_CLASSES}
     trivial_stats = {cls: _class_stats(true_labels, trivial_pred_labels, cls) for cls in CLAUDETTE_ALL_CLASSES}
 
-    n_parse_failures = sum(1 for r in results if r.get("scoring_failed"))
+    # Structurally impossible now (see docstring), kept at a constant 0 for schema
+    # compatibility with existing downstream evaluation scripts.
+    n_parse_failures = 0
     if results:
         y_true, y_score = _slot_probability_matrix(results)
         micro_auprc = average_precision_score(y_true, y_score, average="micro")
@@ -442,7 +345,6 @@ def parse_args():
     p.add_argument("--device", default="cuda", help="Device to run model on (cuda or cpu)")
     p.add_argument("--dtype", default="bfloat16", help="Dtype for model init (bfloat16 or float16)")
     p.add_argument("--max-input-tokens", type=int, default=None, help="Optional cap for prompt tokens before generation; omit to keep the full prompt")
-    p.add_argument("--max-new-tokens", type=int, default=64, help="Max new tokens to generate per prompt (answers are a single short label line)")
     p.add_argument("--max-prompts", type=int, default=0, help="Limit number of prompts (0 = all)")
     p.add_argument("--batch-size", type=int, default=32, help="Number of prompts to generate in a single batched forward pass")
     p.add_argument("--output-jsonl", default="claudette_benchmark_results.jsonl", help="Per-example JSONL output")
@@ -483,7 +385,25 @@ def render_chat_text(tokenizer, chat_messages: list[dict]) -> str:
     )
 
 
-def generate_batch(hf_model, tokenizer, texts: list[str], *, max_new_tokens: int, max_input_tokens: int | None, device: str, y_id: int, n_id: int) -> tuple[list[str], list[dict]]:
+def generate_batch(
+    hf_model,
+    tokenizer,
+    texts: list[str],
+    *,
+    max_input_tokens: int | None,
+    device: str,
+    scaffold_token_ids: list[list[int]],
+    candidate_token_ids: list[list[int]],
+) -> tuple[list[str], list[dict]]:
+    """Thin CLAUDETTE-specific wrapper around slot_scoring.score_slots().
+
+    Tokenizes/left-pads `texts` (already rendered through the chat template) and
+    hands the resulting batch to the benchmark-agnostic constrained-decoding core,
+    then turns its per-slot (chosen token, log-probs) output back into the
+    CLAUDETTE vector string and the {metric: log-odds} dict this script's callers
+    expect. No free generation happens here: the only per-slot model decision is
+    the Y/N value token, forced via candidate_token_ids (see score_slots).
+    """
     # `texts` were already rendered through the chat template (tokenize=False), so the
     # special/control tokens (BOS, header tokens, ...) are already present as literal text.
     # add_special_tokens=False avoids the tokenizer prepending a second BOS on top of that.
@@ -498,52 +418,50 @@ def generate_batch(hf_model, tokenizer, texts: list[str], *, max_new_tokens: int
     attention_mask = padded["attention_mask"].to(device)
 
     try:
-        outputs = hf_model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            stop_strings=["\n\n"],
-            tokenizer=tokenizer,
-            use_cache=True,
-            pad_token_id=tokenizer.pad_token_id,
-            output_scores=True,
-            return_dict_in_generate=True,
+        chosen_ids, log_probs = score_slots(
+            hf_model,
+            input_ids,
+            attention_mask,
+            scaffold_token_ids,
+            candidate_token_ids,
+            device=device,
         )
     except torch.cuda.OutOfMemoryError:
-        # This transformers version computes logits over the *full* padded sequence
-        # (no logits_to_keep slicing), so peak memory scales with batch_size * seq_len *
-        # vocab_size. Long prompts can blow this up well before the requested batch size
-        # is actually reachable, independent of --max-input-tokens. Splitting the batch
-        # in half and retrying is the standard fallback for that.
+        # Each forward call in score_slots() only processes a handful of new tokens
+        # (one chosen value token + one short scaffold fragment) rather than the full
+        # padded sequence, so the per-step vocab-logits peak is already much smaller
+        # than the old free-generation path's (batch_size * full_seq_len * vocab_size).
+        # Very long prompts (the initial prompt+scaffold[0] forward call) can still
+        # blow past available memory before the requested batch size is reachable,
+        # though, independent of --max-input-tokens. Splitting the batch in half and
+        # retrying is the standard fallback for that.
         if device == "cuda":
             torch.cuda.empty_cache()
         if len(texts) <= 1:
             raise
         mid = len(texts) // 2
         print(f"CUDA OOM at batch size {len(texts)}. Splitting into sub-batches of {mid} and {len(texts) - mid}...")
-        first_texts, first_scores = generate_batch(hf_model, tokenizer, texts[:mid], max_new_tokens=max_new_tokens, max_input_tokens=max_input_tokens, device=device, y_id=y_id, n_id=n_id)
-        second_texts, second_scores = generate_batch(hf_model, tokenizer, texts[mid:], max_new_tokens=max_new_tokens, max_input_tokens=max_input_tokens, device=device, y_id=y_id, n_id=n_id)
-        return first_texts + second_texts, first_scores + second_scores
+        first_vectors, first_scores = generate_batch(
+            hf_model, tokenizer, texts[:mid], max_input_tokens=max_input_tokens, device=device,
+            scaffold_token_ids=scaffold_token_ids, candidate_token_ids=candidate_token_ids,
+        )
+        second_vectors, second_scores = generate_batch(
+            hf_model, tokenizer, texts[mid:], max_input_tokens=max_input_tokens, device=device,
+            scaffold_token_ids=scaffold_token_ids, candidate_token_ids=candidate_token_ids,
+        )
+        return first_vectors + second_vectors, first_scores + second_scores
 
-    gen_tokens = outputs.sequences[:, input_ids.shape[1]:]
-    decoded = tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
-
+    vectors = []
     slot_log_odds_batch = []
     for b in range(len(texts)):
-        try:
-            slot_log_odds_batch.append(
-                compute_slot_log_odds(tokenizer, gen_tokens[b].tolist(), outputs.scores, b, decoded[b], y_id, n_id)
-            )
-        except ClaudetteScoringError:
-            # The model did not emit a parseable Y/N vector for every slot (refusal,
-            # truncation, ...). That is model behaviour, not a scoring-pipeline bug:
-            # record this example as unscored (slot_log_odds=None) and let the run
-            # continue. evaluate_claudette_predictions() does not exclude it: it is
-            # scored with p(Y)=0 for every slot in the AUPRC curves and an all-N
-            # prediction for F1.
-            slot_log_odds_batch.append(None)
-    return decoded, slot_log_odds_batch
+        # candidate_token_ids[slot] == [y_id, n_id] for every slot, so index 0 of the
+        # per-slot log-probs is always log p(Y) and index 1 is always log p(N).
+        chars = ["Y" if chosen_ids[b][i] == candidate_token_ids[i][0] else "N" for i in range(len(CLAUDETTE_METRICS))]
+        vectors.append("".join(f"{frag}{ch}" for frag, ch in zip(CLAUDETTE_SCAFFOLD_FRAGMENTS, chars)))
+        slot_log_odds_batch.append(
+            {m: log_probs[b][i][0] - log_probs[b][i][1] for i, m in enumerate(CLAUDETTE_METRICS)}
+        )
+    return vectors, slot_log_odds_batch
 
 
 def main():
@@ -568,8 +486,13 @@ def main():
     # only expose a single-prompt generate() call), without touching the shared wrapper used by the
     # other benchmark scripts.
     hf_model = model._gen._model
+    # Asserted once at startup: every slot's value token is forced to be one of these
+    # two single-token ids (see _single_char_token_id and slot_scoring.score_slots), so
+    # there is no token-merge risk at the answer position anymore.
     y_id = _single_char_token_id(tokenizer, "Y")
     n_id = _single_char_token_id(tokenizer, "N")
+    scaffold_token_ids = [tokenizer.encode(frag, add_special_tokens=False) for frag in CLAUDETTE_SCAFFOLD_FRAGMENTS]
+    candidate_token_ids = [[y_id, n_id] for _ in CLAUDETTE_METRICS]
 
     out_path = Path(args.output_jsonl)
     results = []
@@ -629,15 +552,14 @@ def main():
             print("=== End final model input ===")
 
         try:
-            batch_raw, batch_slot_log_odds = generate_batch(
+            batch_vectors, batch_slot_log_odds = generate_batch(
                 hf_model,
                 tokenizer,
                 batch_texts,
-                max_new_tokens=args.max_new_tokens,
                 max_input_tokens=args.max_input_tokens,
                 device=args.device,
-                y_id=y_id,
-                n_id=n_id,
+                scaffold_token_ids=scaffold_token_ids,
+                candidate_token_ids=candidate_token_ids,
             )
         except RuntimeError as e:
             msg = str(e)
@@ -657,33 +579,35 @@ def main():
                 f"CUDA generation failed for batch starting at index {idx}. Retrying with max_input_tokens={fallback_max_input}..."
             )
 
-            batch_raw, batch_slot_log_odds = generate_batch(
+            batch_vectors, batch_slot_log_odds = generate_batch(
                 hf_model,
                 tokenizer,
                 batch_texts,
-                max_new_tokens=args.max_new_tokens,
                 max_input_tokens=fallback_max_input,
                 device=args.device,
-                y_id=y_id,
-                n_id=n_id,
+                scaffold_token_ids=scaffold_token_ids,
+                candidate_token_ids=candidate_token_ids,
             )
 
-        for offset, (rec, query_prompt, raw, slot_log_odds) in enumerate(zip(batch_records, batch_query_prompts, batch_raw, batch_slot_log_odds)):
+        for offset, (rec, query_prompt, vector, slot_log_odds) in enumerate(zip(batch_records, batch_query_prompts, batch_vectors, batch_slot_log_odds)):
             gt = rec.get("gt", "")
-            pred_vector = extract_claudette_vector_from_text(raw)
-            predicted_metrics = extract_claudette_metrics_from_text(raw)
+            # predicted_metrics is derived from sign(log_odds), the same quantity that
+            # feeds the AUPRC scores (see evaluate_claudette_predictions), so F1 and
+            # AUPRC cannot disagree about which slots were predicted "Y". `vector` (the
+            # scaffold + chosen-token string built in generate_batch) encodes exactly
+            # the same decision and is kept only for raw_output/predicted_vector logging.
+            predicted_metrics = {m: ("Y" if slot_log_odds[m] > 0 else "N") for m in CLAUDETTE_METRICS}
             gt_metrics = extract_claudette_metrics_from_text(gt)
             result = {
                 "index": idx + offset,
                 "prompt": query_prompt,
-                "raw_output": raw,
-                "predicted_vector": pred_vector,
+                "raw_output": vector,
+                "predicted_vector": vector,
                 "predicted_metrics": predicted_metrics,
                 "gt": gt,
                 "gt_metrics": gt_metrics,
                 "correct": metrics_match(predicted_metrics, gt_metrics),
                 "slot_log_odds": slot_log_odds,
-                "scoring_failed": slot_log_odds is None,
             }
             fh.write(json.dumps(result, ensure_ascii=False) + "\n")
             fh.flush()
@@ -699,7 +623,7 @@ def main():
     print(f"  total_slot_instances: {summary['total_slot_instances']}")
     print(
         f"  parse_failures: {summary['parse_failures']}  "
-        f"(no parseable answer vector: p(Y)=0 assumed for AUPRC, all-N assumed for F1)"
+        f"(always 0: every slot's answer is forced by construction, kept for schema compatibility)"
     )
     print()
     print("  8-class scenario (LTD, TER, CH, CR, USE, LAW, J, ARB):")
