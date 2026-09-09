@@ -9,7 +9,7 @@ distribution matching as the greedy tie-break/side constraint.
 Input
 -----
 - --pool-tsv: headerless TSV, column 0 = ToS sentence, column 1 = unfairness
-  vector "LTD:Y|TER:N|CH:N|CR:N|USE:N|LAW:N|J:N|ARB:N|"
+  vector "LTD: Y|TER: N|CH: N|CR: N|USE: N|LAW: N|J: N|ARB: N"
   (feature_coverage_filter/claudette_tos/input), e.g. claudette_tos_train.tsv.
   Each row's 1-based line number is its pool_id, matching the convention used
   by run_feature_coverage_filter.py.
@@ -76,12 +76,17 @@ CLASSES = {m: ["Y", "N"] for m in METRICS}
 # ---------------------------------------------------------------------------
 
 def parse_vector(vec: str) -> Dict[str, str]:
-    """'LTD:Y|TER:N|CH:N|CR:N|USE:N|LAW:N|J:N|ARB:N|' -> {'LTD': 'Y', ...}"""
+    """'LTD: Y|TER: N|CH: N|CR: N|USE: N|LAW: N|J: N|ARB: N' -> {'LTD': 'Y', ...}
+
+    Tolerates optional whitespace around each key/value and an optional trailing
+    '|', so the older compact 'LTD:Y|...|ARB:N|' form still parses too.
+    """
     out: Dict[str, str] = {}
     for part in vec.strip().split("|"):
         if not part or ":" not in part:
             continue
         k, v = part.split(":", 1)
+        k, v = k.strip(), v.strip()
         if k in CLASSES:
             if v not in CLASSES[k]:
                 raise ValueError(f"unbekannte Klasse {k}:{v} in {vec!r}")

@@ -7,7 +7,7 @@ A headerless TSV file (feature_coverage_filter/claudette_tos/input) with
 exactly two tab-separated columns per line, as produced e.g. by
 input/claudette_tos_train.tsv:
 
-    <ToS sentence>\t<LTD:Y|TER:N|...|ARB:N| unfairness-type vector string>
+    <ToS sentence>\t<"LTD: Y|TER: N|...|ARB: N" unfairness-type vector string>
 
 There is no id column, so each line's 1-based line number is used as its
 pool_id.
