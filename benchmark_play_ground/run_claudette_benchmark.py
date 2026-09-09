@@ -15,25 +15,38 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from benchmark_play_ground.data_loader import load_claudette_tsv
 from benchmark_play_ground.model_wrapper import LocalModel
-from benchmark_play_ground.slot_scoring import score_slots
+from benchmark_play_ground.slot_scoring import (
+    SlotPlan,
+    assert_target_matches_plan,
+    build_slot_plan,
+    format_example,
+    make_fragments,
+    score_slots,
+)
 
 
 CLAUDETTE_METRICS = ["LTD", "TER", "CH", "CR", "USE", "LAW", "J", "ARB"]
 CLAUDETTE_NEG_CLASS = "N"
 CLAUDETTE_ALL_CLASSES = CLAUDETTE_METRICS + [CLAUDETTE_NEG_CLASS]
 
-# The scaffold fragment forced immediately before each slot's Y/N value token, in
-# slot order. Concatenating scaffold + chosen value char across all 8 slots
-# reproduces exactly the vector format described in CLAUDETTE_SYSTEM_PROMPT
-# ("LTD:?|TER:?|CH:?|CR:?|USE:?|LAW:?|J:?|ARB:?"), e.g. "LTD:N|TER:N|...|ARB:Y".
-CLAUDETTE_SCAFFOLD_FRAGMENTS = ["LTD:", "|TER:", "|CH:", "|CR:", "|USE:", "|LAW:", "|J:", "|ARB:"]
+# Single source of truth for the answer template (see slot_scoring.make_fragments).
+# The trailing space in the default `assign` is what makes each Y/N value a clean
+# single token for this tokenizer -- build_slot_plan() verifies this and refuses to
+# build a plan otherwise. It produces e.g. "LTD: N|TER: N|...|ARB: Y", the same
+# spaced format the ground-truth TSV rows are expected to use (they are parsed as
+# plain text below and never tokenized).
+CLAUDETTE_FRAGMENTS = make_fragments(CLAUDETTE_METRICS)
+CLAUDETTE_CANDIDATES = [["Y", "N"]] * len(CLAUDETTE_METRICS)
 
-# Every slot's answer token is now forced by construction (see slot_scoring.score_slots):
-# the model is never free to emit anything other than one of the candidate tokens, so
-# there is no "could not locate/parse the answer" failure mode anymore. Scoring can no
-# longer fail.
+# Ground-truth vectors (loaded verbatim from the TSV) use the spaced format that
+# matches the answer template above, e.g.
+# "LTD: N|TER: N|CH: N|CR: N|USE: N|LAW: N|J: N|ARB: N" (no trailing "|"). The
+# regex tolerates optional whitespace after each colon and an optional trailing
+# "|", so the older compact "LTD:N|...|ARB:N|" form still parses too; it is never
+# applied to model output anymore (see generate_batch).
 CLAUDETTE_VECTOR_RE = re.compile(
-    r"LTD:[YN]\|TER:[YN]\|CH:[YN]\|CR:[YN]\|USE:[YN]\|LAW:[YN]\|J:[YN]\|ARB:[YN]\|?"
+    r"LTD:\s*[YN]\|TER:\s*[YN]\|CH:\s*[YN]\|CR:\s*[YN]\|"
+    r"USE:\s*[YN]\|LAW:\s*[YN]\|J:\s*[YN]\|ARB:\s*[YN]\|?"
 )
 
 
@@ -58,7 +71,9 @@ CLAUDETTE_SYSTEM_PROMPT = (
     "Answer with exactly one line in the following format, using Y or N for\n"
     "each type, and nothing else:\n"
     "\n"
-    "LTD:?|TER:?|CH:?|CR:?|USE:?|LAW:?|J:?|ARB:?"
+    # Derived from the same fragments the slot plan is built from, so the prompt
+    # and the scoring template can never drift apart (see slot_scoring.format_example).
+    f"{format_example(CLAUDETTE_FRAGMENTS)}"
 )
 
 
@@ -68,12 +83,12 @@ def extract_claudette_vector_from_text(text: str) -> str | None:
 
 
 def extract_claudette_metrics_from_text(text: str) -> dict:
-    """Parse an "LTD:Y|TER:N|..." vector string into a per-metric Y/N dict.
+    """Parse an "LTD: Y|TER: N|..." vector string into a per-metric Y/N dict.
 
-    Used for the ground-truth vector loaded verbatim from the TSV, and for
-    turning a predicted vector (composed by generate_batch from scaffold +
-    chosen value tokens, see CLAUDETTE_SCAFFOLD_FRAGMENTS) back into the
-    same per-metric dict shape as gt_metrics.
+    Used only for the ground-truth vector loaded verbatim from the TSV (and for the
+    startup sanity check below). Predictions no longer go through this parser: each
+    slot's chosen candidate comes directly off the SlotResult returned by
+    slot_scoring.score_slots (see generate_batch), so there is nothing to parse.
     """
     metrics = {m: None for m in CLAUDETTE_METRICS}
     vector = extract_claudette_vector_from_text(text)
@@ -91,20 +106,26 @@ def metrics_match(predicted_metrics: dict, gt_metrics: dict) -> bool:
     return all(predicted_metrics.get(m) == gt_metrics.get(m) for m in CLAUDETTE_METRICS)
 
 
-def _single_char_token_id(tokenizer, ch: str) -> int:
-    """Look up `ch`'s token id, asserting it tokenizes to exactly one token.
+def _plan_lead_texts(tokenizer) -> list[str]:
+    """Two representative renderings of the prompt up to the answer, for build_slot_plan.
 
-    Called once at startup for "Y" and "N" (see main()). Because the value token
-    at each slot is now forced by construction (the model picks only among
-    candidate_token_ids, never free-generates it -- see slot_scoring.score_slots),
-    this assertion is what rules out the old token-merge risk path (e.g. ":Y" or
-    "Y|" tokenizing as one merged token): every scored decision is guaranteed to be
-    an actual choice between the single-token ids asserted here.
+    A short and a long user turn, per slot_scoring.build_slot_plan's contract: it
+    cross-checks that the resolved fragment/candidate token ids are identical across
+    both, which is what proves the plan does not depend on what precedes it.
     """
-    ids = tokenizer.encode(ch, add_special_tokens=False)
-    if len(ids) != 1:
-        raise ValueError(f"Expected {ch!r} to tokenize to a single token, got {ids!r}")
-    return ids[0]
+    user_messages = [
+        "short clause.",
+        "a considerably longer terms-of-service sentence, with punctuation: "
+        "commas, colons, and a trailing period that mirrors real ToS prose.",
+    ]
+    return [
+        tokenizer.apply_chat_template(
+            [{"role": "system", "content": CLAUDETTE_SYSTEM_PROMPT},
+             {"role": "user", "content": u}],
+            tokenize=False, add_generation_prompt=True,
+        )
+        for u in user_messages
+    ]
 
 
 def _slot_instance_labels(results: list[dict]) -> tuple[list[str], list[str]]:
@@ -209,6 +230,47 @@ def _slot_probability_matrix(results: list[dict]) -> tuple[list[list[int]], list
     return y_true, y_score
 
 
+def _slot_positive_rate(results: list[dict]) -> dict[str, float]:
+    """Fraction of examples for which the model predicted "Y" at each slot.
+
+    A calibration/bias signal independent of ground truth: CLAUDETTE-ToS is heavily
+    skewed toward "N" (see CLAUDETTE_SYSTEM_PROMPT), so a slot's positive rate should
+    normally sit well below 0.5, and a slot stuck near 0 or drifting far above its
+    ground-truth prevalence flags a miscalibrated or degenerate model.
+    """
+    n = len(results)
+    if not n:
+        return {m: 0.0 for m in CLAUDETTE_METRICS}
+    return {
+        m: sum(1 for r in results if r["predicted_metrics"].get(m) == "Y") / n
+        for m in CLAUDETTE_METRICS
+    }
+
+
+def _slot_tie_rate(results: list[dict]) -> dict[str, float]:
+    """Fraction of examples where a slot's Y/N decision was an exact log-prob tie.
+
+    Ties are resolved deterministically by the plan's tie_policy (see
+    slot_scoring.build_slot_plan), but a high tie rate at a slot means many of its
+    decisions are effectively coin flips rather than confident predictions.
+    """
+    n = len(results)
+    if not n:
+        return {m: 0.0 for m in CLAUDETTE_METRICS}
+    return {
+        m: sum(1 for r in results if r.get("ties", {}).get(m)) / n
+        for m in CLAUDETTE_METRICS
+    }
+
+
+def _tie_rate_overall(results: list[dict]) -> float:
+    n = len(results) * len(CLAUDETTE_METRICS)
+    if not n:
+        return 0.0
+    total_ties = sum(1 for r in results for m in CLAUDETTE_METRICS if r.get("ties", {}).get(m))
+    return total_ties / n
+
+
 def evaluate_claudette_predictions(results: list[dict]) -> dict:
     """Score predictions under two multi-class framings of the 8 clause-type slots.
 
@@ -253,6 +315,10 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
     that can fail to produce a usable answer for a slot. The field is kept, constant,
     purely for schema compatibility with existing downstream evaluation scripts that
     read it.
+
+    "positive_rate_by_slot" / "tie_rate_by_slot" / "tie_rate_overall" are calibration
+    diagnostics, not accuracy metrics -- see _slot_positive_rate, _slot_tie_rate and
+    _tie_rate_overall.
     """
     from sklearn.metrics import average_precision_score, f1_score
 
@@ -294,6 +360,9 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
         micro_f1_8plus1_trivial_all_N = 0.0
         macro_f1_8plus1_trivial_all_N = 0.0
 
+    positive_rate_by_slot = _slot_positive_rate(results)
+    tie_rate_by_slot = _slot_tie_rate(results)
+
     classes_out = {}
     for cls in CLAUDETTE_ALL_CLASSES:
         s = stats[cls]
@@ -309,6 +378,9 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
         }
         if cls in per_slot_auprc:
             classes_out[cls]["auprc"] = per_slot_auprc[cls]
+        if cls in positive_rate_by_slot:
+            classes_out[cls]["positive_rate"] = positive_rate_by_slot[cls]
+            classes_out[cls]["tie_rate"] = tie_rate_by_slot[cls]
 
     return {
         "total": total,
@@ -330,6 +402,9 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
         "macro_auprc_8": float(macro_auprc),
         "micro_auprc_8_trivial_all_N": auprc_trivial_all_N,
         "macro_auprc_8_trivial_all_N": auprc_trivial_all_N,
+        "positive_rate_by_slot": positive_rate_by_slot,
+        "tie_rate_by_slot": tie_rate_by_slot,
+        "tie_rate_overall": _tie_rate_overall(results),
         "classes": classes_out,
     }
 
@@ -392,17 +467,17 @@ def generate_batch(
     *,
     max_input_tokens: int | None,
     device: str,
-    scaffold_token_ids: list[list[int]],
-    candidate_token_ids: list[list[int]],
-) -> tuple[list[str], list[dict]]:
+    plan: SlotPlan,
+) -> tuple[list[str], list[dict], list[dict]]:
     """Thin CLAUDETTE-specific wrapper around slot_scoring.score_slots().
 
     Tokenizes/left-pads `texts` (already rendered through the chat template) and
-    hands the resulting batch to the benchmark-agnostic constrained-decoding core,
-    then turns its per-slot (chosen token, log-probs) output back into the
-    CLAUDETTE vector string and the {metric: log-odds} dict this script's callers
+    hands the resulting batch to the benchmark-agnostic constrained-slot-scoring
+    core, then turns each example's SlotResult into the CLAUDETTE vector string
+    (via plan.answer_string, the same template the plan was built from), the
+    {metric: log-odds} dict, and the {metric: tie} dict this script's callers
     expect. No free generation happens here: the only per-slot model decision is
-    the Y/N value token, forced via candidate_token_ids (see score_slots).
+    the Y/N value token, forced by the plan (see score_slots).
     """
     # `texts` were already rendered through the chat template (tokenize=False), so the
     # special/control tokens (BOS, header tokens, ...) are already present as literal text.
@@ -418,50 +493,38 @@ def generate_batch(
     attention_mask = padded["attention_mask"].to(device)
 
     try:
-        chosen_ids, log_probs = score_slots(
-            hf_model,
-            input_ids,
-            attention_mask,
-            scaffold_token_ids,
-            candidate_token_ids,
-            device=device,
-        )
+        slot_results = score_slots(hf_model, input_ids, attention_mask, plan, device=device)
     except torch.cuda.OutOfMemoryError:
         # Each forward call in score_slots() only processes a handful of new tokens
-        # (one chosen value token + one short scaffold fragment) rather than the full
-        # padded sequence, so the per-step vocab-logits peak is already much smaller
-        # than the old free-generation path's (batch_size * full_seq_len * vocab_size).
-        # Very long prompts (the initial prompt+scaffold[0] forward call) can still
-        # blow past available memory before the requested batch size is reachable,
-        # though, independent of --max-input-tokens. Splitting the batch in half and
-        # retrying is the standard fallback for that.
+        # (one chosen value token + one short fragment) rather than the full padded
+        # sequence, so the per-step vocab-logits peak is already much smaller than a
+        # free-generation path's (batch_size * full_seq_len * vocab_size). Very long
+        # prompts (the initial prompt+fragment[0] forward call) can still blow past
+        # available memory before the requested batch size is reachable, though,
+        # independent of --max-input-tokens. Splitting the batch in half and retrying
+        # is the standard fallback for that.
         if device == "cuda":
             torch.cuda.empty_cache()
         if len(texts) <= 1:
             raise
         mid = len(texts) // 2
         print(f"CUDA OOM at batch size {len(texts)}. Splitting into sub-batches of {mid} and {len(texts) - mid}...")
-        first_vectors, first_scores = generate_batch(
-            hf_model, tokenizer, texts[:mid], max_input_tokens=max_input_tokens, device=device,
-            scaffold_token_ids=scaffold_token_ids, candidate_token_ids=candidate_token_ids,
+        first_vectors, first_scores, first_ties = generate_batch(
+            hf_model, tokenizer, texts[:mid], max_input_tokens=max_input_tokens, device=device, plan=plan,
         )
-        second_vectors, second_scores = generate_batch(
-            hf_model, tokenizer, texts[mid:], max_input_tokens=max_input_tokens, device=device,
-            scaffold_token_ids=scaffold_token_ids, candidate_token_ids=candidate_token_ids,
+        second_vectors, second_scores, second_ties = generate_batch(
+            hf_model, tokenizer, texts[mid:], max_input_tokens=max_input_tokens, device=device, plan=plan,
         )
-        return first_vectors + second_vectors, first_scores + second_scores
+        return first_vectors + second_vectors, first_scores + second_scores, first_ties + second_ties
 
     vectors = []
     slot_log_odds_batch = []
-    for b in range(len(texts)):
-        # candidate_token_ids[slot] == [y_id, n_id] for every slot, so index 0 of the
-        # per-slot log-probs is always log p(Y) and index 1 is always log p(N).
-        chars = ["Y" if chosen_ids[b][i] == candidate_token_ids[i][0] else "N" for i in range(len(CLAUDETTE_METRICS))]
-        vectors.append("".join(f"{frag}{ch}" for frag, ch in zip(CLAUDETTE_SCAFFOLD_FRAGMENTS, chars)))
-        slot_log_odds_batch.append(
-            {m: log_probs[b][i][0] - log_probs[b][i][1] for i, m in enumerate(CLAUDETTE_METRICS)}
-        )
-    return vectors, slot_log_odds_batch
+    slot_ties_batch = []
+    for result in slot_results:
+        vectors.append(plan.answer_string([result.values[m] for m in CLAUDETTE_METRICS]))
+        slot_log_odds_batch.append({m: result.log_odds(m) for m in CLAUDETTE_METRICS})
+        slot_ties_batch.append({m: result.ties[m] for m in CLAUDETTE_METRICS})
+    return vectors, slot_log_odds_batch, slot_ties_batch
 
 
 def main():
@@ -472,6 +535,8 @@ def main():
     records = load_claudette_tsv(args.data_tsv)
     if args.max_prompts > 0:
         records = records[: args.max_prompts]
+    if not records:
+        raise SystemExit(f"No records loaded from --data-tsv {args.data_tsv!r}")
 
     # Prepare few-shot examples if requested
     few_shots = []
@@ -486,13 +551,31 @@ def main():
     # only expose a single-prompt generate() call), without touching the shared wrapper used by the
     # other benchmark scripts.
     hf_model = model._gen._model
-    # Asserted once at startup: every slot's value token is forced to be one of these
-    # two single-token ids (see _single_char_token_id and slot_scoring.score_slots), so
-    # there is no token-merge risk at the answer position anymore.
-    y_id = _single_char_token_id(tokenizer, "Y")
-    n_id = _single_char_token_id(tokenizer, "N")
-    scaffold_token_ids = [tokenizer.encode(frag, add_special_tokens=False) for frag in CLAUDETTE_SCAFFOLD_FRAGMENTS]
-    candidate_token_ids = [[y_id, n_id] for _ in CLAUDETTE_METRICS]
+
+    plan = build_slot_plan(
+        tokenizer,
+        CLAUDETTE_METRICS,
+        CLAUDETTE_FRAGMENTS,
+        CLAUDETTE_CANDIDATES,
+        leads=_plan_lead_texts(tokenizer),
+        # ["Y", "N"] with "last": most sentences are "N" (see CLAUDETTE_SYSTEM_PROMPT),
+        # so an exact log-prob tie at the decision boundary resolves to the majority
+        # class instead of systematically inflating "Y".
+        tie_policy="last",
+    )
+    print(plan.describe(tokenizer))
+
+    # Sanity check (fail fast, once, at startup): the ground-truth vector format the
+    # rest of this script assumes must match what the plan can actually score. If a
+    # fine-tuned model was trained on targets in a different format than the plan's
+    # answer template, this raises SlotPlanError immediately instead of silently
+    # producing numbers that don't mean what they claim to.
+    sample_gt = records[0]["gt"]
+    sample_gt_metrics = extract_claudette_metrics_from_text(sample_gt)
+    sample_values = [sample_gt_metrics[m] for m in CLAUDETTE_METRICS]
+    if any(v is None for v in sample_values):
+        raise SystemExit(f"Could not parse a full Y/N vector from the first record's gt for the startup sanity check: {sample_gt!r}")
+    assert_target_matches_plan(plan, sample_gt, sample_values)
 
     out_path = Path(args.output_jsonl)
     results = []
@@ -552,14 +635,13 @@ def main():
             print("=== End final model input ===")
 
         try:
-            batch_vectors, batch_slot_log_odds = generate_batch(
+            batch_vectors, batch_slot_log_odds, batch_slot_ties = generate_batch(
                 hf_model,
                 tokenizer,
                 batch_texts,
                 max_input_tokens=args.max_input_tokens,
                 device=args.device,
-                scaffold_token_ids=scaffold_token_ids,
-                candidate_token_ids=candidate_token_ids,
+                plan=plan,
             )
         except RuntimeError as e:
             msg = str(e)
@@ -579,23 +661,24 @@ def main():
                 f"CUDA generation failed for batch starting at index {idx}. Retrying with max_input_tokens={fallback_max_input}..."
             )
 
-            batch_vectors, batch_slot_log_odds = generate_batch(
+            batch_vectors, batch_slot_log_odds, batch_slot_ties = generate_batch(
                 hf_model,
                 tokenizer,
                 batch_texts,
                 max_input_tokens=fallback_max_input,
                 device=args.device,
-                scaffold_token_ids=scaffold_token_ids,
-                candidate_token_ids=candidate_token_ids,
+                plan=plan,
             )
 
-        for offset, (rec, query_prompt, vector, slot_log_odds) in enumerate(zip(batch_records, batch_query_prompts, batch_vectors, batch_slot_log_odds)):
+        for offset, (rec, query_prompt, vector, slot_log_odds, slot_ties) in enumerate(
+            zip(batch_records, batch_query_prompts, batch_vectors, batch_slot_log_odds, batch_slot_ties)
+        ):
             gt = rec.get("gt", "")
             # predicted_metrics is derived from sign(log_odds), the same quantity that
             # feeds the AUPRC scores (see evaluate_claudette_predictions), so F1 and
-            # AUPRC cannot disagree about which slots were predicted "Y". `vector` (the
-            # scaffold + chosen-token string built in generate_batch) encodes exactly
-            # the same decision and is kept only for raw_output/predicted_vector logging.
+            # AUPRC cannot disagree about which slots were predicted "Y". `vector` (built
+            # from plan.answer_string in generate_batch) encodes exactly the same
+            # decision and is kept only for raw_output/predicted_vector logging.
             predicted_metrics = {m: ("Y" if slot_log_odds[m] > 0 else "N") for m in CLAUDETTE_METRICS}
             gt_metrics = extract_claudette_metrics_from_text(gt)
             result = {
@@ -608,6 +691,7 @@ def main():
                 "gt_metrics": gt_metrics,
                 "correct": metrics_match(predicted_metrics, gt_metrics),
                 "slot_log_odds": slot_log_odds,
+                "ties": slot_ties,
             }
             fh.write(json.dumps(result, ensure_ascii=False) + "\n")
             fh.flush()
@@ -625,6 +709,7 @@ def main():
         f"  parse_failures: {summary['parse_failures']}  "
         f"(always 0: every slot's answer is forced by construction, kept for schema compatibility)"
     )
+    print(f"  tie_rate_overall: {summary['tie_rate_overall']:.4f}")
     print()
     print("  8-class scenario (LTD, TER, CH, CR, USE, LAW, J, ARB):")
     print(
@@ -668,9 +753,13 @@ def main():
     for cls in CLAUDETTE_ALL_CLASSES:
         c = summary["classes"][cls]
         auprc_str = f"  auprc={c['auprc']:.4f}" if "auprc" in c else ""
+        rate_str = (
+            f"  positive_rate={c['positive_rate']:.4f}  tie_rate={c['tie_rate']:.4f}"
+            if "positive_rate" in c else ""
+        )
         print(
             f"    {cls}: support={c['support']}  precision={c['precision']:.4f}  "
-            f"recall={c['recall']:.4f}  f1={c['f1']:.4f}{auprc_str}  |  "
+            f"recall={c['recall']:.4f}  f1={c['f1']:.4f}{auprc_str}{rate_str}  |  "
             f"trivial all-N: precision={c['precision_trivial_all_N']:.4f}  "
             f"recall={c['recall_trivial_all_N']:.4f}  f1={c['f1_trivial_all_N']:.4f}"
         )

@@ -133,7 +133,7 @@ def load_claudette_tsv(path: str) -> List[Dict[str, str]]:
     """Load a CLAUDETTE-TOS-style TSV and return list of records with keys: prompt, gt
 
     Each row holds a single ToS sentence and a gt unfairness-type vector string
-    such as "LTD:N|TER:N|CH:N|CR:N|USE:N|LAW:N|J:N|ARB:Y|". The file has no header
+    such as "LTD: N|TER: N|CH: N|CR: N|USE: N|LAW: N|J: N|ARB: Y". The file has no header
     row, so column names are assigned positionally.
     """
     df = pd.read_csv(path, sep="\t", dtype=str, header=None, names=["prompt", "gt"], quoting=3).fillna("")
