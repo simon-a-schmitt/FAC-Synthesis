@@ -49,7 +49,7 @@ CLAUDETTE_SYSTEM_PROMPT = (
     "Answer with exactly one line in the following format, using Y or N for\n"
     "each type, and nothing else:\n"
     "\n"
-    "LTD:?|TER:?|CH:?|CR:?|USE:?|LAW:?|J:?|ARB:?"
+    "LTD: ?|TER: ?|CH: ?|CR: ?|USE: ?|LAW: ?|J: ?|ARB: ?"
 )
 
 
