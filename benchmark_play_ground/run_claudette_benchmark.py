@@ -17,6 +17,7 @@ from benchmark_play_ground.data_loader import load_claudette_tsv
 from benchmark_play_ground.model_wrapper import LocalModel
 from benchmark_play_ground.slot_scoring import (
     SlotPlan,
+    SlotPlanError,
     assert_target_matches_plan,
     build_slot_plan,
     format_example,
@@ -298,9 +299,12 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
     that slot (see slot_scoring.score_slots). Micro-AUPRC pools all 8*n slot instances
     into a single precision-recall curve; macro-AUPRC averages the per-slot AUPRC
     across the 8 slots. predicted_metrics -- the Y/N vector used for the F1 metrics --
-    is itself derived as sign(s_k(x)) per slot (see main()), the same quantity that
-    feeds the AUPRC scores, so F1 and AUPRC are consistent by construction: a slot
-    counted "Y" for F1 always has p(Y|slot k) > 0.5 in the AUPRC curve, and vice versa.
+    is taken straight from SlotResult.values per slot (the plan's argmax over {Y, N}
+    under its tie policy; see main() / generate_batch). That choice agrees with
+    sign(s_k(x)) in every case except an exact log-prob tie, which the plan's tie
+    policy ("last" -> "N") resolves the same way sign(s_k(x)) <= 0 does, so F1 and
+    AUPRC stay consistent: a slot counted "Y" for F1 has p(Y|slot k) > 0.5 in the
+    AUPRC curve, and vice versa.
 
     Also reports a trivial-classifier AUPRC baseline: a classifier that assigns every
     slot instance the same (non-discriminating) score has a precision-recall curve
@@ -333,6 +337,7 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
     # Structurally impossible now (see docstring), kept at a constant 0 for schema
     # compatibility with existing downstream evaluation scripts.
     n_parse_failures = 0
+
     if results:
         y_true, y_score = _slot_probability_matrix(results)
         micro_auprc = average_precision_score(y_true, y_score, average="micro")
@@ -468,16 +473,21 @@ def generate_batch(
     max_input_tokens: int | None,
     device: str,
     plan: SlotPlan,
-) -> tuple[list[str], list[dict], list[dict]]:
+) -> tuple[list[dict], list[str], list[dict], list[dict]]:
     """Thin CLAUDETTE-specific wrapper around slot_scoring.score_slots().
 
     Tokenizes/left-pads `texts` (already rendered through the chat template) and
     hands the resulting batch to the benchmark-agnostic constrained-slot-scoring
-    core, then turns each example's SlotResult into the CLAUDETTE vector string
-    (via plan.answer_string, the same template the plan was built from), the
-    {metric: log-odds} dict, and the {metric: tie} dict this script's callers
-    expect. No free generation happens here: the only per-slot model decision is
-    the Y/N value token, forced by the plan (see score_slots).
+    core, then turns each example's SlotResult into, per example:
+      - the {metric: "Y"/"N"} dict taken straight from SlotResult.values (the
+        plan's chosen candidate per slot -- the single source of truth for the
+        prediction),
+      - the CLAUDETTE vector string, rendered from exactly those same values via
+        plan.answer_string (the template the plan was built from),
+      - the {metric: log-odds} dict, and
+      - the {metric: tie} dict.
+    No free generation happens here: the only per-slot model decision is the Y/N
+    value token, forced by the plan (see score_slots).
     """
     # `texts` were already rendered through the chat template (tokenize=False), so the
     # special/control tokens (BOS, header tokens, ...) are already present as literal text.
@@ -509,22 +519,34 @@ def generate_batch(
             raise
         mid = len(texts) // 2
         print(f"CUDA OOM at batch size {len(texts)}. Splitting into sub-batches of {mid} and {len(texts) - mid}...")
-        first_vectors, first_scores, first_ties = generate_batch(
+        first_pred, first_vectors, first_scores, first_ties = generate_batch(
             hf_model, tokenizer, texts[:mid], max_input_tokens=max_input_tokens, device=device, plan=plan,
         )
-        second_vectors, second_scores, second_ties = generate_batch(
+        second_pred, second_vectors, second_scores, second_ties = generate_batch(
             hf_model, tokenizer, texts[mid:], max_input_tokens=max_input_tokens, device=device, plan=plan,
         )
-        return first_vectors + second_vectors, first_scores + second_scores, first_ties + second_ties
+        return (
+            first_pred + second_pred,
+            first_vectors + second_vectors,
+            first_scores + second_scores,
+            first_ties + second_ties,
+        )
 
+    predicted_metrics_batch = []
     vectors = []
     slot_log_odds_batch = []
     slot_ties_batch = []
     for result in slot_results:
-        vectors.append(plan.answer_string([result.values[m] for m in CLAUDETTE_METRICS]))
+        # SlotResult.values is the plan's chosen candidate per slot (argmax over
+        # {Y, N} under the plan's tie policy). It is the single source of truth for
+        # the prediction: `vector` is only its string rendering, and the caller's
+        # predicted_metrics is this dict verbatim.
+        pred = {m: result.values[m] for m in CLAUDETTE_METRICS}
+        predicted_metrics_batch.append(pred)
+        vectors.append(plan.answer_string([pred[m] for m in CLAUDETTE_METRICS]))
         slot_log_odds_batch.append({m: result.log_odds(m) for m in CLAUDETTE_METRICS})
         slot_ties_batch.append({m: result.ties[m] for m in CLAUDETTE_METRICS})
-    return vectors, slot_log_odds_batch, slot_ties_batch
+    return predicted_metrics_batch, vectors, slot_log_odds_batch, slot_ties_batch
 
 
 def main():
@@ -576,6 +598,36 @@ def main():
     if any(v is None for v in sample_values):
         raise SystemExit(f"Could not parse a full Y/N vector from the first record's gt for the startup sanity check: {sample_gt!r}")
     assert_target_matches_plan(plan, sample_gt, sample_values)
+
+    # In --mode icl the few-shot assistant turns are injected verbatim into every
+    # prompt as the answer format the model is meant to imitate. Run the same
+    # parse + plan-format sanity check over exactly the few-shot examples that
+    # will be used (few_shots[:icl_k]), so a few-shot TSV in the wrong vector
+    # format -- or a single malformed row -- fails fast at startup instead of
+    # silently teaching the model a format the scoring plan cannot represent.
+    if args.mode == "icl":
+        n_icl = min(args.icl_k, len(few_shots))
+        if n_icl == 0:
+            print(
+                f"Warning: --mode icl but no few-shot examples to inject "
+                f"(few_shot_tsv={args.few_shot_tsv!r}, icl_k={args.icl_k}); running 0-shot."
+            )
+        for i, ex in enumerate(few_shots[:n_icl]):
+            ex_vector = ex.get("label", ex.get("gt", ""))
+            ex_metrics = extract_claudette_metrics_from_text(ex_vector)
+            ex_values = [ex_metrics[m] for m in CLAUDETTE_METRICS]
+            if any(v is None for v in ex_values):
+                raise SystemExit(
+                    f"Few-shot example {i} from --few-shot-tsv {args.few_shot_tsv!r} does not "
+                    f"contain a full Y/N vector: {ex_vector!r}"
+                )
+            try:
+                assert_target_matches_plan(plan, ex_vector, ex_values)
+            except SlotPlanError as e:
+                raise SystemExit(
+                    f"Few-shot example {i} from --few-shot-tsv {args.few_shot_tsv!r} is not in "
+                    f"the scoring plan's answer format:\n{e}"
+                )
 
     out_path = Path(args.output_jsonl)
     results = []
@@ -635,7 +687,7 @@ def main():
             print("=== End final model input ===")
 
         try:
-            batch_vectors, batch_slot_log_odds, batch_slot_ties = generate_batch(
+            batch_predicted_metrics, batch_vectors, batch_slot_log_odds, batch_slot_ties = generate_batch(
                 hf_model,
                 tokenizer,
                 batch_texts,
@@ -661,7 +713,7 @@ def main():
                 f"CUDA generation failed for batch starting at index {idx}. Retrying with max_input_tokens={fallback_max_input}..."
             )
 
-            batch_vectors, batch_slot_log_odds, batch_slot_ties = generate_batch(
+            batch_predicted_metrics, batch_vectors, batch_slot_log_odds, batch_slot_ties = generate_batch(
                 hf_model,
                 tokenizer,
                 batch_texts,
@@ -670,16 +722,18 @@ def main():
                 plan=plan,
             )
 
-        for offset, (rec, query_prompt, vector, slot_log_odds, slot_ties) in enumerate(
-            zip(batch_records, batch_query_prompts, batch_vectors, batch_slot_log_odds, batch_slot_ties)
+        for offset, (rec, query_prompt, pred_metrics, vector, slot_log_odds, slot_ties) in enumerate(
+            zip(batch_records, batch_query_prompts, batch_predicted_metrics, batch_vectors, batch_slot_log_odds, batch_slot_ties)
         ):
             gt = rec.get("gt", "")
-            # predicted_metrics is derived from sign(log_odds), the same quantity that
-            # feeds the AUPRC scores (see evaluate_claudette_predictions), so F1 and
-            # AUPRC cannot disagree about which slots were predicted "Y". `vector` (built
-            # from plan.answer_string in generate_batch) encodes exactly the same
-            # decision and is kept only for raw_output/predicted_vector logging.
-            predicted_metrics = {m: ("Y" if slot_log_odds[m] > 0 else "N") for m in CLAUDETTE_METRICS}
+            # predicted_metrics comes straight from SlotResult.values (the plan's chosen
+            # Y/N candidate per slot), returned by generate_batch. `vector` is only its
+            # string rendering (plan.answer_string of the same values). The AUPRC score
+            # s_k(x) = slot_log_odds[m] has the same sign as this choice in every case
+            # except an exact log-prob tie, which the plan's tie policy ("last" -> "N")
+            # resolves deterministically -- so F1 and AUPRC still cannot disagree about
+            # which slots were predicted "Y".
+            predicted_metrics = dict(pred_metrics)
             gt_metrics = extract_claudette_metrics_from_text(gt)
             result = {
                 "index": idx + offset,

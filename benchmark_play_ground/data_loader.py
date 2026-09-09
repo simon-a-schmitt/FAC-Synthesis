@@ -160,3 +160,60 @@ def load_cti_vsp_metric_classes(path: str) -> Dict[str, List[str]]:
     with open(path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
     return {metric: list(classes.keys()) for metric, classes in data["metric_distribution"].items()}
+
+
+TOXICITY_LABELS = ("toxic", "safe")
+
+
+def map_toxicity_label(label) -> str:
+    """Normalize a toxicity ground-truth cell to "toxic" / "safe".
+
+    Accepts the answer-string form used by the benchmark TSVs
+    ("Answer: toxic" / "Answer: safe", any casing / surrounding whitespace),
+    the bare words "toxic" / "safe", and the integer coding used by the
+    sequence-classification fine-tuning scripts (1 -> toxic, 0 -> safe).
+    Anything unrecognized is returned lowercased and stripped, so a
+    downstream sanity check can fail loudly on it.
+    """
+    s = str(label).strip()
+    low = s.lower()
+    if "toxic" in low:
+        return "toxic"
+    if "safe" in low:
+        return "safe"
+    if s in ("1", "1.0"):
+        return "toxic"
+    if s in ("0", "0.0"):
+        return "safe"
+    return low
+
+
+def load_toxicity_tsv(path: str) -> List[Dict[str, str]]:
+    """Load a toxicity-detection TSV and return records with keys: prompt, gt, label.
+
+    Each row holds a single user request/message (`prompt`) and its toxicity
+    ground truth. `gt` is the canonical answer string the scoring template
+    expects ("Answer: toxic" / "Answer: safe"); `label` is the bare class
+    ("toxic" / "safe") for convenience.
+
+    Tolerant to layout differences between the files in this repo: the test set
+    (`toxicity_test_set.tsv`) has no header row, while the anchor / few-shot set
+    (`toxicity_anchor_set.tsv`) starts with a "prompt\tlabel" header. The
+    ground-truth column may be an "Answer: ..." string, a bare "toxic"/"safe",
+    or the 0/1 integer coding used by the fine-tuning scripts (see
+    map_toxicity_label).
+    """
+    df = pd.read_csv(path, sep="\t", dtype=str, header=None, names=["prompt", "gt"], quoting=3).fillna("")
+
+    # Drop a header row if the file has one (e.g. "prompt"/"text" + "label"/"labels").
+    first_prompt = df.iloc[0]["prompt"].strip().lower()
+    first_gt = df.iloc[0]["gt"].strip().lower()
+    if first_prompt in ("prompt", "text", "sentence") or first_gt in ("label", "labels", "gt"):
+        df = df.iloc[1:].reset_index(drop=True)
+
+    records = []
+    for _, r in df.iterrows():
+        prompt = str(r["prompt"]).replace("\\n", "\n")
+        cls = map_toxicity_label(r["gt"])
+        records.append({"prompt": prompt, "gt": f"Answer: {cls}", "label": cls})
+    return records
