@@ -2,7 +2,7 @@
 """Zieht n Beispiele ohne Zuruecklegen aus einer claudette_tos-tsv-Datei.
 
 k Beispiele werden aus der Teilmenge aller Beispiele gezogen, deren
-Ergebnisvektor mindestens einen Slot != N enthaelt (z.B. "LTD:N|TER:P|...").
+Ergebnisvektor mindestens einen Slot != N enthaelt (z.B. "LTD: N|TER: P|...").
 Die restlichen (n - k) Beispiele werden ohne Zuruecklegen aus der
 Gesamtmenge (exklusive bereits gezogener Zeilen) gezogen.
 
@@ -23,10 +23,11 @@ from pathlib import Path
 
 def has_non_n_slot(label: str) -> bool:
     for slot in label.split("|"):
+        slot = slot.strip()
         if not slot:
             continue
         _, _, value = slot.partition(":")
-        if value != "N":
+        if value.strip() != "N":
             return True
     return False
 
