@@ -341,10 +341,18 @@ def score_slots(
         step = (torch.cat([input_ids, frag], dim=1) if prev_token is None
                 else torch.cat([prev_token, frag], dim=1))
 
+        # Append a mask entry only for tokens not already covered by running_mask:
+        # on the first slot the prompt is already masked, so just the fragment;
+        # on later slots the whole step (fed-back winner + fragment) is new.
+        n_new = frag.shape[1] if prev_token is None else step.shape[1]
         running_mask = torch.cat(
             [running_mask,
-             torch.ones(batch_size, step.shape[1], dtype=running_mask.dtype, device=device)],
+             torch.ones(batch_size, n_new, dtype=running_mask.dtype, device=device)],
             dim=1,
+        )
+        past_len = 0 if past_key_values is None else past_key_values.get_seq_length()
+        assert running_mask.shape[1] == past_len + step.shape[1], (
+            f"mask {running_mask.shape[1]} != kv {past_len + step.shape[1]}"
         )
         # Left-padding-aware position ids, matching HF generate().
         pos = running_mask.long().cumsum(-1) - 1
