@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 import torch
+from transformers.cache_utils import DynamicCache
 
 
 # ==========================================================================
@@ -330,7 +331,11 @@ def score_slots(
     """
     batch_size = input_ids.shape[0]
     running_mask = attention_mask
-    past_key_values = None
+    # Pass an explicit Cache object from the first call onward. Passing
+    # past_key_values=None lets some transformers versions (e.g. 4.43.x)
+    # return the legacy tuple-based cache format instead, which has no
+    # .get_seq_length(), breaking the position-id bookkeeping below.
+    past_key_values = DynamicCache()
     prev_token = None
 
     acc = [{"values": {}, "log_probs": {}, "probs": {}, "ties": {}} for _ in range(batch_size)]
@@ -350,7 +355,7 @@ def score_slots(
              torch.ones(batch_size, n_new, dtype=running_mask.dtype, device=device)],
             dim=1,
         )
-        past_len = 0 if past_key_values is None else past_key_values.get_seq_length()
+        past_len = past_key_values.get_seq_length()
         assert running_mask.shape[1] == past_len + step.shape[1], (
             f"mask {running_mask.shape[1]} != kv {past_len + step.shape[1]}"
         )
