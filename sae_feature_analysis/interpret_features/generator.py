@@ -132,7 +132,7 @@ class Generator:
         )
         return self._tokenizer.batch_decode(outputs[:, inputs.shape[1]:], skip_special_tokens=True)[0]
  
-    def get_activates(self, ids, return_logits=False, max_seq_len=8192):
+    def get_activates(self, ids, return_logits=False, max_seq_len=512):
         if isinstance(ids, str):
             ids = self._tokenizer.convert_tokens_to_ids(self._tokenizer.tokenize(ids))
         if not tc.is_tensor(ids):

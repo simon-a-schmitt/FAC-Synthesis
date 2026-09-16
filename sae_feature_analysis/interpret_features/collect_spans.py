@@ -2,9 +2,12 @@ import os
 import bisect
 import json
 import tempfile
+import time
+import hashlib
 import tqdm
 import torch as tc
 import numpy as np
+from datetime import datetime, timezone
 from corpus import CorpusSearchIndex
 from llm_surgery import switch_mode, mount_function
 from generator import Generator
@@ -63,6 +66,27 @@ def atomic_write_json(path, payload):
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def sha256_of_file(path, chunk_size=1 << 20):
+    """Stream-hash a file so it can be used as a reproducibility pin for the dataset sample."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def detect_gpu_info(generator):
+    device_str = str(getattr(generator, "_device", "cpu"))
+    if device_str.startswith("cuda") and tc.cuda.is_available():
+        try:
+            gpu_index = tc.cuda.current_device()
+            gpu_type = tc.cuda.get_device_properties(gpu_index).name
+        except Exception:
+            gpu_type = "unknown"
+        return 1, gpu_type
+    return 0, "cpu"
 
 
 def load_collectors_from_tsv(path, collectors):
@@ -162,7 +186,8 @@ def activations(messages, model, sae, tokenizer, size=32):
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)
 
-    ids = input_ids[0].to(model._device)
+    raw_token_len = int(input_ids.shape[1])
+    ids = input_ids[0].to(model._device)[:512]
     token_ids = ids.tolist()
     tokens = tokenizer.convert_ids_to_tokens(token_ids)
 
@@ -181,6 +206,7 @@ def activations(messages, model, sae, tokenizer, size=32):
 
     device = model._device
     IDX_dev = IDX.to(device)
+    content_token_count = int(token_mask.sum().item())
     masked_actvs = sae.actvs.squeeze() * token_mask.to(sae.actvs.dtype).unsqueeze(-1)
     act, pos = masked_actvs.max(dim=0)
     choose = act > args.threshold
@@ -191,7 +217,14 @@ def activations(messages, model, sae, tokenizer, size=32):
     spans = [ids[max(0, p - size + 1):p + 1] for p in pos]
     spans = tokenizer.batch_decode(spans)
     sae.topk = topk
-    return {"Neurons": idx, "Spans": spans, "Scores": act}
+    return {
+        "Neurons": idx,
+        "Spans": spans,
+        "Scores": act,
+        "RawTokenLen": raw_token_len,
+        "ContentTokenCount": content_token_count,
+        "Capped": raw_token_len > 512,
+    }
 
 def collect_text_spans(corpus, sae, generator, tokenizer, model_name, subgroup, ttlgroup, max_collects):
     
@@ -202,15 +235,50 @@ def collect_text_spans(corpus, sae, generator, tokenizer, model_name, subgroup, 
     sae.early_stop = True
     
     dataset_name = os.path.splitext(os.path.basename(args.data_path))[0]
-    root = f"./xxx/threshold_{args.threshold}"
+    root = f"./prod_run/threshold_{args.threshold}"
     os.makedirs(root, exist_ok=True)
     out_path = os.path.join(root, f"textspans_group{subgroup}.tsv")
     progress_path = os.path.join(root, f"textspans_group{subgroup}.progress.json")
+    metrics_path = os.path.join(root, f"metrics_group{subgroup}.json")
     checkpoint_every = getattr(args, "checkpoint_every", 500)
     resume_mode = getattr(args, "resume", "auto")
     max_prompts_per_run = max(0, int(getattr(args, "max_prompts_per_run", 0)))
 
+    print(f"[INFO] Hashing dataset for pin: {args.data_path}")
+    dataset_sha256 = sha256_of_file(args.data_path)
+    gpu_count, gpu_type = detect_gpu_info(generator)
+
     collectors = [TopKCollector(max_collects) for _ in range(65536)]
+
+    # Cumulative metric counters, restored from a prior run's metrics snapshot (if any)
+    # so that repeated checkpointed runs report totals across the whole job, not just
+    # the current process invocation.
+    cum_documents_processed = 0
+    cum_documents_skipped = 0
+    cum_raw_tokens_total = 0
+    cum_content_tokens_total = 0
+    cum_documents_capped = 0
+    cum_wall_clock_seconds = 0.0
+
+    if resume_mode in {"auto", "require"} and os.path.exists(metrics_path):
+        try:
+            with open(metrics_path, "r", encoding="utf8") as f:
+                prev_metrics = json.load(f)
+            same_metrics_setup = (
+                prev_metrics.get("data_path") == args.data_path
+                and float(prev_metrics.get("threshold", args.threshold)) == float(args.threshold)
+                and int(prev_metrics.get("subgroup", subgroup)) == subgroup
+                and int(prev_metrics.get("ttlgroup", ttlgroup)) == ttlgroup
+            )
+            if same_metrics_setup:
+                cum_documents_processed = int(prev_metrics.get("documents_processed", 0))
+                cum_documents_skipped = int(prev_metrics.get("documents_skipped", 0))
+                cum_raw_tokens_total = int(prev_metrics.get("raw_tokens_total", 0))
+                cum_content_tokens_total = int(prev_metrics.get("content_tokens_total", 0))
+                cum_documents_capped = int(prev_metrics.get("documents_capped_at_512", 0))
+                cum_wall_clock_seconds = float(prev_metrics.get("wall_clock_seconds", 0.0))
+        except (json.JSONDecodeError, OSError):
+            pass
 
     progress = None
     if resume_mode in {"auto", "require"} and os.path.exists(progress_path):
@@ -281,6 +349,40 @@ def collect_text_spans(corpus, sae, generator, tokenizer, model_name, subgroup, 
         }
         atomic_write_json(progress_path, payload)
 
+    def write_metrics(documents_attempted, run_elapsed_seconds, completed):
+        total_processed = cum_documents_processed + run_documents_processed
+        total_skipped = cum_documents_skipped + run_documents_skipped
+        total_raw_tokens = cum_raw_tokens_total + run_raw_tokens_total
+        total_content_tokens = cum_content_tokens_total + run_content_tokens_total
+        total_capped = cum_documents_capped + run_documents_capped
+        total_wall_clock = cum_wall_clock_seconds + run_elapsed_seconds
+        avg_raw_token_length = (total_raw_tokens / total_processed) if total_processed > 0 else 0.0
+        throughput_docs_per_sec = (total_processed / total_wall_clock) if total_wall_clock > 0 else 0.0
+        payload = {
+            "version": 1,
+            "data_path": args.data_path,
+            "dataset_total_entries": total_rows,
+            "dataset_sha256": dataset_sha256,
+            "threshold": float(args.threshold),
+            "subgroup": int(subgroup),
+            "ttlgroup": int(ttlgroup),
+            "documents_attempted": int(documents_attempted),
+            "documents_processed": int(total_processed),
+            "documents_skipped": int(total_skipped),
+            "raw_tokens_total": int(total_raw_tokens),
+            "content_tokens_total": int(total_content_tokens),
+            "documents_capped_at_512": int(total_capped),
+            "avg_raw_token_length": round(avg_raw_token_length, 4),
+            "wall_clock_seconds": round(total_wall_clock, 4),
+            "gpu_count": int(gpu_count),
+            "gpu_type": gpu_type,
+            "gpu_hours": round((total_wall_clock / 3600.0) * gpu_count, 6),
+            "throughput_docs_per_sec": round(throughput_docs_per_sec, 4),
+            "completed": bool(completed),
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+        }
+        atomic_write_json(metrics_path, payload)
+
     total_rows = len(corpus)
     assigned_total = count_assigned_samples(total_rows, subgroup, ttlgroup)
     already_done_assigned = count_assigned_samples(total_rows, subgroup, ttlgroup, upper_exclusive=start_idx)
@@ -293,9 +395,19 @@ def collect_text_spans(corpus, sae, generator, tokenizer, model_name, subgroup, 
     last_idx = start_idx - 1
     stopped_by_budget = False
 
+    # Run-level (this-invocation-only) metric counters; folded into the cumulative
+    # totals above whenever write_metrics() is called.
+    run_documents_processed = 0
+    run_documents_skipped = 0
+    run_raw_tokens_total = 0
+    run_content_tokens_total = 0
+    run_documents_capped = 0
+    run_start_time = time.time()
+
     if start_idx >= total_rows:
         write_snapshot(out_path)
         write_progress(total_rows - 1, processed_assigned, completed=True)
+        write_metrics(processed_assigned, time.time() - run_start_time, completed=True)
         return
 
     for idx, text in enumerate(corpus):
@@ -329,13 +441,20 @@ def collect_text_spans(corpus, sae, generator, tokenizer, model_name, subgroup, 
         results = None
         if not messages or len(messages) == 0:
             print(f"[WARN] Empty message skipped at sample {idx}")
+            run_documents_skipped += 1
         else:
             try:
                 results = activations(messages, generator, sae, tokenizer)
             except Exception as e:
                 print(f"[WARN] Template error at sample {idx}: {e}")
+                run_documents_skipped += 1
 
         if results is not None:
+            run_documents_processed += 1
+            run_raw_tokens_total += results["RawTokenLen"]
+            run_content_tokens_total += results["ContentTokenCount"]
+            if results["Capped"]:
+                run_documents_capped += 1
             for neuron, span, score in zip(results["Neurons"], results["Spans"], results["Scores"]):
                 collectors[neuron].update(score, (neuron, idx, score, span))
 
@@ -344,6 +463,7 @@ def collect_text_spans(corpus, sae, generator, tokenizer, model_name, subgroup, 
         if processed_this_run % checkpoint_every == 0:
             write_snapshot(out_path)
             write_progress(last_idx, processed_assigned, completed=False)
+            write_metrics(processed_assigned, time.time() - run_start_time, completed=False)
 
         if max_prompts_per_run > 0 and processed_this_run >= max_prompts_per_run:
             stopped_by_budget = True
@@ -352,6 +472,7 @@ def collect_text_spans(corpus, sae, generator, tokenizer, model_name, subgroup, 
     write_snapshot(out_path)
     completed = (not stopped_by_budget) and (last_idx >= total_rows - 1)
     write_progress(last_idx, processed_assigned, completed=completed)
+    write_metrics(processed_assigned, time.time() - run_start_time, completed=completed)
     if stopped_by_budget:
         print(
             f"[INFO] Run budget reached ({max_prompts_per_run} prompts for worker {subgroup}/{ttlgroup}). "
@@ -529,10 +650,21 @@ if __name__ == "__main__":
 
         logger.info(f"Starting feature collection (worker {subgroup}/{ttlgroup})...")
         with tc.no_grad():
-            collect_text_spans(corpus, sae, generator, tokenizer, model_key, subgroup, ttlgroup, max_collects=1000)
+            collect_text_spans(corpus, sae, generator, tokenizer, model_key, subgroup, ttlgroup, max_collects=100)
 
         logger.info(f"{'='*60}")
         logger.info(f"Completed successfully!")
+        metrics_path = os.path.join(f"./prod_run/threshold_{args.threshold}", f"metrics_group{subgroup}.json")
+        if os.path.exists(metrics_path):
+            with open(metrics_path, "r", encoding="utf8") as f:
+                m = json.load(f)
+            logger.info(f"  Documents attempted/processed/skipped: {m['documents_attempted']}/{m['documents_processed']}/{m['documents_skipped']}")
+            logger.info(f"  Raw tokens processed: {m['raw_tokens_total']} (avg length {m['avg_raw_token_length']})")
+            logger.info(f"  Content tokens pooled: {m['content_tokens_total']}")
+            logger.info(f"  Documents capped at 512 tokens: {m['documents_capped_at_512']}")
+            logger.info(f"  Wall clock: {m['wall_clock_seconds']:.1f}s | GPU: {m['gpu_count']}x {m['gpu_type']} | GPU-hours: {m['gpu_hours']}")
+            logger.info(f"  Throughput: {m['throughput_docs_per_sec']} docs/s")
+            logger.info(f"  Dataset: {m['dataset_total_entries']} entries, sha256={m['dataset_sha256'][:16]}...")
         logger.info(f"{'='*60}")
 
     except Exception as e:
