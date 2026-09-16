@@ -1,37 +1,43 @@
 #!/usr/bin/env python3
-"""Constrained-slot CTI-VSP (CVSS v3.1 Base vector prediction) benchmark.
+"""Free-generation CTI-VSP (CVSS v3.1 Base vector prediction) benchmark.
 
-Conceptually the 8-slot, k-way-per-slot counterpart of run_claudette_benchmark.py:
-each of the 8 CVSS base metrics (AV, AC, PR, UI, S, C, I, A) is one slot, scored
-with benchmark_play_ground.slot_scoring (force the "CVSS:3.1/AV: " ... fragment
-through the model, read one full-vocabulary log-softmax at the position fixed a
-priori by construction, keep only that slot's valid candidate letters). No free
-generation happens.
+The model free-generates a CVSS v3.1 Base vector string for a CVE description;
+the 8 base metrics (AV, AC, PR, UI, S, C, I, A) are then parsed out of that raw
+text post-hoc. A metric that cannot be parsed out of a given example's output is
+a "parse failure" for that (example, metric) slot: it is excluded from that
+slot's accuracy/precision/recall/F1 -- NOT counted as wrong -- and the number of
+such failures is reported both overall and per metric.
 
-The stored/reported CVSS vector strings (predicted_vector, gt) stay in the old
-compact format used throughout this repo, e.g. "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/
-S:U/C:H/I:H/A:N" -- no space after each ":". That format cannot be used for the
-constrained-decoding template itself, though: probing the tokenizer shows that
-e.g. ":R" (UI:R) does not tokenize as a single token the way ":N" does, so
-build_slot_plan() rejects a no-space template outright. The internal scoring
-template therefore uses a space before each value ("AV: N", matching CLAUDETTE's
-convention); only the human-facing/stored vector strings are rendered without
-one, via build_cvss_vector().
+All three arms (plain, icl, fine_tuned) use the same fixed system prompt and the
+same user-turn template ("CVE Description: " + query, extracted from whatever
+instruction preamble the TSV's `prompt` column happens to have baked in); icl
+additionally injects few-shot turns between the system prompt and the query.
+
+Stored/reported CVSS vector strings (predicted_vector, gt) use the old compact
+format, e.g. "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N" -- no space after
+each ":".
 
 Metrics
 -------
-  * exact_match_accuracy : fraction of examples where all 8 metrics match,
-  * slot_accuracy        : fraction of (example, metric) pairs that match,
-  * macro_f1             : mean of the 8 per-metric macro-F1 scores (each
-                            per-metric macro-F1 itself an unweighted mean of
-                            that metric's own per-class F1s),
-  * micro_f1             : TP/FP/FN pooled over every (metric, class) pair,
-  * mad                  : mean absolute difference between the predicted and
-                            gold CVSS v3.1 base score.
+  * exact_match_accuracy : fraction of examples where all 8 metrics were parsed
+                            AND matched the ground truth,
+  * slot_accuracy         : fraction of *parsed* (example, metric) pairs that
+                            matched -- parse failures excluded from num/denom,
+  * macro_f1              : mean of the 8 per-metric macro-F1 scores (each
+                             per-metric macro-F1 itself an unweighted mean of
+                             that metric's own per-class F1s, computed only
+                             over that metric's parsed slots),
+  * micro_f1              : TP/FP/FN pooled over every (metric, class) pair,
+                             parsed slots only,
+  * mad                   : mean absolute difference between the predicted and
+                             gold CVSS v3.1 base score (only over examples whose
+                             full 8-metric vector parsed).
 Every one of these also gets a trivial-baseline counterpart: a constant
 predictor that always outputs, for each slot, that slot's majority ground-truth
-class -- computed dynamically from the records in --data-tsv, i.e. the same
-evaluation set the real predictions are scored against. Per-slot support /
+class -- computed dynamically from the records in --data-tsv (the same
+evaluation set the real predictions are scored against), and evaluated over the
+FULL dataset (it never has parse failures), so it stays a stable reference
+figure independent of how well a given run happened to parse. Per-slot support /
 precision / recall / F1 (and their trivial-baseline counterparts) are reported
 under "per_metric".
 """
@@ -54,49 +60,19 @@ sys.path.insert(0, str(ROOT_DIR))
 from benchmark_play_ground.data_loader import load_cti_vsp_tsv, load_cti_vsp_metric_classes
 from benchmark_play_ground.prompt_builder import extract_cve_description_block
 from benchmark_play_ground.model_wrapper import LocalModel
-from benchmark_play_ground.slot_scoring import (
-    SlotPlan,
-    build_slot_plan,
-    format_example,
-    make_fragments,
-    score_slots,
-)
 
 
 CVSS_METRICS = ["AV", "AC", "PR", "UI", "S", "C", "I", "A"]
-
-# The full CVSS v3.1 Base metric domain (fixed by the spec, independent of what
-# a particular --data-tsv happens to contain), used as the constrained-decoding
-# candidate alphabet per slot.
-CVSS_METRIC_VALUES = {
-    "AV": ["N", "A", "L", "P"],
-    "AC": ["L", "H"],
-    "PR": ["N", "L", "H"],
-    "UI": ["N", "R"],
-    "S": ["U", "C"],
-    "C": ["N", "L", "H"],
-    "I": ["N", "L", "H"],
-    "A": ["N", "L", "H"],
-}
-
-# Old, no-space format ("CVSS:3.1/AV:N/AC:L/..."), used only for the system
-# prompt's format example and for parsing gt / few-shot labels. NOT usable as
-# the constrained-decoding template -- see module docstring.
-CVSS_DISPLAY_FRAGMENTS = make_fragments(CVSS_METRICS, sep="/", assign=":", prefix="CVSS:3.1/")
-
-# Scoring template actually forced through the model. The space before each
-# value is what makes every candidate letter a clean single token; see
-# slot_scoring.make_fragments / build_slot_plan.
-CVSS_SCORING_FRAGMENTS = make_fragments(CVSS_METRICS, sep="/", assign=": ", prefix="CVSS:3.1/")
 
 CVSS_VECTOR_RE = re.compile(
     r"CVSS:3\.[01]/AV:[NALP]/AC:[LH]/PR:[NLH]/UI:[NR]/S:[UC]/C:[NLH]/I:[NLH]/A:[NLH]"
 )
 CVSS_LOOSE_RE = re.compile(r"CVSS:3\.[01]/[A-Za-z:/]+")
 
-
+# Fixed across all three arms (plain, icl, fine_tuned) -- see module docstring.
 CTI_VSP_SYSTEM_PROMPT = (
-    "Analyze the CVE description and determine its CVSS v3.1 Base vector.\n"
+    "Analyze the following CVE description and output the CVSS v3.1 Base vector string. "
+    "Do not explain your reasoning. Output only the vector string and nothing else.\n"
     "Valid options for each metric:\n"
     "- Attack Vector (AV): N, A, L, P\n"
     "- Attack Complexity (AC): L, H\n"
@@ -106,11 +82,11 @@ CTI_VSP_SYSTEM_PROMPT = (
     "- Confidentiality (C): N, L, H\n"
     "- Integrity (I): N, L, H\n"
     "- Availability (A): N, L, H\n"
-    "Answer with exactly one line in the following format, and nothing else:\n\n"
-    # Derived from the same (no-space) fragments used to store/report vectors,
-    # so the prompt's example and the reported format can never drift apart.
-    f"{format_example(CVSS_DISPLAY_FRAGMENTS)}"
+    "Output format (exactly this, no other text): "
+    "CVSS:3.1/AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_"
 )
+
+CTI_VSP_STOP_STRINGS = ["\nCVE Description:", "\n\n"]
 
 
 def extract_cvss_vector_from_text(text: str) -> str | None:
@@ -121,9 +97,10 @@ def extract_cvss_vector_from_text(text: str) -> str | None:
 def extract_cvss_metrics_from_text(text: str) -> dict:
     """Parse a "CVSS:3.1/AV:N/AC:L/..." vector string into a per-metric dict.
 
-    Used for the ground-truth vector loaded verbatim from the TSV and for
-    few-shot labels -- never for model predictions, which come straight off
-    the SlotResult returned by slot_scoring.score_slots (see generate_batch).
+    Used both for the ground-truth vector loaded verbatim from the TSV / the
+    few-shot labels, and for the model's raw free-generated output. A metric
+    absent from the (possibly partial/malformed) text is left as None -- a
+    parse failure for that slot; see evaluate_cti_vsp_predictions.
     """
     metrics = {m: None for m in CVSS_METRICS}
     vector = extract_cvss_vector_from_text(text)
@@ -169,10 +146,8 @@ def cvss3_base_score(metrics: dict) -> float | None:
 def compute_majority_classes(records: list[dict]) -> tuple[dict[str, str], dict[str, dict[str, int]]]:
     """Per-metric majority ground-truth class over this run's --data-tsv records.
 
-    Used both as the trivial per-slot baseline predictor and to order each
-    slot's candidate alphabet for the plan's tie policy (majority class last,
-    see slot_scoring.build_slot_plan), so an exact log-prob tie resolves to
-    the majority class instead of inflating a minority one.
+    Used as the trivial per-slot baseline predictor, evaluated over the same
+    evaluation set the real predictions are scored against.
     """
     counts: dict[str, dict[str, int]] = {m: {} for m in CVSS_METRICS}
     for r in records:
@@ -187,13 +162,6 @@ def compute_majority_classes(records: list[dict]) -> tuple[dict[str, str], dict[
             raise SystemExit(f"No parsable ground-truth values for metric {m}; cannot compute majority baseline")
         majority[m] = max(counts[m].items(), key=lambda kv: kv[1])[0]
     return majority, counts
-
-
-def _ordered_candidates(metric: str, majority_cls: str) -> list[str]:
-    """Full CVSS domain for `metric`, with the majority class moved last."""
-    values = CVSS_METRIC_VALUES[metric]
-    rest = [v for v in values if v != majority_cls]
-    return rest + [majority_cls]
 
 
 def _micro_f1_from_counts(tp: int, fp: int, fn: int) -> float:
@@ -212,54 +180,55 @@ def evaluate_cti_vsp_predictions(
         if all(r["gt_metrics"].get(m) == majority_classes[m] for m in CVSS_METRICS)
     )
 
-    slot_total = total * len(CVSS_METRICS)
-    slot_correct = sum(
-        1 for r in results for m in CVSS_METRICS
-        if r["predicted_metrics"].get(m) == r["gt_metrics"].get(m)
-    )
-    slot_correct_trivial = sum(
-        1 for r in results for m in CVSS_METRICS
-        if majority_classes[m] == r["gt_metrics"].get(m)
-    )
-
     per_metric = {}
     micro_tp = micro_fp = micro_fn = 0
     micro_tp_trivial = micro_fp_trivial = micro_fn_trivial = 0
+    slot_correct = 0
+    slot_total = 0  # parsed-only denominator -- parse failures are excluded, not penalized
+    slot_correct_trivial = 0
+    slot_total_trivial = total * len(CVSS_METRICS)
+    n_parse_failures_total = 0
+    n_parse_failures_by_metric = {}
 
     for metric in CVSS_METRICS:
+        parsed = [r for r in results if r["predicted_metrics"].get(metric) is not None]
+        n_parsed = len(parsed)
+        n_failed = total - n_parsed
+        n_parse_failures_by_metric[metric] = n_failed
+        n_parse_failures_total += n_failed
+
+        slot_total += n_parsed
+        slot_correct += sum(1 for r in parsed if r["predicted_metrics"][metric] == r["gt_metrics"].get(metric))
+        slot_correct_trivial += sum(1 for r in results if majority_classes[metric] == r["gt_metrics"].get(metric))
+
         classes = metric_classes.get(metric, [])
         maj = majority_classes[metric]
         class_stats = {}
         macro_f1_sum = 0.0
-        macro_f1_trivial_sum = 0.0
         n_supported = 0
+        macro_f1_trivial_sum = 0.0
+        n_supported_trivial = 0
 
         for cls in classes:
-            tp = sum(
-                1 for r in results
-                if r["predicted_metrics"].get(metric) == cls and r["gt_metrics"].get(metric) == cls
-            )
-            fp = sum(
-                1 for r in results
-                if r["predicted_metrics"].get(metric) == cls and r["gt_metrics"].get(metric) != cls
-            )
-            fn = sum(
-                1 for r in results
-                if r["predicted_metrics"].get(metric) != cls and r["gt_metrics"].get(metric) == cls
-            )
-            support = sum(1 for r in results if r["gt_metrics"].get(metric) == cls)
+            # Actual model: computed only over this metric's successfully
+            # parsed slots (parse failures excluded, per the benchmark spec).
+            tp = sum(1 for r in parsed if r["predicted_metrics"][metric] == cls and r["gt_metrics"].get(metric) == cls)
+            fp = sum(1 for r in parsed if r["predicted_metrics"][metric] == cls and r["gt_metrics"].get(metric) != cls)
+            fn = sum(1 for r in parsed if r["predicted_metrics"][metric] != cls and r["gt_metrics"].get(metric) == cls)
+            support = sum(1 for r in parsed if r["gt_metrics"].get(metric) == cls)
             precision = tp / (tp + fp) if (tp + fp) else 0.0
             recall = tp / (tp + fn) if (tp + fn) else 0.0
             f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
 
-            # Trivial baseline for this class: a constant predictor that always
-            # outputs this metric's majority class `maj`. If cls == maj, it
-            # "hits" every gt==cls example and "false-positives" every other
-            # example; otherwise it never predicts cls at all.
+            # Trivial baseline: a constant predictor that always outputs this
+            # metric's majority class `maj`, over the FULL dataset (it has no
+            # parse failures by construction, so it stays a stable reference
+            # figure independent of this run's parse rate).
+            support_trivial = sum(1 for r in results if r["gt_metrics"].get(metric) == cls)
             if cls == maj:
-                t_tp, t_fp, t_fn = support, total - support, 0
+                t_tp, t_fp, t_fn = support_trivial, total - support_trivial, 0
             else:
-                t_tp, t_fp, t_fn = 0, 0, support
+                t_tp, t_fp, t_fn = 0, 0, support_trivial
             t_precision = t_tp / (t_tp + t_fp) if (t_tp + t_fp) else 0.0
             t_recall = t_tp / (t_tp + t_fn) if (t_tp + t_fn) else 0.0
             t_f1 = 2 * t_precision * t_recall / (t_precision + t_recall) if (t_precision + t_recall) else 0.0
@@ -267,6 +236,7 @@ def evaluate_cti_vsp_predictions(
             class_stats[cls] = {
                 "support": support,
                 "precision": precision, "recall": recall, "f1": f1,
+                "support_trivial": support_trivial,
                 "precision_trivial": t_precision, "recall_trivial": t_recall, "f1_trivial": t_f1,
             }
 
@@ -279,13 +249,17 @@ def evaluate_cti_vsp_predictions(
 
             if support > 0:
                 macro_f1_sum += f1
-                macro_f1_trivial_sum += t_f1
                 n_supported += 1
+            if support_trivial > 0:
+                macro_f1_trivial_sum += t_f1
+                n_supported_trivial += 1
 
         per_metric[metric] = {
-            "macro_f1": macro_f1_sum / n_supported if n_supported else 0.0,
-            "macro_f1_trivial": macro_f1_trivial_sum / n_supported if n_supported else 0.0,
             "majority_class": maj,
+            "n_parsed": n_parsed,
+            "n_parse_failures": n_failed,
+            "macro_f1": macro_f1_sum / n_supported if n_supported else 0.0,
+            "macro_f1_trivial": macro_f1_trivial_sum / n_supported_trivial if n_supported_trivial else 0.0,
             "classes": class_stats,
         }
 
@@ -320,7 +294,9 @@ def evaluate_cti_vsp_predictions(
         "slot_correct": slot_correct,
         "slot_total": slot_total,
         "slot_accuracy": slot_correct / slot_total if slot_total else 0.0,
-        "slot_accuracy_trivial": slot_correct_trivial / slot_total if slot_total else 0.0,
+        "slot_correct_trivial": slot_correct_trivial,
+        "slot_total_trivial": slot_total_trivial,
+        "slot_accuracy_trivial": slot_correct_trivial / slot_total_trivial if slot_total_trivial else 0.0,
         "macro_f1": macro_f1,
         "macro_f1_trivial": macro_f1_trivial,
         "micro_f1": micro_f1,
@@ -329,6 +305,9 @@ def evaluate_cti_vsp_predictions(
         "mad_trivial": mad_trivial,
         "mad_n_scored": n_scored,
         "mad_n_unscored": total - n_scored,
+        "n_parse_failures_total": n_parse_failures_total,
+        "n_parse_failures_by_metric": n_parse_failures_by_metric,
+        "n_examples_unparseable_vector": total - n_scored,
         "majority_classes": majority_classes,
         "majority_vector": majority_vector,
         "majority_vector_score": majority_vector_score,
@@ -351,36 +330,35 @@ def parse_args():
     p.add_argument("--lora-path", default=None, help="Path to LoRA adapter weights (required for --mode fine_tuned); merged onto the base model from --model-path")
     p.add_argument("--device", default="cuda", help="Device to run model on (cuda or cpu)")
     p.add_argument("--dtype", default="bfloat16", help="Dtype for model init (bfloat16 or float16)")
-    p.add_argument("--max-input-tokens", type=int, default=None, help="Optional cap for prompt tokens before scoring; omit to keep the full prompt")
+    p.add_argument("--max-input-tokens", type=int, default=None, help="Optional cap for prompt tokens before generation; omit to keep the full prompt")
+    p.add_argument("--max-new-tokens", type=int, default=256, help="Max new tokens to generate per prompt")
     p.add_argument("--max-prompts", type=int, default=0, help="Limit number of prompts (0 = all)")
-    p.add_argument("--batch-size", type=int, default=32, help="Number of prompts to score in a single batched forward pass")
+    p.add_argument("--batch-size", type=int, default=32, help="Number of prompts to generate in a single batched forward pass")
     p.add_argument("--output-jsonl", default="cti_vsp_benchmark_results.jsonl", help="Per-example JSONL output")
     p.add_argument("--resume", action="store_true", help="Resume from existing output JSONL if present")
     return p.parse_args()
 
 
 def build_chat_messages(args, query_prompt: str, few_shots: list[dict]) -> list[dict]:
-    if args.mode == "plain":
-        user_content = extract_cve_description_block(query_prompt)
-        return [
-            {"role": "system", "content": CTI_VSP_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ]
+    """Same system prompt and user-turn template for all three arms.
+
+    The TSV's `prompt` column has an instruction preamble baked in ahead of
+    the "CVE Description: ..." block; extract_cve_description_block() strips
+    that off so every arm queries the model with exactly CTI_VSP_SYSTEM_PROMPT
+    as the system turn and "CVE Description: ..." as the (final) user turn.
+    icl additionally injects few-shot turns, built the same way, in between.
+    """
+    user_content = extract_cve_description_block(query_prompt)
+    messages = [{"role": "system", "content": CTI_VSP_SYSTEM_PROMPT}]
     if args.mode == "icl":
         k = min(args.icl_k, len(few_shots))
-        examples = few_shots[:k]
-        user_content = extract_cve_description_block(query_prompt)
-        messages = [{"role": "system", "content": CTI_VSP_SYSTEM_PROMPT}]
-        for ex in examples:
+        for ex in few_shots[:k]:
             ex_description = extract_cve_description_block(ex.get("prompt", ""))
             ex_vector = ex.get("label", ex.get("gt", ""))
             messages.append({"role": "user", "content": ex_description})
             messages.append({"role": "assistant", "content": ex_vector})
-        messages.append({"role": "user", "content": user_content})
-        return messages
-    # "fine_tuned" queries the model directly, without a system prompt or
-    # few-shot examples, mirroring how the LoRA fine-tuning targets were built.
-    return [{"role": "user", "content": query_prompt}]
+    messages.append({"role": "user", "content": user_content})
+    return messages
 
 
 def render_chat_text(tokenizer, chat_messages: list[dict]) -> str:
@@ -391,76 +369,49 @@ def render_chat_text(tokenizer, chat_messages: list[dict]) -> str:
     )
 
 
-def _plan_lead_texts(tokenizer) -> list[str]:
-    """Two representative renderings of the prompt up to the answer, for build_slot_plan.
-
-    A short and a long user turn, per slot_scoring.build_slot_plan's contract: it
-    cross-checks that the resolved fragment/candidate token ids are identical
-    across both, which is what proves the plan does not depend on what precedes it.
-    """
-    user_messages = [
-        "CVE Description: short description.",
-        "CVE Description: a considerably longer CVE description, with punctuation: "
-        "commas, colons, and a trailing period that mirrors real CVE prose.",
-    ]
-    return [
-        tokenizer.apply_chat_template(
-            [{"role": "system", "content": CTI_VSP_SYSTEM_PROMPT},
-             {"role": "user", "content": u}],
-            tokenize=False, add_generation_prompt=True,
-        )
-        for u in user_messages
-    ]
-
-
-def generate_batch(
-    hf_model,
-    tokenizer,
-    texts: list[str],
-    *,
-    max_input_tokens: int | None,
-    device: str,
-    plan: SlotPlan,
-) -> list[dict]:
-    """Thin CTI-VSP-specific wrapper around slot_scoring.score_slots().
-
-    Tokenizes/left-pads `texts` (already rendered through the chat template) and
-    hands the batch to the benchmark-agnostic constrained-slot-scoring core,
-    then turns each example's SlotResult into a dict with the {metric: value}
-    prediction and its no-space vector string rendering. No free generation
-    happens here: the only per-slot model decision is the value token, forced
-    by the plan (see score_slots).
-    """
+def generate_batch(hf_model, tokenizer, texts: list[str], *, max_new_tokens: int, max_input_tokens: int | None, device: str) -> list[str]:
+    # `texts` were already rendered through the chat template (tokenize=False), so the
+    # special/control tokens (BOS, header tokens, ...) are already present as literal text.
+    # add_special_tokens=False avoids the tokenizer prepending a second BOS on top of that.
     encoded = [tokenizer(text, add_special_tokens=False)["input_ids"] for text in texts]
     if max_input_tokens:
         encoded = [ids[-max_input_tokens:] for ids in encoded]
 
+    # tokenizer.padding_side is "left" (set in generator_uni.build_model), so this left-pads
+    # the batch, which is what a causal LM needs for correct batched generation.
     padded = tokenizer.pad({"input_ids": encoded}, padding=True, return_tensors="pt")
     input_ids = padded["input_ids"].to(device)
     attention_mask = padded["attention_mask"].to(device)
 
     try:
-        slot_results = score_slots(hf_model, input_ids, attention_mask, plan, device=device)
+        outputs = hf_model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            stop_strings=CTI_VSP_STOP_STRINGS,
+            tokenizer=tokenizer,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id,
+        )
     except torch.cuda.OutOfMemoryError:
+        # This transformers version computes logits over the *full* padded sequence
+        # (no logits_to_keep slicing), so peak memory scales with batch_size * seq_len *
+        # vocab_size. Long CTI-VSP prompts can blow this up well before the requested
+        # batch size is actually reachable, independent of --max-input-tokens. Splitting
+        # the batch in half and retrying is the standard fallback for that.
         if device == "cuda":
             torch.cuda.empty_cache()
         if len(texts) <= 1:
             raise
         mid = len(texts) // 2
         print(f"CUDA OOM at batch size {len(texts)}. Splitting into sub-batches of {mid} and {len(texts) - mid}...")
-        first = generate_batch(hf_model, tokenizer, texts[:mid], max_input_tokens=max_input_tokens, device=device, plan=plan)
-        second = generate_batch(hf_model, tokenizer, texts[mid:], max_input_tokens=max_input_tokens, device=device, plan=plan)
+        first = generate_batch(hf_model, tokenizer, texts[:mid], max_new_tokens=max_new_tokens, max_input_tokens=max_input_tokens, device=device)
+        second = generate_batch(hf_model, tokenizer, texts[mid:], max_new_tokens=max_new_tokens, max_input_tokens=max_input_tokens, device=device)
         return first + second
 
-    out = []
-    for result in slot_results:
-        predicted_metrics = {m: result.values[m] for m in CVSS_METRICS}
-        out.append({
-            "predicted_metrics": predicted_metrics,
-            "predicted_vector": build_cvss_vector(predicted_metrics),
-            "ties": {m: result.ties[m] for m in CVSS_METRICS},
-        })
-    return out
+    gen_tokens = outputs[:, input_ids.shape[1]:]
+    return tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
 
 
 def main():
@@ -476,35 +427,8 @@ def main():
 
     metric_classes = load_cti_vsp_metric_classes(args.metric_distribution_json)
     # Majority class per metric, computed dynamically over exactly the records
-    # being evaluated (see compute_majority_classes). Used both for the trivial
-    # per-slot baseline and to order each slot's candidate alphabet so the
-    # plan's tie policy resolves ties towards the majority class.
+    # being evaluated (see compute_majority_classes) -- the trivial baseline.
     majority_classes, majority_counts = compute_majority_classes(records)
-
-    # Prepare few-shot examples if requested
-    few_shots = []
-    if args.few_shot_tsv and args.mode == "icl":
-        few_shots = load_cti_vsp_tsv(args.few_shot_tsv)
-
-    lora_path = args.lora_path if args.mode == "fine_tuned" else None
-    model = LocalModel(args.model_path, device=args.device, dtype=args.dtype, lora_path=lora_path)
-    model.load()
-    tokenizer = model.tokenizer
-    # Batched scoring needs direct access to the underlying HF model (LocalModel/UnifiedGenerator
-    # only expose a single-prompt generate() call), without touching the shared wrapper used by the
-    # other benchmark scripts.
-    hf_model = model._gen._model
-
-    cvss_candidates = [_ordered_candidates(m, majority_classes[m]) for m in CVSS_METRICS]
-    plan = build_slot_plan(
-        tokenizer,
-        CVSS_METRICS,
-        CVSS_SCORING_FRAGMENTS,
-        cvss_candidates,
-        leads=_plan_lead_texts(tokenizer),
-        tie_policy="last",
-    )
-    print(plan.describe(tokenizer))
     print("Majority classes (trivial baseline, dynamic from --data-tsv):", majority_classes)
 
     # Fail fast, once, at startup: the ground-truth vector format the rest of
@@ -518,25 +442,19 @@ def main():
             f"(missing {missing}): {sample_gt!r}"
         )
 
-    # In --mode icl the few-shot assistant turns are injected verbatim into every
-    # prompt, so run the same parse check over exactly the few-shot examples that
-    # will be used (few_shots[:icl_k]).
-    if args.mode == "icl":
-        n_icl = min(args.icl_k, len(few_shots))
-        if n_icl == 0:
-            print(
-                f"Warning: --mode icl but no few-shot examples to inject "
-                f"(few_shot_tsv={args.few_shot_tsv!r}, icl_k={args.icl_k}); running 0-shot."
-            )
-        for i, ex in enumerate(few_shots[:n_icl]):
-            ex_vector = ex.get("label", ex.get("gt", ""))
-            ex_metrics = extract_cvss_metrics_from_text(ex_vector)
-            ex_missing = [m for m in CVSS_METRICS if ex_metrics.get(m) is None]
-            if ex_missing:
-                raise SystemExit(
-                    f"Few-shot example {i} from --few-shot-tsv {args.few_shot_tsv!r} is "
-                    f"missing metrics {ex_missing}: {ex_vector!r}"
-                )
+    # Prepare few-shot examples if requested
+    few_shots = []
+    if args.few_shot_tsv and args.mode == "icl":
+        few_shots = load_cti_vsp_tsv(args.few_shot_tsv)
+
+    lora_path = args.lora_path if args.mode == "fine_tuned" else None
+    model = LocalModel(args.model_path, device=args.device, dtype=args.dtype, lora_path=lora_path)
+    model.load()
+    tokenizer = model.tokenizer
+    # Batched generation needs direct access to the underlying HF model (LocalModel/UnifiedGenerator
+    # only expose a single-prompt generate() call), without touching the shared wrapper used by the
+    # other benchmark scripts.
+    hf_model = model._gen._model
 
     out_path = Path(args.output_jsonl)
     results = []
@@ -596,13 +514,13 @@ def main():
             print("=== End final model input ===")
 
         try:
-            batch_out = generate_batch(
+            batch_raw = generate_batch(
                 hf_model,
                 tokenizer,
                 batch_texts,
+                max_new_tokens=args.max_new_tokens,
                 max_input_tokens=args.max_input_tokens,
                 device=args.device,
-                plan=plan,
             )
         except RuntimeError as e:
             msg = str(e)
@@ -622,30 +540,32 @@ def main():
                 f"CUDA generation failed for batch starting at index {idx}. Retrying with max_input_tokens={fallback_max_input}..."
             )
 
-            batch_out = generate_batch(
+            batch_raw = generate_batch(
                 hf_model,
                 tokenizer,
                 batch_texts,
+                max_new_tokens=args.max_new_tokens,
                 max_input_tokens=fallback_max_input,
                 device=args.device,
-                plan=plan,
             )
 
-        for offset, (rec, query_prompt, pred) in enumerate(zip(batch_records, batch_query_prompts, batch_out)):
+        for offset, (rec, query_prompt, raw) in enumerate(zip(batch_records, batch_query_prompts, batch_raw)):
             gt = rec.get("gt", "")
+            pred_vector = extract_cvss_vector_from_text(raw)
+            predicted_metrics = extract_cvss_metrics_from_text(raw)
             gt_metrics = extract_cvss_metrics_from_text(gt)
-            predicted_metrics = pred["predicted_metrics"]
             result = {
                 "index": idx + offset,
                 "prompt": query_prompt,
-                "predicted_vector": pred["predicted_vector"],
+                "raw_output": raw,
+                "predicted_vector": pred_vector,
                 "predicted_metrics": predicted_metrics,
+                "predicted_metrics_missing": [m for m in CVSS_METRICS if predicted_metrics.get(m) is None],
                 "predicted_score": cvss3_base_score(predicted_metrics),
                 "gt": gt,
                 "gt_metrics": gt_metrics,
                 "gt_score": cvss3_base_score(gt_metrics),
                 "correct": metrics_match(predicted_metrics, gt_metrics),
-                "ties": pred["ties"],
             }
             fh.write(json.dumps(result, ensure_ascii=False) + "\n")
             fh.flush()
@@ -664,7 +584,7 @@ def main():
     )
     print(
         f"  slot_accuracy: {summary['slot_accuracy']:.4f} "
-        f"({summary['slot_correct']}/{summary['slot_total']})  "
+        f"({summary['slot_correct']}/{summary['slot_total']}, parsed slots only)  "
         f"(trivial majority baseline: {summary['slot_accuracy_trivial']:.4f})"
     )
     print(
@@ -683,13 +603,18 @@ def main():
         )
     else:
         print(f"  mad: n/a (no scoreable predictions; n_unscored={summary['mad_n_unscored']})")
+    print(
+        f"  parse failures: {summary['n_parse_failures_total']} slots "
+        f"({summary['n_examples_unparseable_vector']}/{summary['total']} examples with >=1 missing metric)"
+    )
+    print(f"  parse failures by metric: {summary['n_parse_failures_by_metric']}")
     print(f"  majority vector (trivial baseline): {summary['majority_vector']}")
     print("  per_metric:")
     for metric in CVSS_METRICS:
         m = summary["per_metric"][metric]
         print(
-            f"    {metric} (majority={m['majority_class']}): macro_f1={m['macro_f1']:.4f}  "
-            f"(trivial: {m['macro_f1_trivial']:.4f})"
+            f"    {metric} (majority={m['majority_class']}, parsed={m['n_parsed']}/{summary['total']}): "
+            f"macro_f1={m['macro_f1']:.4f}  (trivial: {m['macro_f1_trivial']:.4f})"
         )
         for cls, stats in m["classes"].items():
             print(
