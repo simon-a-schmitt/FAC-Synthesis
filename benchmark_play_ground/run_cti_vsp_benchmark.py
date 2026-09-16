@@ -67,7 +67,28 @@ CVSS_METRICS = ["AV", "AC", "PR", "UI", "S", "C", "I", "A"]
 CVSS_VECTOR_RE = re.compile(
     r"CVSS:3\.[01]/AV:[NALP]/AC:[LH]/PR:[NLH]/UI:[NR]/S:[UC]/C:[NLH]/I:[NLH]/A:[NLH]"
 )
-CVSS_LOOSE_RE = re.compile(r"CVSS:3\.[01]/[A-Za-z:/]+")
+
+# Valid letters per CVSS base metric.
+CVSS_METRIC_VALUE_CHARS = {
+    "AV": "NALP",
+    "AC": "LH",
+    "PR": "NLH",
+    "UI": "NR",
+    "S": "UC",
+    "C": "NLH",
+    "I": "NLH",
+    "A": "NLH",
+}
+
+# Per-metric "KEY:\s*VALUE" regex, mirroring CLAUDETTE_VECTOR_RE's tolerance for
+# whitespace after the colon, but restricted to that metric's own valid letters
+# so a garbled or out-of-range value is never accepted -- it becomes None
+# instead, same as a metric missing from the text entirely (\b before the key
+# keeps e.g. "\bA:" from matching inside "AV:"/"AC:", since there is no word
+# boundary between "A" and the following "V"/"C").
+CVSS_METRIC_RE = {
+    m: re.compile(rf"\b{m}:\s*([{chars}])") for m, chars in CVSS_METRIC_VALUE_CHARS.items()
+}
 
 # Fixed across all three arms (plain, icl, fine_tuned) -- see module docstring.
 CTI_VSP_SYSTEM_PROMPT = (
@@ -95,25 +116,20 @@ def extract_cvss_vector_from_text(text: str) -> str | None:
 
 
 def extract_cvss_metrics_from_text(text: str) -> dict:
-    """Parse a "CVSS:3.1/AV:N/AC:L/..." vector string into a per-metric dict.
+    """Extract each CVSS base metric's value independently via CVSS_METRIC_RE.
 
     Used both for the ground-truth vector loaded verbatim from the TSV / the
     few-shot labels, and for the model's raw free-generated output. A metric
-    absent from the (possibly partial/malformed) text is left as None -- a
-    parse failure for that slot; see evaluate_cti_vsp_predictions.
+    whose value cannot be found, or isn't one of that metric's valid letters,
+    is left as None -- a parse failure for that slot; see
+    evaluate_cti_vsp_predictions.
     """
-    metrics = {m: None for m in CVSS_METRICS}
-    vector = extract_cvss_vector_from_text(text)
-    if vector is None:
-        loose = CVSS_LOOSE_RE.search(text)
-        vector = loose.group(0) if loose else None
-    if not vector:
-        return metrics
-    for segment in vector.split("/")[1:]:
-        key, _, value = segment.partition(":")
-        key = key.strip()
-        if key in metrics and value:
-            metrics[key] = value.strip()[0]
+    if not text:
+        return {m: None for m in CVSS_METRICS}
+    metrics = {}
+    for m in CVSS_METRICS:
+        match = CVSS_METRIC_RE[m].search(text)
+        metrics[m] = match.group(1) if match else None
     return metrics
 
 
