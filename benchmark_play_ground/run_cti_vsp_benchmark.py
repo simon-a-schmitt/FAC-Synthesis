@@ -59,7 +59,6 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
 from benchmark_play_ground.data_loader import load_cti_vsp_tsv, load_cti_vsp_metric_classes
-from benchmark_play_ground.prompt_builder import extract_cve_description_block
 from benchmark_play_ground.model_wrapper import LocalModel
 
 
@@ -98,17 +97,17 @@ CVSS_METRIC_RE = {
 # description and hardcoding this instead doesn't shift tokenization relative
 # to what the fine-tuned arm was trained against.
 CTI_VSP_SYSTEM_PROMPT = (
-    "Analyze the following CVE description and output the CVSS v3.1 Base vector string. "
-    "Do not explain your reasoning. Output only the vector string and nothing else.  "
-    "Valid options for each metric: "
-    "- Attack Vector (AV): N, A, L, P "
-    "- Attack Complexity (AC): L, H "
-    "- Privileges Required (PR): N, L, H "
-    "- User Interaction (UI): N, R "
-    "- Scope (S): U, C "
-    "- Confidentiality (C): N, L, H "
-    "- Integrity (I): N, L, H "
-    "- Availability (A): N, L, H  "
+    "Analyze the CVE description and output the CVSS v3.1 Base vector string. "
+    "Do not explain your reasoning. Output only the vector string and nothing else.\n"
+    "Valid options for each metric:\n"
+    "- Attack Vector (AV): N, A, L, P\n"
+    "- Attack Complexity (AC): L, H\n"
+    "- Privileges Required (PR): N, L, H\n"
+    "- User Interaction (UI): N, R\n"
+    "- Scope (S): U, C\n"
+    "- Confidentiality (C): N, L, H\n"
+    "- Integrity (I): N, L, H\n"
+    "- Availability (A): N, L, H\n"
     "Output format (exactly this, no other text): "
     "CVSS:3.1/AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_"
 )
@@ -364,22 +363,20 @@ def parse_args():
 def build_chat_messages(args, query_prompt: str, few_shots: list[dict]) -> list[dict]:
     """Same system prompt and user-turn template for all three arms.
 
-    --data-tsv's `prompt` column now holds nothing but the raw CVE description
-    (no baked-in instruction preamble), so the "CVE Description: " prefix is
-    hardcoded here rather than extracted from the TSV text; every arm queries
-    the model with exactly CTI_VSP_SYSTEM_PROMPT as the system turn and
-    "CVE Description: <description>" as the (final) user turn. icl
-    additionally injects few-shot turns in between; --few-shot-tsv may still
-    carry the old baked-in-preamble format, so extract_cve_description_block()
-    is kept there to strip it back down to the same "CVE Description: ..."
-    block.
+    Both --data-tsv's `prompt` column and --few-shot-tsv's `prompt` column now
+    hold nothing but the raw CVE description (no baked-in instruction preamble,
+    no "CVE Description: " marker), so that prefix is hardcoded here for the
+    query and for every few-shot example alike; every arm queries the model
+    with exactly CTI_VSP_SYSTEM_PROMPT as the system turn and
+    "CVE Description: <description>" as the (final) user turn. icl additionally
+    injects few-shot turns, built the same way, in between.
     """
     user_content = "CVE Description: " + query_prompt.strip()
     messages = [{"role": "system", "content": CTI_VSP_SYSTEM_PROMPT}]
     if args.mode == "icl":
         k = min(args.icl_k, len(few_shots))
         for ex in few_shots[:k]:
-            ex_description = extract_cve_description_block(ex.get("prompt", ""))
+            ex_description = "CVE Description: " + ex.get("prompt", "").strip()
             ex_vector = ex.get("label", ex.get("gt", ""))
             messages.append({"role": "user", "content": ex_description})
             messages.append({"role": "assistant", "content": ex_vector})
