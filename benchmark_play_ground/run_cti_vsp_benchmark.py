@@ -8,10 +8,11 @@ a "parse failure" for that (example, metric) slot: it is excluded from that
 slot's accuracy/precision/recall/F1 -- NOT counted as wrong -- and the number of
 such failures is reported both overall and per metric.
 
-All three arms (plain, icl, fine_tuned) use the same fixed system prompt and the
-same user-turn template ("CVE Description: " + query, extracted from whatever
-instruction preamble the TSV's `prompt` column happens to have baked in); icl
-additionally injects few-shot turns between the system prompt and the query.
+All three arms (plain, icl, fine_tuned) use the same fixed, hardcoded system
+prompt (CTI_VSP_SYSTEM_PROMPT) and the same user-turn template
+("CVE Description: " + query, where query is --data-tsv's `prompt` column
+taken as-is -- just the raw CVE description, no preamble); icl additionally
+injects few-shot turns between the system prompt and the query.
 
 Stored/reported CVSS vector strings (predicted_vector, gt) use the old compact
 format, e.g. "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N" -- no space after
@@ -91,18 +92,23 @@ CVSS_METRIC_RE = {
 }
 
 # Fixed across all three arms (plain, icl, fine_tuned) -- see module docstring.
+# Byte-identical to the instruction preamble that used to be baked into
+# --data-tsv's `prompt` column (see benchmarks/cti_vsp/cti_vsp_benchmark_test_500.tsv),
+# including its double spaces, so switching that column over to a bare CVE
+# description and hardcoding this instead doesn't shift tokenization relative
+# to what the fine-tuned arm was trained against.
 CTI_VSP_SYSTEM_PROMPT = (
     "Analyze the following CVE description and output the CVSS v3.1 Base vector string. "
-    "Do not explain your reasoning. Output only the vector string and nothing else.\n"
-    "Valid options for each metric:\n"
-    "- Attack Vector (AV): N, A, L, P\n"
-    "- Attack Complexity (AC): L, H\n"
-    "- Privileges Required (PR): N, L, H\n"
-    "- User Interaction (UI): N, R\n"
-    "- Scope (S): U, C\n"
-    "- Confidentiality (C): N, L, H\n"
-    "- Integrity (I): N, L, H\n"
-    "- Availability (A): N, L, H\n"
+    "Do not explain your reasoning. Output only the vector string and nothing else.  "
+    "Valid options for each metric: "
+    "- Attack Vector (AV): N, A, L, P "
+    "- Attack Complexity (AC): L, H "
+    "- Privileges Required (PR): N, L, H "
+    "- User Interaction (UI): N, R "
+    "- Scope (S): U, C "
+    "- Confidentiality (C): N, L, H "
+    "- Integrity (I): N, L, H "
+    "- Availability (A): N, L, H  "
     "Output format (exactly this, no other text): "
     "CVSS:3.1/AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_"
 )
@@ -358,13 +364,17 @@ def parse_args():
 def build_chat_messages(args, query_prompt: str, few_shots: list[dict]) -> list[dict]:
     """Same system prompt and user-turn template for all three arms.
 
-    The TSV's `prompt` column has an instruction preamble baked in ahead of
-    the "CVE Description: ..." block; extract_cve_description_block() strips
-    that off so every arm queries the model with exactly CTI_VSP_SYSTEM_PROMPT
-    as the system turn and "CVE Description: ..." as the (final) user turn.
-    icl additionally injects few-shot turns, built the same way, in between.
+    --data-tsv's `prompt` column now holds nothing but the raw CVE description
+    (no baked-in instruction preamble), so the "CVE Description: " prefix is
+    hardcoded here rather than extracted from the TSV text; every arm queries
+    the model with exactly CTI_VSP_SYSTEM_PROMPT as the system turn and
+    "CVE Description: <description>" as the (final) user turn. icl
+    additionally injects few-shot turns in between; --few-shot-tsv may still
+    carry the old baked-in-preamble format, so extract_cve_description_block()
+    is kept there to strip it back down to the same "CVE Description: ..."
+    block.
     """
-    user_content = extract_cve_description_block(query_prompt)
+    user_content = "CVE Description: " + query_prompt.strip()
     messages = [{"role": "system", "content": CTI_VSP_SYSTEM_PROMPT}]
     if args.mode == "icl":
         k = min(args.icl_k, len(few_shots))
