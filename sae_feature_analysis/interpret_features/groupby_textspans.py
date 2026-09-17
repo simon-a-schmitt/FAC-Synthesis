@@ -118,10 +118,8 @@ class Reader:
             self.df.sort_values("NeuronID", inplace=True)
         except Exception as e:
             raise RuntimeError(f"Fehler beim Laden von {fpath}: {e}")
-        self.tokenizer = trf.AutoTokenizer.from_pretrained(
-                           "mistralai/Mistral-7B-Instruct-v0.2", # optional
-                           use_fast=False, padding_side="right", 
-                           cache_dir=CACHE_DIR)
+            
+        self.tokenizer = trf.AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", cache_dir=CACHE_DIR)
     
     def select(self, idx, topK=5, key="Span"):
         i = self.df.NeuronID.searchsorted(idx, side="left")
