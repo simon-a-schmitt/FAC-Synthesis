@@ -198,11 +198,14 @@ def activations(messages, model, sae, tokenizer, size=32):
         device=ids.device,
     )
 
+    sae.actvs = None
     try:
         with tc.no_grad():
             model.get_activates(ids)
     except RuntimeError:
         pass
+    if sae.actvs is None or sae.actvs.squeeze().shape[0] != len(token_ids):
+        raise RuntimeError(f"actvs/token length mismatch")
 
     device = model._device
     IDX_dev = IDX.to(device)
@@ -421,26 +424,12 @@ def collect_text_spans(corpus, sae, generator, tokenizer, model_name, subgroup, 
         last_idx = idx
 
         text = text.replace("\\n", "\n").replace("\\t", "\t")
-        if "Human:" in text or "Assistant:" in text:
-            messages = []
-            current_role = None
-            for line in text.split("\n"):
-                if line.startswith("Human:"):
-                    current_role = "user"
-                    content = line[len("Human:"):].strip()
-                    messages.append({"role": current_role, "content": content})
-                elif line.startswith("Assistant:"):
-                    current_role = "assistant"
-                    content = line[len("Assistant:"):].strip()
-                    messages.append({"role": current_role, "content": content})
-                elif current_role is not None and line.strip():
-                    messages[-1]["content"] += " " + line.strip()
-        else:
-            messages = [{"role": "user", "content": text}]
+        
+        messages = [{"role": "user", "content": text}]
         
         results = None
-        if not messages or len(messages) == 0:
-            print(f"[WARN] Empty message skipped at sample {idx}")
+        if not text.strip():
+            print(f"[WARN] Empty document skipped at sample {idx}")
             run_documents_skipped += 1
         else:
             try:
@@ -470,7 +459,7 @@ def collect_text_spans(corpus, sae, generator, tokenizer, model_name, subgroup, 
             break
 
     write_snapshot(out_path)
-    completed = (not stopped_by_budget) and (last_idx >= total_rows - 1)
+    completed = (not stopped_by_budget) and (processed_assigned >= assigned_total)
     write_progress(last_idx, processed_assigned, completed=completed)
     write_metrics(processed_assigned, time.time() - run_start_time, completed=completed)
     if stopped_by_budget:
