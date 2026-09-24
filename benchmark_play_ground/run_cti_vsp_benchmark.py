@@ -3,10 +3,12 @@
 
 The model free-generates a CVSS v3.1 Base vector string for a CVE description;
 the 8 base metrics (AV, AC, PR, UI, S, C, I, A) are then parsed out of that raw
-text post-hoc. A metric that cannot be parsed out of a given example's output is
-a "parse failure" for that (example, metric) slot: it is excluded from that
-slot's accuracy/precision/recall/F1 -- NOT counted as wrong -- and the number of
-such failures is reported both overall and per metric.
+text post-hoc. An example whose predicted vector has ANY unparsable slot (one
+of the 8 metrics could not be recovered from the raw output) is excluded
+entirely from evaluation -- not just that one slot, but exact_match,
+slot_accuracy, macro_f1, micro_f1 and mad all skip that example. The exclusion
+count is reported as n_excluded_unparseable (overall and, as a diagnostic of
+which metric tends to cause it, per metric).
 
 All three arms (plain, icl, fine_tuned) use the same fixed, hardcoded system
 prompt (CTI_VSP_SYSTEM_PROMPT) and the same user-turn template
@@ -20,27 +22,27 @@ each ":".
 
 Metrics
 -------
-  * exact_match_accuracy : fraction of examples where all 8 metrics were parsed
-                            AND matched the ground truth,
-  * slot_accuracy         : fraction of *parsed* (example, metric) pairs that
-                            matched -- parse failures excluded from num/denom,
+All computed only over examples whose predicted vector fully parsed (all 8
+metrics recovered from the raw output) -- see n_excluded_unparseable; an
+example with even one unparsable slot is dropped from every metric below, not
+just that slot:
+  * exact_match_accuracy : fraction of evaluated examples whose full 8-metric
+                            vector matched the ground truth,
+  * slot_accuracy         : fraction of (evaluated example, metric) pairs that
+                            matched,
   * macro_f1              : mean of the 8 per-metric macro-F1 scores (each
                              per-metric macro-F1 itself an unweighted mean of
-                             that metric's own per-class F1s, computed only
-                             over that metric's parsed slots),
+                             that metric's own per-class F1s),
   * micro_f1              : TP/FP/FN pooled over every (metric, class) pair,
-                             parsed slots only,
   * mad                   : mean absolute difference between the predicted and
-                             gold CVSS v3.1 base score (only over examples whose
-                             full 8-metric vector parsed).
+                             gold CVSS v3.1 base score.
 Every one of these also gets a trivial-baseline counterpart: a constant
 predictor that always outputs, for each slot, that slot's majority ground-truth
-class -- computed dynamically from the records in --data-tsv (the same
-evaluation set the real predictions are scored against), and evaluated over the
-FULL dataset (it never has parse failures), so it stays a stable reference
-figure independent of how well a given run happened to parse. Per-slot support /
-precision / recall / F1 (and their trivial-baseline counterparts) are reported
-under "per_metric".
+class -- majority classes computed dynamically from the FULL --data-tsv (a
+stable reference independent of this run's parse rate), but scored over that
+same evaluated-examples subset as the real predictions, so the two arms stay
+directly comparable. Per-slot support / precision / recall / F1 (and their
+trivial-baseline counterparts) are reported under "per_metric".
 """
 from __future__ import annotations
 
@@ -58,7 +60,7 @@ from cvss.exceptions import CVSSError
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
-from benchmark_play_ground.data_loader import load_cti_vsp_tsv, load_cti_vsp_metric_classes
+from benchmark_play_ground.data_loader import load_cti_vsp_tsv
 from benchmark_play_ground.model_wrapper import LocalModel
 
 
@@ -168,7 +170,10 @@ def compute_majority_classes(records: list[dict]) -> tuple[dict[str, str], dict[
     """Per-metric majority ground-truth class over this run's --data-tsv records.
 
     Used as the trivial per-slot baseline predictor, evaluated over the same
-    evaluation set the real predictions are scored against.
+    evaluation set the real predictions are scored against. The returned
+    per-class counts are also reused by main() to derive metric_classes (the
+    per-metric class set for macro-F1 label scoping) at runtime, instead of
+    loading it from a separate ground-truth-distribution file.
     """
     counts: dict[str, dict[str, int]] = {m: {} for m in CVSS_METRICS}
     for r in records:
@@ -194,10 +199,28 @@ def _micro_f1_from_counts(tp: int, fp: int, fn: int) -> float:
 def evaluate_cti_vsp_predictions(
     results: list[dict], metric_classes: dict, majority_classes: dict
 ) -> dict:
-    total = len(results)
-    exact_match = sum(1 for r in results if r["correct"])
+    n_generated = len(results)
+
+    # An example with even one unparsable predicted slot is dropped from EVERY
+    # metric below (not just that slot) -- see module docstring.
+    evaluated = [
+        r for r in results
+        if all(r["predicted_metrics"].get(m) is not None for m in CVSS_METRICS)
+    ]
+    total = len(evaluated)
+    n_excluded_unparseable = n_generated - total
+
+    # Diagnostic only (does not affect any metric below): of ALL generated
+    # examples, how many were missing each metric -- helps spot which metric
+    # tends to cause the exclusion. A single excluded example can count
+    # towards more than one metric here if it was missing several.
+    n_missing_by_metric = {
+        m: sum(1 for r in results if r["predicted_metrics"].get(m) is None) for m in CVSS_METRICS
+    }
+
+    exact_match = sum(1 for r in evaluated if r["correct"])
     exact_match_trivial = sum(
-        1 for r in results
+        1 for r in evaluated
         if all(r["gt_metrics"].get(m) == majority_classes[m] for m in CVSS_METRICS)
     )
 
@@ -205,22 +228,14 @@ def evaluate_cti_vsp_predictions(
     micro_tp = micro_fp = micro_fn = 0
     micro_tp_trivial = micro_fp_trivial = micro_fn_trivial = 0
     slot_correct = 0
-    slot_total = 0  # parsed-only denominator -- parse failures are excluded, not penalized
+    slot_total = total * len(CVSS_METRICS)
     slot_correct_trivial = 0
-    slot_total_trivial = total * len(CVSS_METRICS)
-    n_parse_failures_total = 0
-    n_parse_failures_by_metric = {}
+    slot_total_trivial = slot_total
 
     for metric in CVSS_METRICS:
-        parsed = [r for r in results if r["predicted_metrics"].get(metric) is not None]
-        n_parsed = len(parsed)
-        n_failed = total - n_parsed
-        n_parse_failures_by_metric[metric] = n_failed
-        n_parse_failures_total += n_failed
-
-        slot_total += n_parsed
-        slot_correct += sum(1 for r in parsed if r["predicted_metrics"][metric] == r["gt_metrics"].get(metric))
-        slot_correct_trivial += sum(1 for r in results if majority_classes[metric] == r["gt_metrics"].get(metric))
+        # Every evaluated example has this metric parsed by construction.
+        slot_correct += sum(1 for r in evaluated if r["predicted_metrics"][metric] == r["gt_metrics"].get(metric))
+        slot_correct_trivial += sum(1 for r in evaluated if majority_classes[metric] == r["gt_metrics"].get(metric))
 
         classes = metric_classes.get(metric, [])
         maj = majority_classes[metric]
@@ -231,21 +246,20 @@ def evaluate_cti_vsp_predictions(
         n_supported_trivial = 0
 
         for cls in classes:
-            # Actual model: computed only over this metric's successfully
-            # parsed slots (parse failures excluded, per the benchmark spec).
-            tp = sum(1 for r in parsed if r["predicted_metrics"][metric] == cls and r["gt_metrics"].get(metric) == cls)
-            fp = sum(1 for r in parsed if r["predicted_metrics"][metric] == cls and r["gt_metrics"].get(metric) != cls)
-            fn = sum(1 for r in parsed if r["predicted_metrics"][metric] != cls and r["gt_metrics"].get(metric) == cls)
-            support = sum(1 for r in parsed if r["gt_metrics"].get(metric) == cls)
+            tp = sum(1 for r in evaluated if r["predicted_metrics"][metric] == cls and r["gt_metrics"].get(metric) == cls)
+            fp = sum(1 for r in evaluated if r["predicted_metrics"][metric] == cls and r["gt_metrics"].get(metric) != cls)
+            fn = sum(1 for r in evaluated if r["predicted_metrics"][metric] != cls and r["gt_metrics"].get(metric) == cls)
+            support = sum(1 for r in evaluated if r["gt_metrics"].get(metric) == cls)
             precision = tp / (tp + fp) if (tp + fp) else 0.0
             recall = tp / (tp + fn) if (tp + fn) else 0.0
             f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
 
             # Trivial baseline: a constant predictor that always outputs this
-            # metric's majority class `maj`, over the FULL dataset (it has no
-            # parse failures by construction, so it stays a stable reference
-            # figure independent of this run's parse rate).
-            support_trivial = sum(1 for r in results if r["gt_metrics"].get(metric) == cls)
+            # metric's majority class `maj`, scored over the SAME evaluated
+            # subset as the real predictions (support_trivial == support,
+            # since both are gt-only counts over that same subset) so the two
+            # arms stay directly comparable.
+            support_trivial = support
             if cls == maj:
                 t_tp, t_fp, t_fn = support_trivial, total - support_trivial, 0
             else:
@@ -277,8 +291,7 @@ def evaluate_cti_vsp_predictions(
 
         per_metric[metric] = {
             "majority_class": maj,
-            "n_parsed": n_parsed,
-            "n_parse_failures": n_failed,
+            "n_missing": n_missing_by_metric[metric],
             "macro_f1": macro_f1_sum / n_supported if n_supported else 0.0,
             "macro_f1_trivial": macro_f1_trivial_sum / n_supported_trivial if n_supported_trivial else 0.0,
             "classes": class_stats,
@@ -291,7 +304,7 @@ def evaluate_cti_vsp_predictions(
 
     score_diffs = [
         abs(r["predicted_score"] - r["gt_score"])
-        for r in results
+        for r in evaluated
         if r["predicted_score"] is not None and r["gt_score"] is not None
     ]
     n_scored = len(score_diffs)
@@ -301,13 +314,16 @@ def evaluate_cti_vsp_predictions(
     majority_vector_score = cvss3_base_score(majority_classes)
     if majority_vector_score is not None:
         trivial_score_diffs = [
-            abs(majority_vector_score - r["gt_score"]) for r in results if r["gt_score"] is not None
+            abs(majority_vector_score - r["gt_score"]) for r in evaluated if r["gt_score"] is not None
         ]
     else:
         trivial_score_diffs = []
     mad_trivial = sum(trivial_score_diffs) / len(trivial_score_diffs) if trivial_score_diffs else None
 
     return {
+        "n_generated": n_generated,
+        "n_excluded_unparseable": n_excluded_unparseable,
+        "n_missing_by_metric": n_missing_by_metric,
         "total": total,
         "exact_match": exact_match,
         "exact_match_accuracy": exact_match / total if total else 0.0,
@@ -326,9 +342,6 @@ def evaluate_cti_vsp_predictions(
         "mad_trivial": mad_trivial,
         "mad_n_scored": n_scored,
         "mad_n_unscored": total - n_scored,
-        "n_parse_failures_total": n_parse_failures_total,
-        "n_parse_failures_by_metric": n_parse_failures_by_metric,
-        "n_examples_unparseable_vector": total - n_scored,
         "majority_classes": majority_classes,
         "majority_vector": majority_vector,
         "majority_vector_score": majority_vector_score,
@@ -340,14 +353,9 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model-path", required=True, help="Local model directory for Llama-3.1-8b-Instruct")
     p.add_argument("--data-tsv", required=True, help="CTI-VSP TSV file (cti_vsp_benchmark_test_500.tsv)")
-    p.add_argument(
-        "--metric-distribution-json",
-        default=str(ROOT_DIR / "benchmarks" / "cti_vsp" / "cti_vsp_gt_metric_distribution.json"),
-        help="JSON file listing the ground-truth classes per CVSS metric (for macro-F1 label scoping)",
-    )
     p.add_argument("--few-shot-tsv", default=None, help="Optional TSV with few-shot examples")
     p.add_argument("--mode", choices=("plain", "icl", "fine_tuned"), default="plain")
-    p.add_argument("--icl-k", type=int, default=3, help="Number of few-shot examples to include")
+    p.add_argument("--icl-k", type=int, default=5, help="Number of few-shot examples to include")
     p.add_argument("--lora-path", default=None, help="Path to LoRA adapter weights (required for --mode fine_tuned); merged onto the base model from --model-path")
     p.add_argument("--device", default="cuda", help="Device to run model on (cuda or cpu)")
     p.add_argument("--dtype", default="bfloat16", help="Dtype for model init (bfloat16 or float16)")
@@ -448,11 +456,16 @@ def main():
     if not records:
         raise SystemExit(f"No records loaded from --data-tsv {args.data_tsv!r}")
 
-    metric_classes = load_cti_vsp_metric_classes(args.metric_distribution_json)
     # Majority class per metric, computed dynamically over exactly the records
     # being evaluated (see compute_majority_classes) -- the trivial baseline.
     majority_classes, majority_counts = compute_majority_classes(records)
     print("Majority classes (trivial baseline, dynamic from --data-tsv):", majority_classes)
+
+    # Per-metric class set for macro-F1 label scoping, derived from the very
+    # same ground-truth counts (no separate --metric-distribution-json needed):
+    # only classes actually observed in this run's --data-tsv are scored, so
+    # macro-F1 isn't diluted by a theoretically-valid letter that never occurs.
+    metric_classes = {m: sorted(counts.keys()) for m, counts in majority_counts.items()}
 
     # Fail fast, once, at startup: the ground-truth vector format the rest of
     # this script assumes must parse into a full 8-metric vector.
@@ -600,14 +613,18 @@ def main():
 
     summary = evaluate_cti_vsp_predictions(results, metric_classes, majority_classes)
     print("Summary:")
-    print(f"  total: {summary['total']}")
+    print(
+        f"  n_generated: {summary['n_generated']}  "
+        f"excluded (>=1 unparsable slot): {summary['n_excluded_unparseable']}  "
+        f"evaluated: {summary['total']}"
+    )
     print(
         f"  exact_match_accuracy: {summary['exact_match_accuracy']:.4f}  "
         f"(trivial majority baseline: {summary['exact_match_accuracy_trivial']:.4f})"
     )
     print(
         f"  slot_accuracy: {summary['slot_accuracy']:.4f} "
-        f"({summary['slot_correct']}/{summary['slot_total']}, parsed slots only)  "
+        f"({summary['slot_correct']}/{summary['slot_total']}, evaluated examples only)  "
         f"(trivial majority baseline: {summary['slot_accuracy_trivial']:.4f})"
     )
     print(
@@ -626,17 +643,13 @@ def main():
         )
     else:
         print(f"  mad: n/a (no scoreable predictions; n_unscored={summary['mad_n_unscored']})")
-    print(
-        f"  parse failures: {summary['n_parse_failures_total']} slots "
-        f"({summary['n_examples_unparseable_vector']}/{summary['total']} examples with >=1 missing metric)"
-    )
-    print(f"  parse failures by metric: {summary['n_parse_failures_by_metric']}")
+    print(f"  n_missing_by_metric (diagnostic, over all {summary['n_generated']} generated examples): {summary['n_missing_by_metric']}")
     print(f"  majority vector (trivial baseline): {summary['majority_vector']}")
     print("  per_metric:")
     for metric in CVSS_METRICS:
         m = summary["per_metric"][metric]
         print(
-            f"    {metric} (majority={m['majority_class']}, parsed={m['n_parsed']}/{summary['total']}): "
+            f"    {metric} (majority={m['majority_class']}, n_missing={m['n_missing']}/{summary['n_generated']}): "
             f"macro_f1={m['macro_f1']:.4f}  (trivial: {m['macro_f1_trivial']:.4f})"
         )
         for cls, stats in m["classes"].items():

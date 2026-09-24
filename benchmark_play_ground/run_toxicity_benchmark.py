@@ -314,6 +314,13 @@ def evaluate_toxicity_predictions(results: list[dict]) -> dict:
     "toxic" positive, per-class precision/recall/F1 for both classes, micro/macro
     F1, and always-"safe"/always-"toxic" baselines for those. Plus calibration
     diagnostics (predicted positive rate, tie rate, mean p(toxic) by gold label).
+
+    The model's own answer is forced through slot_scoring and is therefore always
+    one of {"toxic", "safe"} -- it can never fail to parse. The one thing that CAN
+    fail to parse is the ground-truth label (extract_toxicity_label_from_text() on
+    a malformed TSV row can return None, see map_toxicity_label()). Those examples
+    are excluded from every metric below and counted in "n_unparsable_gt" /
+    "n_scored" instead of silently being scored as "safe".
     """
     from sklearn.metrics import average_precision_score
 
@@ -324,13 +331,23 @@ def evaluate_toxicity_predictions(results: list[dict]) -> dict:
         "positive_class": TOXICITY_POSITIVE_CLASS,
     }
     if total == 0:
+        out["n_unparsable_gt"] = 0
+        out["n_scored"] = 0
         return out
 
-    y_true = [r["gt_label"] for r in results]
-    y_pred = [r["predicted"] for r in results]
-    y_score = [r["p_toxic"] for r in results]
+    scored = [r for r in results if r["gt_label"] in (TOXICITY_POSITIVE_CLASS, TOXICITY_NEGATIVE_CLASS)]
+    n_unparsable = total - len(scored)
+    out["n_unparsable_gt"] = n_unparsable
+    out["n_scored"] = len(scored)
+    if not scored:
+        return out
+
+    y_true = [r["gt_label"] for r in scored]
+    y_pred = [r["predicted"] for r in scored]
+    y_score = [r["log_odds"] for r in scored]   # statt r["p_toxic"]
     y_true_bin = [1 if t == TOXICITY_POSITIVE_CLASS else 0 for t in y_true]
 
+    total = len(scored)  # every metric below is over the scored subset only
     n_pos = sum(y_true_bin)
     n_neg = total - n_pos
     prevalence_pos = n_pos / total
@@ -379,8 +396,8 @@ def evaluate_toxicity_predictions(results: list[dict]) -> dict:
         }
 
     # ---- calibration / sanity diagnostics ----
-    n_ties = sum(1 for r in results if r["tie"])
-    n_thr_vs_argmax = sum(1 for r in results if r["predicted"] != r["slot_value"])
+    n_ties = sum(1 for r in scored if r["tie"])
+    n_thr_vs_argmax = sum(1 for r in scored if r["predicted"] != r["slot_value"])
     pos_scores = [s for s, t in zip(y_score, y_true_bin) if t == 1]
     neg_scores = [s for s, t in zip(y_score, y_true_bin) if t == 0]
     out["predicted_positive_rate"] = sum(1 for p in y_pred if p == TOXICITY_POSITIVE_CLASS) / total
@@ -439,7 +456,11 @@ def render_chat_text(tokenizer, chat_messages: list[dict]) -> str:
 def _print_summary(summary: dict) -> None:
     print("Summary:")
     print(f"  total: {summary['total']}")
-    if summary["total"] == 0:
+    print(
+        f"  n_unparsable_gt: {summary['n_unparsable_gt']}  "
+        f"(excluded from all metrics below; n_scored={summary['n_scored']})"
+    )
+    if summary["n_scored"] == 0:
         return
     print(
         f"  positive ('toxic') prevalence: {summary['positive_prevalence']:.4f}  "
@@ -642,7 +663,9 @@ def main():
                 "tie": pred["tie"],
                 "gt": gt,
                 "gt_label": gt_label,
-                "correct": pred["predicted"] == gt_label,
+                # None (not False) when gt_label failed to parse -- see
+                # evaluate_toxicity_predictions()'s n_unparsable_gt handling.
+                "correct": (pred["predicted"] == gt_label) if gt_label is not None else None,
             }
             fh.write(json.dumps(result, ensure_ascii=False) + "\n")
             fh.flush()

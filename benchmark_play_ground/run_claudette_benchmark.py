@@ -312,7 +312,10 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
     every one of the 8 slots has the same number of instances (n, one per example),
     the macro average of the 8 per-slot prevalences equals the single prevalence
     pooled over all 8*n slot instances -- so both the micro and macro trivial-AUPRC
-    baselines reduce to that one pooled positive prevalence.
+    baselines reduce to that one pooled positive prevalence. The weighted-AUPRC
+    baseline instead averages the 8 per-slot prevalences weighted by each slot's own
+    positive count, so it generally differs from the micro/macro baseline whenever the
+    slots' positive counts differ.
 
     "parse_failures" is always 0: every slot's Y/N answer token is forced by
     construction (see slot_scoring.score_slots), so there is no longer a code path
@@ -342,15 +345,35 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
         y_true, y_score = _slot_probability_matrix(results)
         micro_auprc = average_precision_score(y_true, y_score, average="micro")
         macro_auprc = average_precision_score(y_true, y_score, average="macro")
+        weighted_auprc = average_precision_score(y_true, y_score, average="weighted")
         per_slot_auprc_values = average_precision_score(y_true, y_score, average=None)
     else:
         micro_auprc = 0.0
         macro_auprc = 0.0
+        weighted_auprc = 0.0
         per_slot_auprc_values = [0.0] * len(CLAUDETTE_METRICS)
     per_slot_auprc = {m: float(v) for m, v in zip(CLAUDETTE_METRICS, per_slot_auprc_values)}
 
     n_positive_slot_instances = sum(1 for t in true_labels if t != CLAUDETTE_NEG_CLASS)
     auprc_trivial_all_N = n_positive_slot_instances / len(true_labels) if true_labels else 0.0
+
+    # weighted trivial baseline: weighted mean of each slot's own prevalence (that
+    # slot's trivial AUPRC), weighted by the slot's positive count -- the same
+    # weighting sklearn's average="weighted" applies to the real AUPRC values above.
+    # Unlike the micro/macro trivial baselines, this generally differs from the pooled
+    # prevalence whenever the 8 slots don't all have the same positive count.
+    if results:
+        per_slot_positive_counts = [sum(row[k] for row in y_true) for k in range(len(CLAUDETTE_METRICS))]
+        n_examples = len(y_true)
+        total_positive_count = sum(per_slot_positive_counts)
+        if total_positive_count:
+            weighted_auprc_trivial_all_N = sum(
+                c * (c / n_examples) for c in per_slot_positive_counts
+            ) / total_positive_count
+        else:
+            weighted_auprc_trivial_all_N = 0.0
+    else:
+        weighted_auprc_trivial_all_N = 0.0
 
     y_true_matrix, y_pred_matrix = _slot_label_matrices(results)
     if results:
@@ -405,8 +428,10 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
         "macro_f1_8plus1_trivial_all_N": float(macro_f1_8plus1_trivial_all_N),
         "micro_auprc_8": float(micro_auprc),
         "macro_auprc_8": float(macro_auprc),
+        "weighted_auprc_8": float(weighted_auprc),
         "micro_auprc_8_trivial_all_N": auprc_trivial_all_N,
         "macro_auprc_8_trivial_all_N": auprc_trivial_all_N,
+        "weighted_auprc_8_trivial_all_N": float(weighted_auprc_trivial_all_N),
         "positive_rate_by_slot": positive_rate_by_slot,
         "tie_rate_by_slot": tie_rate_by_slot,
         "tie_rate_overall": _tie_rate_overall(results),
@@ -781,6 +806,10 @@ def main():
     print(
         f"    macro_auprc: {summary['macro_auprc_8']:.4f}  "
         f"(trivial all-N baseline: {summary['macro_auprc_8_trivial_all_N']:.4f})"
+    )
+    print(
+        f"    weighted_auprc: {summary['weighted_auprc_8']:.4f}  "
+        f"(trivial all-N baseline: {summary['weighted_auprc_8_trivial_all_N']:.4f})"
     )
     print()
     print("  8+1-class scenario (adds negative class 'N'), LexGLUE-style (per-example, 9 labels):")
