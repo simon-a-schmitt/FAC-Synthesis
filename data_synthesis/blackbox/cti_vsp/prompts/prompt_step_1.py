@@ -1,45 +1,47 @@
 SYSTEM_PROMPT = """
-You write CVE-style vulnerability descriptions in the authentic register of
-public vulnerability records. You produce input contexts for a training
-corpus — description text only, never scores, severity ratings, or
-commentary.
+You write vulnerability descriptions as they are published in public CVE
+records. You produce input contexts for a training corpus. Description text
+only, never scores, severity ratings, or commentary.
 
 REGISTER
-Terse, factual, no marketing language, no hedging, no meta-commentary.
-Length 20-60 words.
+Terse and factual, as published in vulnerability records. No marketing
+language, no hedging, no meta-commentary. Version qualifiers are concrete and
+phrased as records phrase them, for example "through 6.7.1", "prior to 4.2.3"
+or "in versions 1.0.0 through 1.4.2", never as placeholders. Always write in
+English.
 
-Descriptions in this corpus vary in granularity — some name a source file
-and function, others only a component, endpoint, or parameter. Vary this
-across the corpus rather than repeating one level.
+LENGTH
+Typically one or two sentences of a few dozen words. Shorter descriptions and
+longer ones, where the mechanism takes more words to state, also occur.
+Length follows from the defect being described, not from a target.
 
-Version qualifiers must be concrete and phrased as records phrase them
-("through 6.7.1", "prior to 4.2.3", "in versions 1.0.0 through 1.4.2").
-Never "2.x", "before 2.y", or bracketed slots. Do not invent CVE
-identifiers, database IDs, or advisory references.
+CONTENT
+Descriptions name specific software. This ranges from major vendors and
+mainline projects to small vendors, CMS plugins, device firmware, niche
+libraries and industrial controllers.
+
+Descriptions differ in granularity. Some name a source file and function,
+others only a component, endpoint or parameter.
+
+The vulnerability class is one that can occur in the named component, and it
+is an actual security defect, not a configuration choice.
+
+CONDITIONS AND IMPACT
+Some descriptions state the conditions under which the defect can be
+exploited: who can reach the component, what privileges are needed, whether
+a user must act first, or how it is reachable over a network. Others leave
+these conditions implicit. The same holds for consequences. Some descriptions
+name what an attacker can achieve, others describe only the defect. Both
+forms are normal.
 
 RESTRAINT
-Real descriptions are terse and leave most exploitation conditions implicit.
-Describe the defect and its mechanism, then stop. Most descriptions do not
-state who can reach the component, what privileges are needed, whether a
-user must act first, or how it is reachable over a network. A minority state
-one such condition. Leaving conditions unstated is correct; do not compensate.
-
-IMPACT
-Most descriptions name no consequence at all; some name exactly one. Never
-enumerate several. No severity adjectives. Never write "confidentiality,
-integrity, and availability", "full/complete compromise", or "total loss of".
-
-PLAUSIBILITY
-One defect, one mechanism. The vulnerability class must be possible in the
-named component and must be an actual security defect, not a configuration
-choice. Prefer common classes — a plain correct description beats an
-elaborate confused one.
-
-ENTITIES
-Name specific software, weighted toward the long tail: small vendors, CMS
-plugins, device firmware, niche libraries, industrial controllers. Major
-vendors and mainline projects may appear, but should not dominate.
+One description states one defect with one mechanism. A plain, technically
+coherent description is preferable to an elaborate one. Do not add
+background, remediation advice or explanation. Do not use the vocabulary of
+vulnerability scoring, such as severity ratings or rating categories. Do not
+invent CVE identifiers, database IDs or advisory references.
 """.strip()
+
 
 
 STEP_1_PROMPT_TEMPLATE = """

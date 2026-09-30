@@ -44,6 +44,15 @@ call of a wave completes (as_completed), while the rest of the wave is still in 
 result depends only on (candidate, feature), not on the pool, so running it in completion order
 keeps runs deterministic. Dedup and pool mutation still happen strictly in slot order after the
 wave's barrier, exactly as in the blackbox branch.
+
+SAE compute tracking: every SAE forward pass (seed coverage check + activation check of each
+generated candidate) is timed (wall clock between two torch.cuda.synchronize() calls, i.e. the
+net GPU time without model loading or API waiting) and its token count (all prompt tokens run
+through Llama up to the hooked layer) is recorded. The totals live in counters["sae_seed_check"]
+/ counters["sae_candidate_check"] and are therefore checkpointed after every wave and carried over
+on --resume; the seed check runs only once per run, so a resumed run just keeps its stats. Only
+persisted work is counted: a wave interrupted before its checkpoint is lost (its API calls and SAE
+passes are redone on --resume), exactly like its API tokens.
 """
 
 from __future__ import annotations
@@ -55,6 +64,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -105,7 +115,7 @@ DEFAULT_MODEL = "deepseek"
 # hybrid/ imports this module and overwrites these globals itself.
 MODEL_ID, PROVIDER = MODEL_PRESETS[DEFAULT_MODEL]
 
-# If True, every request is pinned to PROVIDER (via provider.only/allow_fallbacks=False). If
+# If True, every request is pinned to PROVIDER (via provider.only/allow_fallbacks=True). If
 # False, PROVIDER is only used as EXPECTED_PROVIDER_NAME's default and requests are left free to
 # be routed by OpenRouter across any provider that satisfies provider.require_parameters.
 PIN_PROVIDER = False
@@ -463,16 +473,36 @@ def load_sae_context(args: argparse.Namespace, system_prompt: str) -> SaeContext
     return SaeContext(fs=fs, model=model, collector=collector, sae=sae, system_prompt=system_prompt)
 
 
+def new_sae_stats() -> dict:
+    """Running totals over a set of SAE forward passes (see the module docstring)."""
+    return {"n_forward_passes": 0, "n_forward_tokens": 0, "gpu_seconds": 0.0}
+
+
+def add_sae_pass(stats: dict, n_forward_tokens: int, seconds: float) -> None:
+    stats["n_forward_passes"] += 1
+    stats["n_forward_tokens"] += n_forward_tokens
+    stats["gpu_seconds"] = round(stats["gpu_seconds"] + seconds, 6)
+
+
+def _cuda_sync(sae_ctx: SaeContext) -> None:
+    """Waits for all queued GPU work, so perf_counter() brackets exactly one SAE pass."""
+    if sae_ctx.fs.tc.cuda.is_available():
+        sae_ctx.fs.tc.cuda.synchronize()
+
+
 def compute_target_activation(text: str, feature_id: int, sae_ctx: SaeContext) -> dict:
     """Raw SAE activation of `feature_id` on the content (user-turn) tokens of the classification
     prompt for `text`. Mirrors compute_feature_activation_for_description() in
     fac_test_pipeline/run_synthetic_feature_activation_check.py, without the CVSS wrapping and
-    without p95 normalisation."""
+    without p95 normalisation. Also returns the pass's net GPU time (sae_seconds) and the number
+    of tokens run through the model (n_forward_tokens)."""
     fs = sae_ctx.fs
     tc = fs.tc
     model, collector = sae_ctx.model, sae_ctx.collector
     tokenizer = model._tokenizer  # noqa: SLF001
 
+    _cuda_sync(sae_ctx)
+    start = time.perf_counter()
     with tc.no_grad():
         collector.cache = None
         _, token_ids, tokens = fs._encode_prompt_tokens(text, model, system=sae_ctx.system_prompt)
@@ -484,12 +514,15 @@ def compute_target_activation(text: str, feature_id: int, sae_ctx: SaeContext) -
             raise RuntimeError("Collector cache is empty. Hook may not be mounted correctly.")
 
         hidden_seq = collector.cache.to(tc.float32)[0]
+        n_forward_tokens = int(hidden_seq.shape[0])
         if hidden_seq.shape[0] != len(tokens):
             seq_len = min(hidden_seq.shape[0], len(tokens))
             hidden_seq = hidden_seq[:seq_len]
             token_ids = token_ids[:seq_len]
             tokens = tokens[:seq_len]
         sparse_features = sae_ctx.sae.encode(hidden_seq).detach().cpu()
+    _cuda_sync(sae_ctx)
+    sae_seconds = time.perf_counter() - start
 
     special_ids = fs._special_token_id_set(tokenizer)
     content_start = fs._find_user_content_start(token_ids, tokens, tokenizer)
@@ -501,6 +534,8 @@ def compute_target_activation(text: str, feature_id: int, sae_ctx: SaeContext) -
         "max_raw_activation": 0.0,
         "n_active_tokens": 0,
         "top_token": None,
+        "n_forward_tokens": n_forward_tokens,
+        "sae_seconds": round(sae_seconds, 6),
     }
     if not content_positions or not 0 <= feature_id < sparse_features.shape[1]:
         return result
@@ -519,13 +554,16 @@ def compute_target_activation(text: str, feature_id: int, sae_ctx: SaeContext) -
     return result
 
 
-def compute_seed_peak_activations(seed_file: Path, sae_ctx: SaeContext) -> dict[int, float]:
+def compute_seed_peak_activations(
+    seed_file: Path, sae_ctx: SaeContext, sae_stats: dict | None = None
+) -> dict[int, float]:
     """{feature_id: max raw SAE activation over the content tokens of all seed rows}.
 
     Reuses active_feature_identification/get_active_features/run_get_active_features.py as is
     (TSV loading, per-row task detection from the label column, task-specific prompt/opening
     phrase, content-token masking), so "covered by the seeds" means exactly what that script
-    reports as active. Must be called after load_sae_context() (offline env vars, sys.path)."""
+    reports as active. Must be called after load_sae_context() (offline env vars, sys.path).
+    If given, `sae_stats` (see new_sae_stats) is updated with every seed row's forward pass."""
     spec = importlib.util.spec_from_file_location("fg_get_active_features", GET_ACTIVE_FEATURES_SCRIPT)
     gaf = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -538,10 +576,16 @@ def compute_seed_peak_activations(seed_file: Path, sae_ctx: SaeContext) -> dict[
             if task is None:
                 raise SystemExit(f"{seed_file}: cannot determine task from seed label {label!r}.")
             system, user_content, opening_phrase = gaf.build_prompt_for_row(task, text)
+            _cuda_sync(sae_ctx)
+            start = time.perf_counter()
             row_peaks = gaf.compute_max_raw_activation_per_feature(
                 user_content, sae_ctx.model, sae_ctx.collector, sae_ctx.sae,
                 opening_phrase=opening_phrase, system=system,
             )
+            _cuda_sync(sae_ctx)
+            if sae_stats is not None:
+                # The collector still holds this row's hidden states [1, seq, hidden].
+                add_sae_pass(sae_stats, int(sae_ctx.collector.cache.shape[1]), time.perf_counter() - start)
             for feature_id, peak in row_peaks.items():
                 if peak > peaks.get(feature_id, float("-inf")):
                     peaks[feature_id] = peak
@@ -686,6 +730,16 @@ def process_call_result(
             f"endpoint_tags={sampling_verification['endpoint_tags']})",
             file=sys.stderr,
         )
+    # SAE passes of this call's candidates (all of them ran, incl. later target_reached ones).
+    # Counted here, i.e. main-thread, in slot order and only for waves that get checkpointed.
+    call_sae_stats = new_sae_stats()
+    for sae_result in sae_results:
+        add_sae_pass(call_sae_stats, sae_result["n_forward_tokens"], sae_result["sae_seconds"])
+    if "sae_candidate_check" in counters:  # hybrid/ passes counters without SAE tracking
+        candidate_stats = counters["sae_candidate_check"]
+        candidate_stats["n_forward_passes"] += call_sae_stats["n_forward_passes"]
+        candidate_stats["n_forward_tokens"] += call_sae_stats["n_forward_tokens"]
+        candidate_stats["gpu_seconds"] = round(candidate_stats["gpu_seconds"] + call_sae_stats["gpu_seconds"], 6)
     # One entry per parsed candidate, pointing at the accepted/rejected entry (same call_id).
     call_outcomes: list[dict] = []
     call_records.append(
@@ -702,6 +756,9 @@ def process_call_result(
             "context_examples": result.context_examples,
             "n_parsed_candidates": len(result.candidates),
             "outcomes": call_outcomes,
+            "sae_n_forward_passes": call_sae_stats["n_forward_passes"],
+            "sae_n_forward_tokens": call_sae_stats["n_forward_tokens"],
+            "sae_gpu_seconds": call_sae_stats["gpu_seconds"],
             "openrouter_response": result.openrouter_meta,
             "sampling_verification": sampling_verification,
         }
@@ -717,6 +774,8 @@ def process_call_result(
             "sae_n_active_tokens": sae_result["n_active_tokens"],
             "sae_n_content_tokens": sae_result["n_content_tokens"],
             "sae_top_token": sae_result["top_token"],
+            "sae_n_forward_tokens": sae_result["n_forward_tokens"],
+            "sae_seconds": sae_result["sae_seconds"],
         }
 
         if counters["n_accepted_this_run"] >= args.n:
@@ -923,7 +982,7 @@ def build_model_params(args: argparse.Namespace) -> dict:
         model_params["provider"] = {
             **model_params.get("provider", {}),
             "only": [PROVIDER],
-            "allow_fallbacks": False,
+            "allow_fallbacks": True,
             "require_parameters": True,
         }
     else:
@@ -935,7 +994,7 @@ def build_model_params(args: argparse.Namespace) -> dict:
         model_params["provider"] = {
             **model_params["provider"],
             "quantizations": ["fp8"],
-            "allow_fallbacks": False,
+            "allow_fallbacks": True,
             "require_parameters": True,
             "data_collection": "deny",
         }
@@ -1116,20 +1175,38 @@ def main() -> None:
             "total_prompt_tokens": 0,
             "total_completion_tokens": 0,
             "next_id": next_id,
+            "sae_seed_check": new_sae_stats(),
+            "sae_candidate_check": new_sae_stats(),
+            "sae_tracking_complete": True,
         }
     else:
         counters["next_id"] = max(counters["next_id"], next_id)
+        if "sae_candidate_check" not in counters:
+            # Checkpoint from before SAE tracking: its seed check and earlier candidate checks
+            # were not measured, so the totals of this run stay incomplete.
+            print("[resume] Note: checkpoint predates SAE compute tracking; SAE stats cover only the waves from now on.")
+            counters["sae_seed_check"] = None
+            counters["sae_candidate_check"] = new_sae_stats()
+            counters["sae_tracking_complete"] = False
 
     print("Loading Llama + SAE for feature verification...")
     sae_ctx = load_sae_context(args, sae_system_prompt)
 
     if schedule is None:
         print(f"Computing seed coverage of the relevant features on {seed_file} (threshold {args.threshold})...")
-        schedule = new_schedule(features, compute_seed_peak_activations(seed_file, sae_ctx), args.threshold)
+        seed_peaks = compute_seed_peak_activations(seed_file, sae_ctx, counters["sae_seed_check"])
+        schedule = new_schedule(features, seed_peaks, args.threshold)
+        seed_check = counters["sae_seed_check"]
+        print(
+            f"  [sae] seed check: {seed_check['n_forward_passes']} forward pass(es), "
+            f"{seed_check['n_forward_tokens']} token(s), {seed_check['gpu_seconds']:.2f} s"
+        )
     covered_set = set(schedule["seed_covered"])
+    seed_coverage_by_label = {}
     for label in args.feature_labels:
         n_label = label_counts[label]
         n_covered = sum(f["label"] == label and f["feature_id"] in covered_set for f in features)
+        seed_coverage_by_label[label] = {"total": n_label, "covered": n_covered, "uncovered": n_label - n_covered}
         print(f"  [seed coverage] {label:<9} covered {n_covered:>4} / not covered {n_label - n_covered:>4} / total {n_label:>4}")
     print(
         f"[schedule] pass {schedule['pass_idx']}: {len(schedule['pass_queue'])} feature(s) queued, "
@@ -1273,6 +1350,13 @@ def main() -> None:
     total_prompt_tokens = counters["total_prompt_tokens"]
     total_completion_tokens = counters["total_completion_tokens"]
     target_reached = n_accepted_this_run >= args.n
+    sae_seed_check = counters["sae_seed_check"]
+    sae_candidate_check = counters["sae_candidate_check"]
+    sae_total = dict(sae_candidate_check)
+    if sae_seed_check is not None:
+        for key in sae_total:
+            sae_total[key] += sae_seed_check[key]
+        sae_total["gpu_seconds"] = round(sae_total["gpu_seconds"], 6)
 
     bb.save_json(accepted_path, seed_pool_entries + accepted_pool)
     print(f"Wrote {len(seed_pool_entries)} seed + {len(accepted_pool)} synthetic entrie(s) to {accepted_path}")
@@ -1307,6 +1391,7 @@ def main() -> None:
         "n_relevant_features": len(features),
         "n_seed_covered": len(schedule["seed_covered"]),
         "n_seed_uncovered": len(schedule["seed_uncovered"]),
+        "seed_coverage_by_label": seed_coverage_by_label,
         "seed_covered": schedule["seed_covered"],
         "seed_uncovered": schedule["seed_uncovered"],
         "seed_peak_activations": schedule["seed_peak_activations"],
@@ -1319,6 +1404,11 @@ def main() -> None:
         "sae_model": os.path.abspath(args.model_name),
         "sae_ckpt_path": os.path.abspath(args.sae_ckpt_path),
         "sae_layer": args.layer,
+        "sae_device": args.device,
+        "sae_seed_check": sae_seed_check,
+        "sae_candidate_check": sae_candidate_check,
+        "sae_total": sae_total,
+        "sae_tracking_complete": counters["sae_tracking_complete"],
         "n_requested": args.n,
         "rouge_threshold": args.rouge_threshold,
         "n_calls": n_calls,
@@ -1347,6 +1437,7 @@ def main() -> None:
     existing_log = bb.load_json_dict(log_path) or {}
     cumulative_prompt_tokens = existing_log.get("cumulative_prompt_tokens", 0) + total_prompt_tokens
     cumulative_completion_tokens = existing_log.get("cumulative_completion_tokens", 0) + total_completion_tokens
+    cumulative_sae_gpu_seconds = round(existing_log.get("cumulative_sae_gpu_seconds", 0.0) + sae_total["gpu_seconds"], 6)
     runs = existing_log.get("runs", [])
     runs.append(run_entry)
     bb.save_json(
@@ -1357,6 +1448,7 @@ def main() -> None:
             "cumulative_prompt_tokens": cumulative_prompt_tokens,
             "cumulative_completion_tokens": cumulative_completion_tokens,
             "cumulative_total_tokens": cumulative_prompt_tokens + cumulative_completion_tokens,
+            "cumulative_sae_gpu_seconds": cumulative_sae_gpu_seconds,
             "runs": runs,
         },
     )
@@ -1371,6 +1463,12 @@ def main() -> None:
         f"({counters['n_feature_inactive']} feature inactive, {counters['n_rouge_duplicate']} ROUGE duplicate) "
         f"over {n_calls} call(s) ({counters['n_failed_calls']} failed); "
         f"prompt_tokens={total_prompt_tokens}, completion_tokens={total_completion_tokens}"
+    )
+    print(
+        f"SAE: {sae_total['n_forward_passes']} forward pass(es), {sae_total['n_forward_tokens']} token(s), "
+        f"{sae_total['gpu_seconds']:.2f} s net GPU time (candidate check {sae_candidate_check['gpu_seconds']:.2f} s, "
+        f"seed check {'n/a' if sae_seed_check is None else format(sae_seed_check['gpu_seconds'], '.2f') + ' s'})"
+        + ("" if counters["sae_tracking_complete"] else " [incomplete: resumed from a pre-tracking checkpoint]")
     )
 
 

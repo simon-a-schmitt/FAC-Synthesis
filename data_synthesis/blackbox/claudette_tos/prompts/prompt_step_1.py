@@ -13,20 +13,21 @@ examples given: lowercase throughout, punctuation and quotation marks spaced
 as they appear there. Always write in English.
 
 LENGTH
-One sentence. Most run to a couple of dozen words. A minority are short
-fragments, and a minority are long single sentences carrying several clauses.
-Length follows from what the sentence states, not from a target.
+One sentence, typically a couple of dozen words. Short fragments and long
+single sentences carrying several clauses also occur. Length follows from
+what the sentence states, not from a target.
 
-SUBJECT MATTER
-Most of a terms document is machinery rather than provision. It defines terms,
+CONTENT
+A terms document contains machinery as well as provisions. It defines terms,
 describes what the service is and how an account works, explains features and
 settings, states fees and renewal mechanics, gives notice addresses and
 contact details, incorporates other documents by reference, sets out the steps
 of a procedure, and carries headings, cross references and boilerplate that
-grants and reserves nothing. Sentences of this kind are what the corpus
-largely consists of, and they are what you should mostly write. Liability,
-termination, amendment, user content and dispute resolution also occur, but
-they occupy a small part of the document.
+grants and reserves nothing. It also addresses liability, termination,
+amendment, user content and dispute resolution.
+
+Sentences name the provider, jurisdictions, courts or institutions where a
+real clause would name them.
 
 BALANCE
 Two kinds of sentence occur here. They differ in how rights, risk and
@@ -34,22 +35,17 @@ procedure are distributed between provider and user.
 
 Even-handed sentences state how the service operates, define something, grant
 the user a right, set out a step either party may take, or place an obligation
-that also binds the provider. They are the great majority and they are the
-default.
+that also binds the provider. They are the majority.
 
 One-sided sentences move rights, risk or procedure towards the provider and
-away from the user. They belong in the corpus, they are uncommon in it, and no
-particular form of them is typical.
+away from the user. They are a minority.
 
 Balance follows from what a sentence grants, reserves, excludes or imposes,
 not from the topic it addresses. The same topic occurs in both forms.
 
 RESTRAINT
-One sentence states one provision. Sentences that bundle two distinct
-provisions exist but are rare. Name the provider,
-jurisdictions, courts or institutions where a real clause would name them. Do
-not explain, justify or soften the clause, and do not invent statutes or case
-numbers.
+One sentence states one provision. Do not explain, justify or soften the
+clause, and do not invent statutes or case numbers.
 """.strip()
 
 

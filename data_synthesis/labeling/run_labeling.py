@@ -101,7 +101,7 @@ MODEL_PRESETS = {
 }
 DEFAULT_MODEL = "gpt"
 
-# If True, every request is pinned to --provider (via provider.only/allow_fallbacks=False), as
+# If True, every request is pinned to --provider (via provider.only/allow_fallbacks=True), as
 # before. If False, requests are left free to be routed by OpenRouter across any provider that
 # satisfies provider.require_parameters (i.e. load-balanced across all eligible providers).
 PIN_PROVIDER = False
@@ -459,7 +459,7 @@ def main() -> None:
         model_params["provider"] = {
             **model_params.get("provider", {}),
             "only": [provider],
-            "allow_fallbacks": False,
+            "allow_fallbacks": True,
             "require_parameters": True,
         }
     else:
@@ -471,7 +471,7 @@ def main() -> None:
         model_params["provider"] = {
             **model_params["provider"],
             "quantizations": ["fp8"],
-            "allow_fallbacks": False,
+            "allow_fallbacks": True,
             "require_parameters": True,
             "data_collection": "deny",
         }
