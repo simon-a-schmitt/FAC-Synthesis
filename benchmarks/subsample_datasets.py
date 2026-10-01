@@ -9,7 +9,6 @@ csv.field_size_limit(sys.maxsize)
 def subsample_tsv(input_file, output_file, n, seed=None, remove_from_input=True):
     with open(input_file, newline="", encoding="utf-8") as f:
         reader = csv.reader(f, delimiter="\t", quoting=csv.QUOTE_NONE, quotechar=None)
-        header = next(reader)
         rows = list(reader)
 
     if n > len(rows):
@@ -24,13 +23,11 @@ def subsample_tsv(input_file, output_file, n, seed=None, remove_from_input=True)
 
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, delimiter="\t", quoting=csv.QUOTE_NONE, quotechar=None)
-        writer.writerow(header)
         writer.writerows(sampled_rows)
 
     if remove_from_input:
         with open(input_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f, delimiter="\t", quoting=csv.QUOTE_NONE, quotechar=None)
-            writer.writerow(header)
             writer.writerows(remaining_rows)
 
     return len(sampled_rows), len(remaining_rows)
@@ -39,7 +36,7 @@ def subsample_tsv(input_file, output_file, n, seed=None, remove_from_input=True)
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Randomly draw n rows (without replacement) from a TSV file. "
+            "Randomly draw n rows (without replacement) from a headerless TSV file. "
             "Sampled rows are written to the output TSV and, by default, removed from the input TSV "
             "(use --keep-in-input to leave the input file unchanged)."
         )
