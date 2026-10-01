@@ -8,6 +8,7 @@ import multiprocessing
 import pandas as pd
 import transformers as trf
 import tqdm
+import csv
 
 
 CACHE_DIR = "../../"
@@ -110,15 +111,16 @@ class Reader:
         
         # CSV mit Fehlerbehandlung laden
         try:
-            self.df = pd.read_csv(fpath, engine="python", 
-                on_bad_lines="skip", encoding="utf8", sep="\t")
+            self.df = pd.read_csv(fpath, engine="python", sep="\t",
+                      quoting=csv.QUOTE_NONE, on_bad_lines="error",
+                      encoding="utf8")
             if "NeuronID" not in self.df.columns:
                 raise KeyError(f"Spalte 'NeuronID' nicht gefunden. Verfügbare Spalten: {self.df.columns.tolist()}")
             print(f"Loading success! {len(self.df)} rows geladen.")
             self.df.sort_values("NeuronID", inplace=True)
         except Exception as e:
             raise RuntimeError(f"Fehler beim Laden von {fpath}: {e}")
-            
+
         self.tokenizer = trf.AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct", cache_dir=CACHE_DIR)
     
     def select(self, idx, topK=5, key="Span"):
