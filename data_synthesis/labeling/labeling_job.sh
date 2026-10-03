@@ -20,7 +20,7 @@ SCRIPT_DIR="$WS_PATH/code/FAC-Synthesis/data_synthesis/labeling"
 
 # Adjust per run.
 SOURCE="feature_guided"   # blackbox | feature_guided | hybrid
-DOMAIN="toxicity_detection"
+DOMAIN="toxicity_detection"  # claudette_tos | cti_vsp | toxicity_detection
 INPUT_JSON="toxicity_fg_llama_d0_6_t0_0_accepted.json"
 MODEL="gpt"               # gpt | deepseek
 MAX_CONCURRENT_REQUESTS=8
@@ -29,7 +29,7 @@ mkdir -p logs
 
 python "$SCRIPT_DIR/run_labeling.py" \
     --source "$SOURCE" \
-    --path "$DOMAIN" \
+    --domain "$DOMAIN" \
     --input-json "$INPUT_JSON" \
     --model "$MODEL" \
     --max-concurrent-requests "$MAX_CONCURRENT_REQUESTS" \

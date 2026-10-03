@@ -2,9 +2,9 @@
 
 Hybrid counterpart of ../feature_guided/summarize_generation_run.py and
 ../blackbox/summarize_generation_run.py: merges the blackbox phase (<prefix>_bb_*) and the
-feature-guided phase (<prefix>_fg_*) of every run. Requires <path>/output/<prefix>_bb_accepted.json
-and _bb_rejected.json plus at least one of <path>/log/<prefix>_bb_log.json (runs whose blackbox
-phase completed) and <path>/output/<prefix>_checkpoint.json (a run that has not finished yet;
+feature-guided phase (<prefix>_fg_*) of every run. Requires hybrid/<domain>/output/<prefix>_bb_accepted.json
+and _bb_rejected.json plus at least one of hybrid/<domain>/log/<prefix>_bb_log.json (runs whose blackbox
+phase completed) and hybrid/<domain>/output/<prefix>_checkpoint.json (a run that has not finished yet;
 reported with "status": "incomplete" and the phase it stopped in). The _fg_* files, _fg_log.json,
 _log.json and both _failed.json files are read if present. Computes, in total and per run_id:
   - overall: API calls, token usage and samples of both phases together, plus the token usage
@@ -14,54 +14,39 @@ _log.json and both _failed.json files are read if present. Computes, in total an
   - feature_guided: the feature-guided phase, counted as in the feature-guided summary
     ("feature_inactive" + "rouge_duplicate"), with the feature triggering (pass 0 = the relevant
     features covered neither by the seeds nor by the blackbox examples) and the SAE compute of
-    the candidate checks (the seed + blackbox coverage check is not tracked by run_generation.py).
+    the candidate checks and of the seed + blackbox coverage check (not tracked by older runs).
   - coverage (per run): relevant features covered by the seeds, by the blackbox examples, by the
     blackbox examples only, and left uncovered (= the features of pass 0), in total and per label.
 In every phase, "target_reached" samples (never checked, the phase's target already reached) are
 reported separately under "target_reached" and left out of the sample counts and the SAE compute;
 a call whose every sample was target_reached is likewise left out of the call count and tokens.
-Writes <path>/log/<prefix>_summary.json.
+Writes hybrid/<domain>/log/<prefix>_summary.json.
 
 Calls and samples are joined on (run_id, wave_idx, slot_index) WITHIN a phase: both phases share
 the run_id and count waves/slots from 0, so the phases are always evaluated on their own files.
 
 Usage:
-    python summarize_generation_run.py --path toxicity_detection --prefix toxicity_hybrid_350_50_llama_d0_6_t0_0
+    python summarize_generation_run.py --domain toxicity_detection --prefix toxicity_hybrid_350_50_llama_d0_6_t0_0
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import sys
-from collections import Counter
-from datetime import datetime, timezone
 from pathlib import Path
 
-BASE_DIR = Path(__file__).parent
-RUN_GENERATION_SCRIPT = BASE_DIR / "run_generation.py"
-FEATURE_GUIDED_SUMMARY_SCRIPT = BASE_DIR.parent / "feature_guided" / "summarize_generation_run.py"
+ARM_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(ARM_DIR.parent))
 
+# The per-phase counting is the blackbox / feature-guided summaries' own.
+from blackbox import summarize_generation_run as bbs  # noqa: E402
+from feature_guided import summarize_generation_run as fgs  # noqa: E402
+from shared.benchmarks import DOMAINS  # noqa: E402
+from shared.generation import PHASE_BLACKBOX, PHASE_FEATURE_GUIDED  # noqa: E402
+from shared.run_io import load_json_dict, load_json_list, save_json, utc_now  # noqa: E402
+from shared.summary import is_generation_failure, slot_key, verification_summary  # noqa: E402
 
-def _load_module(path: Path, module_name: str):
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    # Must be registered before exec: @dataclass definitions look themselves up in sys.modules.
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-# Path resolution and phase names are shared with the generator; the per-phase counting with the
-# feature-guided summary, which in turn holds the blackbox summary (token usage, sampling
-# verification, the blackbox counting rules, the call/sample join key).
-hy = _load_module(RUN_GENERATION_SCRIPT, "hybrid_run_generation")
-fgs = _load_module(FEATURE_GUIDED_SUMMARY_SCRIPT, "feature_guided_summarize_generation_run")
-bbs = fgs.bbs
-bb = fgs.bb
-
-PHASES = (hy.PHASE_BLACKBOX, hy.PHASE_FEATURE_GUIDED)
+PHASES = (PHASE_BLACKBOX, PHASE_FEATURE_GUIDED)
 TOKEN_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens", "cached_prompt_tokens", "cost")
 
 
@@ -127,9 +112,11 @@ def collect_runs(logs: dict[str, dict | None], checkpoint: dict | None) -> list[
             "feature_guided_started_at": (fg_run or {}).get("started_at", fg_state.get("started_at")),
             "feature_guided_finished_at": (fg_run or {}).get("finished_at"),
             "_calls": {
-                hy.PHASE_BLACKBOX: bb_run["calls"] if bb_run is not None else bb_state.get("call_records", []),
-                hy.PHASE_FEATURE_GUIDED: fg_run["calls"] if fg_run is not None else fg_state.get("call_records", []),
+                PHASE_BLACKBOX: bb_run["calls"] if bb_run is not None else bb_state.get("call_records", []),
+                PHASE_FEATURE_GUIDED: fg_run["calls"] if fg_run is not None else fg_state.get("call_records", []),
             },
+            # Runs before the shared feature-guidance code did not track the coverage check.
+            "_sae_coverage": (fg_run or {}).get("sae_coverage_check", (fg_state.get("counters") or {}).get("sae_coverage_check")),
             "_schedule": {
                 key: schedule.get(key)
                 for key in ("covered", "uncovered", "seed_covered", "blackbox_covered", "blackbox_only_covered", "exhausted_in_pass")
@@ -140,9 +127,9 @@ def collect_runs(logs: dict[str, dict | None], checkpoint: dict | None) -> list[
 
 def fg_summary_run(run: dict) -> dict:
     """The run in the normalised form feature_guided/summarize_generation_run.py works on. SAE
-    compute of the candidate checks is summed from the call records (the hybrid run keeps no
-    run-level SAE counters); the coverage check is not tracked."""
-    calls = run["_calls"][hy.PHASE_FEATURE_GUIDED]
+    compute of the candidate checks is summed from the call records; the coverage check (seeds +
+    blackbox examples) is taken from the run's counters where tracked."""
+    calls = run["_calls"][PHASE_FEATURE_GUIDED]
     tracked = bool(calls) and all("sae_n_forward_passes" in c for c in calls)
     return {
         "run_id": run["run_id"],
@@ -155,7 +142,7 @@ def fg_summary_run(run: dict) -> dict:
         "feature_scores": run["feature_scores"],
         "feature_labels": run["feature_labels"],
         "sae_tracked": tracked,
-        "sae_seed_check": None,
+        "sae_seed_check": run["_sae_coverage"],
         "sae_candidate_check": fgs.sae_from_calls(calls) if tracked else None,
         "sae_tracking_complete": tracked,
     }
@@ -229,17 +216,16 @@ def feature_guided_stats(runs: list[dict], accepted: list[dict], rejected: list[
         }
     sae = stats["sae"]
     if sae["tracked"]:
-        sae.pop("seed_check")
-        sae["coverage_check"] = None
-        sae["note"] = ("SAE compute of the seed + blackbox coverage check is not tracked by hybrid/run_generation.py; "
-                       "total = candidate checks only.")
+        sae["coverage_check"] = sae.pop("seed_check")
+        if sae["coverage_check"] is None:
+            sae["note"] = "SAE compute of the seed + blackbox coverage check was not tracked (older run); total = candidate checks only."
     else:
-        sae["note"] = "SAE compute was not tracked by the run_generation.py version of these run(s)."
+        sae["note"] = "SAE compute was not tracked by the generator version of these run(s)."
     return stats
 
 
 def overall_stats(phase_stats: dict[str, dict], counted: list[dict]) -> dict:
-    bb_s, fg_s = phase_stats[hy.PHASE_BLACKBOX], phase_stats[hy.PHASE_FEATURE_GUIDED]
+    bb_s, fg_s = phase_stats[PHASE_BLACKBOX], phase_stats[PHASE_FEATURE_GUIDED]
     both = (bb_s, fg_s)
     samples = {
         key: sum(s["samples"].get(key, 0) for s in both)
@@ -252,7 +238,7 @@ def overall_stats(phase_stats: dict[str, dict], counted: list[dict]) -> dict:
             **{key: sum(s["api"][key] for s in both) for key in ("n_calls", "n_successful_calls", "n_failed_calls")},
             "n_calls_by_phase": {phase: phase_stats[phase]["api"]["n_calls"] for phase in PHASES},
             "tokens": sum_tokens(list(tokens_by_phase.values())),
-            "sampling_verification": bbs.verification_summary(counted),
+            "sampling_verification": verification_summary(counted),
         },
         "tokens_by_phase": {"total": sum_tokens(list(tokens_by_phase.values())), **tokens_by_phase},
         "samples": samples,
@@ -275,8 +261,8 @@ def hybrid_stats(runs: list[dict], data: dict[str, dict[str, list[dict]]]) -> di
     }
     calls = {phase: [c for r in runs for c in r["_calls"][phase]] for phase in PHASES}
     phase_stats = {
-        hy.PHASE_BLACKBOX: blackbox_stats(calls[hy.PHASE_BLACKBOX], **picked[hy.PHASE_BLACKBOX]),
-        hy.PHASE_FEATURE_GUIDED: feature_guided_stats(runs, **picked[hy.PHASE_FEATURE_GUIDED]),
+        PHASE_BLACKBOX: blackbox_stats(calls[PHASE_BLACKBOX], **picked[PHASE_BLACKBOX]),
+        PHASE_FEATURE_GUIDED: feature_guided_stats(runs, **picked[PHASE_FEATURE_GUIDED]),
     }
     counted = [
         c for phase in PHASES
@@ -293,17 +279,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Summarize token usage (total and per phase), accepted/rejected counts, coverage, feature "
         "triggering and SAE compute of a hybrid generation run (by --prefix)."
     )
-    parser.add_argument(
-        "--path", type=str, required=True,
-        help="Domain subfolder (e.g. 'toxicity_detection'), either a name under hybrid/ or a path to it.",
-    )
+    parser.add_argument("--domain", type=str, required=True, choices=DOMAINS)
     parser.add_argument("--prefix", type=str, required=True, help="The --prefix the run was generated with.")
     return parser
 
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    domain_dir = hy.resolve_domain_dir(args.path)
+    domain_dir = ARM_DIR / args.domain
     output_dir = domain_dir / "output"
     log_dir = domain_dir / "log"
     files = {
@@ -324,19 +307,19 @@ def main() -> None:
     data: dict[str, dict[str, list[dict]]] = {}
     for phase, short in zip(PHASES, ("bb", "fg")):
         data[phase] = {
-            "accepted": [e for e in bb.load_json_list(files[f"{short}_accepted"]) if e.get("type") == "synthetic"],
-            "rejected": bb.load_json_list(files[f"{short}_rejected"]),
-            "failed": [e for e in bb.load_json_list(files[f"{short}_failed"]) if bbs.is_generation_failure(e)],
+            "accepted": [e for e in load_json_list(files[f"{short}_accepted"]) if e.get("type") == "synthetic"],
+            "rejected": load_json_list(files[f"{short}_rejected"]),
+            "failed": [e for e in load_json_list(files[f"{short}_failed"]) if is_generation_failure(e)],
         }
         for entries in data[phase].values():
             for entry in entries:
-                entry["_key"] = bbs.slot_key(entry.get("run_id"), entry)
-    runs = collect_runs({key: bb.load_json_dict(files[key]) for key in ("bb_log", "fg_log", "log")},
-                        bb.load_json_dict(files["checkpoint"]))
+                entry["_key"] = slot_key(entry.get("run_id"), entry)
+    runs = collect_runs({key: load_json_dict(files[key]) for key in ("bb_log", "fg_log", "log")},
+                        load_json_dict(files["checkpoint"]))
     for run in runs:
         for records in run["_calls"].values():
             for record in records:
-                record["_key"] = bbs.slot_key(run["run_id"], record)
+                record["_key"] = slot_key(run["run_id"], record)
 
     run_summaries = [
         {**{k: v for k, v in run.items() if not k.startswith("_")}, **hybrid_stats([run], data)}
@@ -351,7 +334,7 @@ def main() -> None:
     summary = {
         "prefix": args.prefix,
         "path": str(domain_dir),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": utc_now(),
         "counting_rules": (
             "Each phase is counted on its own files. Blackbox phase: only 'rouge_duplicate' is a rejection. "
             "Feature-guided phase: 'feature_inactive' (SAE activation check) and 'rouge_duplicate' (ROUGE-L dedup). "
@@ -368,7 +351,7 @@ def main() -> None:
     }
 
     output_path = log_dir / f"{args.prefix}_summary.json"
-    bb.save_json(output_path, summary)
+    save_json(output_path, summary)
 
     n_incomplete = sum(r["status"] == "incomplete" for r in runs)
     print(f"Prefix {args.prefix!r}: {len(runs)} run(s) ({n_incomplete} incomplete)")
@@ -393,18 +376,21 @@ def main() -> None:
                   f"blackbox {cov['n_covered_by_blackbox']} ({cov['n_covered_by_blackbox_only']} only by blackbox), "
                   f"covered {cov['n_covered']}, uncovered {cov['n_uncovered']}"
                   + (f" (uncovered/relevant: {labels})" if labels else ""))
-        triggering = run[hy.PHASE_FEATURE_GUIDED].get("feature_triggering")
+        triggering = run[PHASE_FEATURE_GUIDED].get("feature_triggering")
         for name, block in (("pass 0", triggering["pass_0_uncovered_features"]), ("all passes", triggering["all_passes"])):
             print(f"    features {name}: attempted {block['n_features_attempted']}, reached {block['n_features_reached']}, "
                   f"exhausted {block['n_features_exhausted']}, never reached {block['n_features_never_reached']}, "
                   f"open {block['n_features_open']}; "
                   f"mean attempts to reach {block['mean_attempts_to_reach']} {block['attempts_to_reach_distribution']}")
-        sae = run[hy.PHASE_FEATURE_GUIDED]["sae"]
+        sae = run[PHASE_FEATURE_GUIDED]["sae"]
         if sae["tracked"]:
             cand = sae["candidate_check"]
             print(f"    SAE candidate checks: {cand['n_forward_passes']} forward pass(es), {cand['n_forward_tokens']} token(s), "
-                  f"{cand['gpu_seconds']:.2f} s ({cand['gpu_time']}) net GPU time (coverage check not tracked)")
-            tr_sae = run[hy.PHASE_FEATURE_GUIDED]["target_reached"]["sae"]
+                  f"{cand['gpu_seconds']:.2f} s ({cand['gpu_time']}) net GPU time")
+            cov_sae = sae["coverage_check"]
+            print("    SAE coverage check: " + ("not tracked (older run)" if cov_sae is None else
+                  f"{cov_sae['n_forward_passes']} forward pass(es), {cov_sae['gpu_seconds']:.2f} s"))
+            tr_sae = run[PHASE_FEATURE_GUIDED]["target_reached"]["sae"]
             print(f"    excluded SAE of target_reached samples: {tr_sae['n_forward_passes']} forward pass(es), "
                   f"{tr_sae['gpu_seconds']:.2f} s")
         else:

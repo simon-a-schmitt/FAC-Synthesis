@@ -1,10 +1,10 @@
 """Summarize a feature-guided generation run (all runs written under one --prefix) into a JSON file.
 
 Feature-guided counterpart of ../blackbox/summarize_generation_run.py. Requires
-<path>/output/<prefix>_accepted.json and _rejected.json plus at least one of
-<path>/log/<prefix>_log.json (completed runs) and <path>/output/<prefix>_checkpoint.json (a run
+feature_guided/<domain>/output/<prefix>_accepted.json and _rejected.json plus at least one of
+feature_guided/<domain>/log/<prefix>_log.json (completed runs) and feature_guided/<domain>/output/<prefix>_checkpoint.json (a run
 that has not reached --n yet, e.g. between two --resume invocations; reported with
-"status": "incomplete"). <path>/output/<prefix>_failed.json is read if present. Computes, in total
+"status": "incomplete"). feature_guided/<domain>/output/<prefix>_failed.json is read if present. Computes, in total
 and per run_id:
   - API: calls (successful / failed) and token usage summed over the calls' OpenRouter usage, plus
     the provider/sampling-parameter verification. As in the blackbox summary, a call whose every
@@ -25,57 +25,39 @@ and per run_id:
     candidate activation checks (for runs of run_generation.py versions that tracked it; older
     runs report null). The SAE passes of target_reached samples did run, but are left out of
     these numbers like their tokens and reported on their own under "target_reached".
-and writes it to <path>/log/<prefix>_summary.json.
+and writes it to feature_guided/<domain>/log/<prefix>_summary.json.
 
 Calls and samples are joined on (run_id, wave_idx, slot_index), which every version of
 run_generation.py has written, so older logs (without call_id/outcomes) work as well.
 
 Usage:
-    python summarize_generation_run.py --path toxicity_detection --prefix toxicity_fg_llama_d0_6_t0_0
+    python summarize_generation_run.py --domain toxicity_detection --prefix toxicity_fg_llama_d0_6_t0_0
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
 from pathlib import Path
 
-BASE_DIR = Path(__file__).parent
-RUN_GENERATION_SCRIPT = BASE_DIR / "run_generation.py"
-BLACKBOX_SUMMARY_SCRIPT = BASE_DIR.parent / "blackbox" / "summarize_generation_run.py"
+ARM_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(ARM_DIR.parent))
 
-
-def _load_module(path: Path, module_name: str):
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    # Must be registered before exec: @dataclass definitions look themselves up in sys.modules.
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-# Path resolution, feature loading and JSON I/O are shared with the generator; token usage,
-# sampling verification and the call/sample join key with the blackbox summary.
-fg = _load_module(RUN_GENERATION_SCRIPT, "feature_guided_run_generation")
-bbs = _load_module(BLACKBOX_SUMMARY_SCRIPT, "blackbox_summarize_generation_run")
-bb = fg.bb
+from shared.benchmarks import DOMAINS  # noqa: E402
+from shared.feature_guidance import load_features  # noqa: E402
+from shared.run_io import load_json_dict, load_json_list, save_json, utc_now  # noqa: E402
+from shared.summary import (  # noqa: E402
+    format_seconds,
+    is_generation_failure,
+    slot_key,
+    sum_usage,
+    verification_summary,
+)
 
 REJECTION_REASONS = ("feature_inactive", "rouge_duplicate")
 TARGET_REACHED_REASON = "target_reached"
 SAE_STAT_KEYS = ("n_forward_passes", "n_forward_tokens", "gpu_seconds")
-
-
-def format_seconds(seconds: float | None) -> str | None:
-    """HH:MM:SS, as bb.format_wall_clock_slurm."""
-    if seconds is None:
-        return None
-    hours, remainder = divmod(max(round(seconds), 0), 3600)
-    minutes, secs = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def _mean(values: list[int]) -> float | None:
@@ -106,12 +88,12 @@ def run_from_log(run: dict) -> dict:
         "calls": run.get("calls", []),
         "seed_covered": run.get("seed_covered"),
         "seed_uncovered": run.get("seed_uncovered"),
-        "seed_coverage_by_label": run.get("seed_coverage_by_label"),
+        "seed_coverage_by_label": run.get("seed_coverage_by_label") or _old_style_by_label(run.get("coverage_by_label")),
         "exhausted_in_pass": run.get("exhausted_in_pass"),
         "sae_tracked": has_sae,
-        "sae_seed_check": run.get("sae_seed_check"),
+        "sae_seed_check": run.get("sae_coverage_check", run.get("sae_seed_check")),
         "sae_candidate_check": run.get("sae_candidate_check"),
-        "sae_tracking_complete": run.get("sae_tracking_complete", False) if has_sae else False,
+        "sae_tracking_complete": run.get("sae_tracking_complete", True) if has_sae else False,
     }
 
 
@@ -144,10 +126,18 @@ def run_from_checkpoint(checkpoint: dict) -> dict:
         "seed_coverage_by_label": None,
         "exhausted_in_pass": schedule.get("exhausted_in_pass"),
         "sae_tracked": has_sae,
-        "sae_seed_check": counters.get("sae_seed_check"),
+        "sae_seed_check": counters.get("sae_coverage_check", counters.get("sae_seed_check")),
         "sae_candidate_check": counters.get("sae_candidate_check"),
-        "sae_tracking_complete": counters.get("sae_tracking_complete", False) if has_sae else False,
+        "sae_tracking_complete": counters.get("sae_tracking_complete", True) if has_sae else False,
     }
+
+
+def _old_style_by_label(by_label: dict | None) -> dict | None:
+    """Current logs' coverage_by_label in the {total, covered, uncovered} form of seed_coverage_by_label."""
+    if by_label is None:
+        return None
+    return {label: {"total": v["total"], "covered": v["seed_covered"], "uncovered": v["total"] - v["seed_covered"]}
+            for label, v in by_label.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +154,7 @@ def feature_labels_by_id(feature_scores: str | None, labels: list[str] | None) -
     key = (feature_scores, tuple(labels))
     if key not in _FEATURE_LABEL_CACHE:
         try:
-            features = fg.load_features(Path(feature_scores), list(labels))
+            features = load_features(Path(feature_scores), list(labels))
             _FEATURE_LABEL_CACHE[key] = {f["feature_id"]: f["label"] for f in features}
         except (OSError, SystemExit) as exc:
             print(f"[warn] Could not load feature labels from {feature_scores}: {exc}", file=sys.stderr)
@@ -330,7 +320,7 @@ def sae_stats(runs: list[dict], tr_samples: list[dict]) -> tuple[dict, dict | No
     that additionally produced a checked sample."""
     tracked = [r for r in runs if r["sae_tracked"]]
     if not tracked:
-        return {"tracked": False, "note": "SAE compute was not tracked by the run_generation.py version of these run(s)."}, None
+        return {"tracked": False, "note": "SAE compute was not tracked by the generator version of these run(s)."}, None
     tracked_ids = {r["run_id"] for r in tracked}
     tr_tracked = [e for e in tr_samples if e.get("run_id") in tracked_ids]
     tr_complete = all("sae_seconds" in e and "sae_n_forward_tokens" in e for e in tr_tracked)
@@ -377,8 +367,8 @@ def run_stats(runs: list[dict], accepted: list[dict], rejected: list[dict], fail
             "n_successful_calls": len(counted_calls),
             "n_failed_calls": len(failed),
             "n_calls_without_candidate": sum(1 for c in counted_calls if c.get("n_parsed_candidates", 0) == 0),
-            "tokens": bbs.sum_usage(counted_calls),
-            "sampling_verification": bbs.verification_summary(counted_calls),
+            "tokens": sum_usage(counted_calls),
+            "sampling_verification": verification_summary(counted_calls),
         },
         "samples": {
             "n_generated": n_generated,
@@ -392,7 +382,7 @@ def run_stats(runs: list[dict], accepted: list[dict], rejected: list[dict], fail
         "target_reached": {
             "n_samples": len(target_reached),
             "n_calls": len(tr_calls),
-            "tokens": bbs.sum_usage(tr_calls),
+            "tokens": sum_usage(tr_calls),
             "sae": tr_sae,
         },
         "sae": sae,
@@ -409,17 +399,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Summarize token usage, accepted/rejected counts, feature triggering and SAE compute "
         "of a feature-guided generation run (by --prefix)."
     )
-    parser.add_argument(
-        "--path", type=str, required=True,
-        help="Domain subfolder (e.g. 'toxicity_detection'), either a name under feature_guided/ or a path to it.",
-    )
+    parser.add_argument("--domain", type=str, required=True, choices=DOMAINS)
     parser.add_argument("--prefix", type=str, required=True, help="The --prefix the run was generated with.")
     return parser
 
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    domain_dir = fg.resolve_domain_dir(args.path)
+    domain_dir = ARM_DIR / args.domain
     output_dir = domain_dir / "output"
     log_dir = domain_dir / "log"
     files = {
@@ -435,19 +422,19 @@ def main() -> None:
     if not files["log"].exists() and not files["checkpoint"].exists():
         raise SystemExit(f"Neither {files['log']} nor {files['checkpoint']} exists for prefix {args.prefix!r}.")
 
-    accepted = [e for e in bb.load_json_list(files["accepted"]) if e.get("type") == "synthetic"]
-    rejected = bb.load_json_list(files["rejected"])
-    failed = [e for e in bb.load_json_list(files["failed"]) if bbs.is_generation_failure(e)]
-    runs = [run_from_log(r) for r in (bb.load_json_dict(files["log"]) or {}).get("runs", [])]
-    checkpoint = bb.load_json_dict(files["checkpoint"])
+    accepted = [e for e in load_json_list(files["accepted"]) if e.get("type") == "synthetic"]
+    rejected = load_json_list(files["rejected"])
+    failed = [e for e in load_json_list(files["failed"]) if is_generation_failure(e)]
+    runs = [run_from_log(r) for r in (load_json_dict(files["log"]) or {}).get("runs", [])]
+    checkpoint = load_json_dict(files["checkpoint"])
     if checkpoint is not None:
         runs.append(run_from_checkpoint(checkpoint))
 
     for entry in accepted + rejected + failed:
-        entry["_key"] = bbs.slot_key(entry.get("run_id"), entry)
+        entry["_key"] = slot_key(entry.get("run_id"), entry)
     for run in runs:
         for record in run["calls"]:
-            record["_key"] = bbs.slot_key(run["run_id"], record)
+            record["_key"] = slot_key(run["run_id"], record)
 
     run_summaries = []
     for run in runs:
@@ -478,7 +465,7 @@ def main() -> None:
     summary = {
         "prefix": args.prefix,
         "path": str(domain_dir),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": utc_now(),
         "counting_rules": (
             "Rejections are 'feature_inactive' (SAE activation check) and 'rouge_duplicate' (ROUGE-L dedup); "
             "n_generated = n_accepted + n_rejected. 'target_reached' samples and their calls are reported under "
@@ -495,7 +482,7 @@ def main() -> None:
     }
 
     output_path = log_dir / f"{args.prefix}_summary.json"
-    bb.save_json(output_path, summary)
+    save_json(output_path, summary)
 
     api, samples, tr, sae = totals["api"], totals["samples"], totals["target_reached"], totals["sae"]
     tokens = api["tokens"]

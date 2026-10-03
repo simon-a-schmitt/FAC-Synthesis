@@ -3,15 +3,15 @@ API, produced by blackbox/run_generation.py, feature_guided/run_generation.py, o
 hybrid/run_generation.py.
 
 --source selects the generation method (blackbox, feature_guided, or hybrid); together
-with --path (the domain) this gives the source domain dir <source>/<path>. Reads
-<source>/<path>/output/<prefix>_accepted.json (a JSON list of seed + synthetic entries,
+with --domain this gives the source domain dir <source>/<domain>. Reads
+<source>/<domain>/output/<prefix>_accepted.json (a JSON list of seed + synthetic entries,
 same format for both methods) and asks an OpenRouter model to label every non-seed
 ("type" != "seed") entry's text, using the system prompt from
-labeling/<domain>/prompt/prompt_step_2.py (SYSTEM_PROMPT / LABEL_FRAGMENTS) - shared by
-both sources, so the same labeling prompt is used regardless of generation method. Seed entries
+prompts/<domain>/labeling.py (SYSTEM_PROMPT / LABEL_FRAGMENTS / USER_PROMPT_PREFIX) - shared by
+all sources, so the same labeling prompt is used regardless of generation method. Seed entries
 are not re-labeled - their label already exists in the seed_group TSV the original
-generation run drew from (found via the "seed_file" recorded in
-<source>/<path>/log/<prefix>_log.json), already stored in the exact "<prefix>: <label>"
+generation run drew from (benchmarks/<domain>/<seed set>/, found via the seed_set/seed_group
+recorded in <source>/<domain>/log/<prefix>_log.json), already stored in the exact "<prefix>: <label>"
 format the model is asked to produce, so seed and model-produced labels end up formatted
 identically in the output.
 
@@ -21,8 +21,8 @@ one prompt/label pair per line, tab-separated, seed examples first (in seed orde
 followed by the labeled synthetic examples (in accepted-pool order, regardless of
 completion order - see fetch_one/main).
 
-Requests run concurrently via a thread pool, reusing run_generation.py's RateLimiter to
-respect the API's tps limit. Unlike run_generation.py's generation calls, labeling calls
+Requests run concurrently via a thread pool (shared/openrouter.py's RateLimiter respects the
+API's tps limit). Unlike the generation calls, labeling calls
 don't build on each other (no shared mutable pool, no dedup against prior results), so
 there is no need for its wave/barrier scheme: every synthetic entry's call is simply
 submitted up front and results are collected as they complete, then written out in the
@@ -47,68 +47,70 @@ labeling/<domain>/<prefix>_failed.json, so nothing has to be reconstructed from 
 scrollback after the fact. Like the TSV, this file is loaded and extended across runs rather
 than overwritten.
 
-Model, provider, and sampling params are independent of run_generation.py's: --model picks
-one of the MODEL_PRESETS keywords hardcoded at the top of this file ("gpt" or "deepseek"),
-each mapping to an OpenRouter model id + provider slug. --provider/--temperature/--max-tokens/
---extra-params override the preset's provider/LABELING_MODEL_PARAMS the same way
-run_generation.py's equivalent flags override its own BASE_MODEL_PARAMS.
+Every API call (initial and retry rounds, successful or not) is also recorded in a per-prefix
+run log at labeling/<domain>/log/<prefix>_log.json, analogous to run_generation.py's: one
+entry per invocation of this script under "runs" (run_id, model/params, counts, token usage,
+the endpoint catalog snapshot, and one record per call with its OpenRouter response metadata
+incl. usage and its sampling_verification), plus cumulative token totals across all runs.
+summarize_labeling_run.py turns this log into an overview.
 
-See blackbox/run_generation.py for the script this reuses HTTP/env/rate-limit plumbing from.
+Model, provider, and sampling params are independent of the generator's: --model picks one of
+the MODEL_PRESETS at the top of this file ("gpt" or "deepseek"). --provider/--temperature/
+--max-tokens/--extra-params override the preset's provider/LABELING_MODEL_PARAMS, built by the
+same shared.openrouter.build_model_params as the generation request parameters.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import importlib.util
-import json
-import os
 import re
 import sys
+import uuid
 from collections import Counter
 from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
+from dataclasses import dataclass, field
+from pathlib import Path, PureWindowsPath
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).resolve().parent
 DATA_SYNTHESIS_DIR = BASE_DIR.parent
-SOURCE_DIRS = {
-    "blackbox": DATA_SYNTHESIS_DIR / "blackbox",
-    "feature_guided": DATA_SYNTHESIS_DIR / "feature_guided",
-    "hybrid": DATA_SYNTHESIS_DIR / "hybrid",
-}
+sys.path.insert(0, str(DATA_SYNTHESIS_DIR))
 
-# The shared HTTP/env/rate-limit plumbing lives in blackbox/run_generation.py.
-sys.path.insert(0, str(SOURCE_DIRS["blackbox"]))
-
-from run_generation import (  # noqa: E402
-    DEFAULT_ENV_FILE,
-    FP8_DATA_DENY_MODEL_ID_FRAGMENTS,
-    MAX_RETRY_BACKOFF_SECONDS,
+from prompts import load_labeling_prompt  # noqa: E402
+from shared.benchmarks import (  # noqa: E402
+    DEFAULT_SEED_SET,
+    DOMAINS,
+    find_seed_file,
+    find_seed_file_by_name,
+    load_seed_labels,
+)
+from shared.openrouter import (  # noqa: E402
+    EndpointCatalog,
     RateLimiter,
+    add_api_args,
+    build_model_params,
     call_openrouter_chat,
-    load_dotenv,
+    require_api_key,
+    response_meta,
+    summarize_sampling_verification,
+    verify_call,
+)
+from shared.run_io import (  # noqa: E402
+    append_run_log,
+    format_wall_clock_slurm,
+    load_json_dict,
     load_json_list,
     save_json,
+    utc_now,
 )
 
-# Hardcoded analogously to run_generation.py's MODEL_ID/PROVIDER - independent of that
-# script's choice. --model selects one of these by keyword: keyword -> (model id, provider).
+SOURCES = ("blackbox", "feature_guided", "hybrid")
+
+# Labeling models, independent of the generator: --model keyword -> (model id, provider).
 MODEL_PRESETS = {
     "gpt": ("openai/gpt-4o-mini-2024-07-18", "openai"),
     "deepseek": ("deepseek/deepseek-v4-flash-0731", "baseten/fp8"),
 }
-DEFAULT_MODEL = "gpt"
-
-# If True, every request is pinned to --provider (via provider.only/allow_fallbacks=True), as
-# before. If False, requests are left free to be routed by OpenRouter across any provider that
-# satisfies provider.require_parameters (i.e. load-balanced across all eligible providers).
-PIN_PROVIDER = False
-
-# The deepseek-v4-flash family is the only model this "reasoning": {"enabled": False} override
-# is known to be needed/supported for; other models must not get it set.
-DEEPSEEK_V4_FLASH_MODEL_ID_FRAGMENT = "deepseek-v4-flash"
 
 MAX_UNPARSED_RETRIES = 3
 
@@ -120,38 +122,6 @@ LABELING_MODEL_PARAMS = {
     "max_tokens": 64,
     "usage": {"include": True},
 }
-
-
-def resolve_domain_dir(source: str, path_arg: str) -> Path:
-    """Resolves --path to a domain dir under <source>/ (e.g. blackbox/toxicity_detection),
-    or takes it as-is if it is already a full/relative path to an existing directory.
-    """
-    candidate = Path(path_arg)
-    under_source = SOURCE_DIRS[source] / candidate
-    if under_source.is_dir():
-        return under_source
-    if candidate.is_dir():
-        return candidate.resolve()
-    raise SystemExit(
-        f"--path '{path_arg}' does not resolve to a directory (tried '{under_source}' and '{candidate}')."
-    )
-
-
-def load_prompt_step_2_module(domain_name: str):
-    prompt_path = BASE_DIR / domain_name / "prompt" / "prompt_step_2.py"
-    if not prompt_path.exists():
-        raise SystemExit(f"Expected prompt module at {prompt_path}, but it does not exist.")
-    spec = importlib.util.spec_from_file_location(f"prompt_step_2_{domain_name}", prompt_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    for attr in ("SYSTEM_PROMPT", "LABEL_FRAGMENTS"):
-        if not hasattr(module, attr):
-            raise SystemExit(f"{prompt_path} is missing required attribute '{attr}'.")
-    # Optional: prepended to the text in the user message (e.g. cti_vsp's "CVE Description: ").
-    # Domains that don't set it (e.g. toxicity_detection) get the bare text, as before.
-    user_prompt_prefix = getattr(module, "USER_PROMPT_PREFIX", "")
-    return module.SYSTEM_PROMPT, module.LABEL_FRAGMENTS, user_prompt_prefix
 
 
 def resolve_input_json(domain_dir: Path, path_arg: Path) -> Path:
@@ -168,34 +138,22 @@ def output_prefix_from_input(input_json: Path) -> str:
     return stem[: -len(suffix)] if stem.endswith(suffix) else stem
 
 
-def find_log_file(domain_dir: Path, prefix: str) -> Path:
+def resolve_seed_file(domain: str, domain_dir: Path, prefix: str) -> Path:
+    """The seed_group TSV the run that produced <prefix>_accepted.json drew from, resolved in
+    benchmarks/ from the seed_set/seed_group of the first run in <prefix>_log.json (older logs
+    without seed_set used the k5 seed groups; logs without seed_group are matched by file name)."""
     log_path = domain_dir / "log" / f"{prefix}_log.json"
-    if not log_path.exists():
-        raise SystemExit(f"Expected log file at {log_path}, but it does not exist.")
-    return log_path
-
-
-def load_seed_labels(domain_dir: Path, prefix: str) -> dict[int, str]:
-    """Maps seed_example_id -> already-labeled answer line (e.g. "Answer: safe"), read
-    from the seed_group TSV used by the run that produced <prefix>_accepted.json (its
-    path is recorded in the first run entry of <prefix>_log.json).
-    """
-    log_path = find_log_file(domain_dir, prefix)
-    log_data = json.loads(log_path.read_text(encoding="utf-8"))
-    runs = log_data.get("runs") or []
+    runs = (load_json_dict(log_path) or {}).get("runs") or []
     if not runs:
-        raise SystemExit(f"{log_path} has no recorded runs; cannot determine the seed_group TSV used.")
-    seed_file = Path(runs[0]["seed_file"])
-    if not seed_file.exists():
-        raise SystemExit(f"Seed file recorded in {log_path} no longer exists: {seed_file}")
-
-    labels: dict[int, str] = {}
-    with open(seed_file, "r", encoding="utf-8", newline="") as f:
-        for i, row in enumerate(csv.reader(f, delimiter="\t")):
-            if len(row) < 2 or not row[0].strip():
-                continue
-            labels[i] = row[1].strip()
-    return labels
+        raise SystemExit(f"{log_path} is missing or has no recorded runs; cannot determine the seed group used.")
+    run = runs[0]
+    if run.get("seed_group"):
+        return find_seed_file(domain, run.get("seed_set", DEFAULT_SEED_SET), run["seed_group"])
+    name = PureWindowsPath(run["seed_file"]).name  # also splits the Windows paths of old logs
+    seed_file = find_seed_file_by_name(domain, name)
+    if seed_file is None:
+        raise SystemExit(f"Seed file {name!r} recorded in {log_path} not found under benchmarks/{domain}/.")
+    return seed_file
 
 
 def load_accepted_entries(accepted_path: Path) -> tuple[list[dict], list[dict]]:
@@ -217,7 +175,7 @@ def load_existing_labels(out_path: Path, fragments: dict, answer_regex: re.Patte
     as not-yet-labeled and retried.
 
     Each label is re-normalized through normalize_label_line() against the current
-    fragments/regex before being reused, so a formatting change to prompt_step_2.py's
+    fragments/regex before being reused, so a formatting change to prompts/<domain>/labeling.py's
     template is also applied to labels written by an earlier run, not just
     newly-labeled ones.
     """
@@ -310,6 +268,7 @@ class CallResult:
     error: str | None = None
     unparsed: bool = False
     raw_response: str = ""
+    openrouter_meta: dict = field(default_factory=dict)
 
 
 def fetch_one(ctx: WorkerContext, index: int, text: str) -> CallResult:
@@ -328,10 +287,16 @@ def fetch_one(ctx: WorkerContext, index: int, text: str) -> CallResult:
         return CallResult(index=index, text=text, ok=False, error=str(exc))
 
     raw_text = response["choices"][0]["message"].get("content") or ""
+    openrouter_meta = response_meta(response)
     label_line = normalize_label_line(raw_text, ctx.fragments, ctx.answer_regex)
     if label_line is None:
-        return CallResult(index=index, text=text, ok=True, label_line="", unparsed=True, raw_response=raw_text)
-    return CallResult(index=index, text=text, ok=True, label_line=label_line, raw_response=raw_text)
+        return CallResult(
+            index=index, text=text, ok=True, label_line="", unparsed=True, raw_response=raw_text,
+            openrouter_meta=openrouter_meta,
+        )
+    return CallResult(
+        index=index, text=text, ok=True, label_line=label_line, raw_response=raw_text, openrouter_meta=openrouter_meta
+    )
 
 
 def run_batch(ctx: WorkerContext, indices_and_texts: list[tuple[int, str]], max_workers: int) -> list[CallResult]:
@@ -346,135 +311,62 @@ def run_batch(ctx: WorkerContext, indices_and_texts: list[tuple[int, str]], max_
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Label synthetic blackbox/feature_guided examples for one domain via the OpenRouter API, "
-        "with the domain's labeling/<domain>/prompt/prompt_step_2.py system prompt. Model/provider/params are "
-        "independent of run_generation.py's - --model picks one of this script's MODEL_PRESETS "
-        f"({', '.join(f'{k}={v[0]}' for k, v in MODEL_PRESETS.items())})."
+        description="Label the synthetic examples of one generation run via the OpenRouter API, with the "
+        "domain's prompts/<domain>/labeling.py prompt."
     )
-    parser.add_argument(
-        "--source", type=str, required=True, choices=sorted(SOURCE_DIRS),
-        help="Generation method the input JSON comes from: 'blackbox', 'feature_guided', or 'hybrid'.",
-    )
-    parser.add_argument(
-        "--path", type=str, required=True,
-        help="Domain subfolder (e.g. 'toxicity_detection'), either a name under "
-        "<source>/ or a full/relative path to it. Output goes to labeling/<domain name>/.",
-    )
-    parser.add_argument(
-        "--model", type=str, default=DEFAULT_MODEL, choices=sorted(MODEL_PRESETS),
-        help="Labeling model keyword, mapped to an OpenRouter model id + provider via MODEL_PRESETS "
-        f"({', '.join(f'{k}={v[0]}' for k, v in MODEL_PRESETS.items())}; default: %(default)s).",
-    )
-    parser.add_argument(
-        "--provider", type=str, default=None,
-        help="OpenRouter provider slug to pin via provider.only when PIN_PROVIDER is set "
-        "(default: the --model preset's provider).",
-    )
-    parser.add_argument("--temperature", type=float, default=None, help="Override LABELING_MODEL_PARAMS['temperature'].")
-    parser.add_argument("--max-tokens", type=int, default=None, help="Override LABELING_MODEL_PARAMS['max_tokens'].")
-    parser.add_argument(
-        "--extra-params", type=str, default=None,
-        help="Additional OpenRouter request body parameters as a JSON object string.",
-    )
+    parser.add_argument("--source", type=str, required=True, choices=SOURCES,
+                        help="Generation arm the input JSON comes from.")
+    parser.add_argument("--domain", type=str, required=True, choices=DOMAINS)
+    parser.add_argument("--model", type=str, required=True, choices=sorted(MODEL_PRESETS),
+                        help="Labeling model: " + ", ".join(f"{k}={v[0]}" for k, v in MODEL_PRESETS.items()))
+    parser.add_argument("--provider", type=str, default=None,
+                        help="Provider slug to pin when PIN_PROVIDER is set (default: the preset's provider).")
     parser.add_argument(
         "--input-json", type=Path, required=True,
-        help="Accepted-pool JSON to label, as produced by <source>/run_generation.py (e.g. "
-        "'test_run_01_accepted.json' or 'output/test_run_01_accepted.json'). Only "
-        "non-seed entries are sent to the API; seed entries are pulled pre-labeled from "
-        "the seed_group TSV recorded in the matching log file.",
+        help="Accepted-pool JSON to label (e.g. 'cti_vsp_bb_deepseek_01_accepted.json', looked up in "
+        "<source>/<domain>/output/). Only non-seed entries are sent to the API.",
     )
-    parser.add_argument(
-        "--n", type=int, default=0,
-        help="Only label the first n non-seed examples (0 = all).",
-    )
-    parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE, help="Path to a .env file providing OPENROUTER_API_KEY.")
-    parser.add_argument("--request-timeout", type=float, default=120.0)
-    parser.add_argument(
-        "--max-retry-seconds", type=float, default=600.0,
-        help="Total wall-clock budget (seconds) to keep retrying a single failed HTTP request, with "
-        "exponentially increasing backoff between attempts (capped at %ds per wait), before giving up, "
-        "logging the call as an error, and moving on (default: %%(default)s = 10 minutes)." % MAX_RETRY_BACKOFF_SECONDS,
-    )
-    parser.add_argument(
-        "--requests-per-second", type=float, default=None,
-        help="Optional cap on request start rate, to respect the API's tps limit (default: unlimited).",
-    )
-    parser.add_argument(
-        "--max-concurrent-requests", type=int, default=1,
-        help="Number of worker threads (default: 1). Labeling calls are independent of "
-        "each other, so - unlike run_generation.py's generation calls - all of them are "
-        "simply submitted to the pool up front; results are written out in the original "
-        "entry order regardless of completion order.",
-    )
+    parser.add_argument("--n", type=int, default=0, help="Only label the first n non-seed examples (0 = all).")
+    add_api_args(parser)
     return parser
 
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    started_at = utc_now()
+    run_id = uuid.uuid4().hex
+    api_key = require_api_key(args.env_file)
 
-    load_dotenv(args.env_file)
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise SystemExit(f"OPENROUTER_API_KEY is not set. Set it in the environment or in {args.env_file}.")
-
-    domain_dir = resolve_domain_dir(args.source, args.path)
-    system_prompt, fragments, user_prompt_prefix = load_prompt_step_2_module(domain_dir.name)
+    domain_dir = DATA_SYNTHESIS_DIR / args.source / args.domain
+    prompt = load_labeling_prompt(args.domain)
+    system_prompt, fragments, user_prompt_prefix = prompt.system, prompt.fragments, prompt.user_prefix
     answer_regex = build_answer_regex(fragments)
 
     input_json = resolve_input_json(domain_dir, args.input_json)
     prefix = output_prefix_from_input(input_json)
 
     seed_entries, synthetic_entries = load_accepted_entries(input_json)
-    seed_labels = load_seed_labels(domain_dir, prefix)
+    seed_file = resolve_seed_file(args.domain, domain_dir, prefix)
+    seed_labels = load_seed_labels(seed_file)
 
     seed_rows: list[tuple[str, str]] = []
     for entry in seed_entries:
         seed_id = entry.get("seed_example_id")
-        label = seed_labels.get(seed_id)
-        if label is None:
-            raise SystemExit(f"No pre-labeled answer found for seed_example_id={seed_id} (text: {entry['text']!r}).")
-        seed_rows.append((entry["text"], label))
+        if seed_id is None or not 0 <= seed_id < len(seed_labels):
+            raise SystemExit(f"No label in {seed_file} for seed_example_id={seed_id} (text: {entry['text']!r}).")
+        seed_rows.append((entry["text"], seed_labels[seed_id]))
 
     if args.n > 0:
         synthetic_entries = synthetic_entries[: args.n]
 
-    output_dir = BASE_DIR / domain_dir.name
-    print(f"Source: {args.source} | domain: {domain_dir} | input: {input_json} | output dir: {output_dir}")
+    output_dir = BASE_DIR / args.domain
+    print(f"Source: {args.source} | domain: {domain_dir} | input: {input_json} | seeds: {seed_file} | output dir: {output_dir}")
     print(f"{len(seed_rows)} pre-labeled seed example(s), {len(synthetic_entries)} synthetic example(s) to label")
     model_id, provider = MODEL_PRESETS[args.model]
     if args.provider is not None:
         provider = args.provider
     print(f"Model: {args.model} -> {model_id} | provider: {provider}")
-
-    model_params = dict(LABELING_MODEL_PARAMS)
-    if DEEPSEEK_V4_FLASH_MODEL_ID_FRAGMENT in model_id:
-        model_params["reasoning"] = {"enabled": False}
-    if args.temperature is not None:
-        model_params["temperature"] = args.temperature
-    if args.max_tokens is not None:
-        model_params["max_tokens"] = args.max_tokens
-    if args.extra_params:
-        model_params.update(json.loads(args.extra_params))
-    if PIN_PROVIDER:
-        model_params["provider"] = {
-            **model_params.get("provider", {}),
-            "only": [provider],
-            "allow_fallbacks": True,
-            "require_parameters": True,
-        }
-    else:
-        model_params["provider"] = {
-            **model_params.get("provider", {}),
-            "require_parameters": True,
-        }
-    if any(fragment in model_id for fragment in FP8_DATA_DENY_MODEL_ID_FRAGMENTS):
-        model_params["provider"] = {
-            **model_params["provider"],
-            "quantizations": ["fp8"],
-            "allow_fallbacks": True,
-            "require_parameters": True,
-            "data_collection": "deny",
-        }
+    model_params = build_model_params(model_id, provider, LABELING_MODEL_PARAMS, args)
 
     ctx = WorkerContext(
         api_key=api_key,
@@ -489,10 +381,47 @@ def main() -> None:
         rate_limiter=RateLimiter(args.requests_per_second),
     )
 
+    endpoint_catalog = EndpointCatalog(model_id, args.request_timeout)
+    endpoint_catalog.refresh()
+
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / f"{prefix}.tsv"
     failed_path = output_dir / f"{prefix}_failed.json"
+    log_path = output_dir / "log" / f"{prefix}_log.json"
     failed_entries = load_json_list(failed_path)
+
+    call_records: list[dict] = []
+    token_totals = {"prompt_tokens": 0, "completion_tokens": 0}
+
+    def record_call(round_label: str, result: CallResult) -> None:
+        """Appends one log record per API call (main thread only - EndpointCatalog isn't thread-safe)."""
+        call_id = f"{run_id}_{len(call_records) + 1:06d}"
+        if not result.ok:
+            status = "api_error"
+        elif result.unparsed:
+            status = "unparsed"
+        else:
+            status = "labeled"
+        record = {
+            "call_id": call_id,
+            "call_number": len(call_records) + 1,
+            "round": round_label,
+            "index": result.index,
+            "text": result.text,
+            "status": status,
+            "label": result.label_line or None,
+            "raw_response": result.raw_response if result.ok else None,
+            "error": result.error,
+        }
+        if result.ok:
+            usage = result.openrouter_meta.get("usage") or {}
+            token_totals["prompt_tokens"] += usage.get("prompt_tokens") or 0
+            token_totals["completion_tokens"] += usage.get("completion_tokens") or 0
+            record["openrouter_response"] = result.openrouter_meta
+            record["sampling_verification"] = verify_call(
+                call_id, model_params, result.openrouter_meta.get("provider"), endpoint_catalog
+            )
+        call_records.append(record)
 
     def record_failure(round_label: str, result: CallResult) -> None:
         failed_entries.append(
@@ -503,7 +432,7 @@ def main() -> None:
                 "reason": "unparsed" if result.unparsed else "api_error",
                 "raw_response": result.raw_response if result.unparsed else None,
                 "error": result.error,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": utc_now(),
             }
         )
 
@@ -531,6 +460,7 @@ def main() -> None:
 
     results = run_batch(ctx, [(idx, entry["text"]) for idx, entry in to_label], args.max_concurrent_requests)
     for n_done, result in enumerate(results, start=1):
+        record_call("initial", result)
         if not result.ok:
             print(f"  [error] [{n_done}/{len(results)}] {result.error}", file=sys.stderr)
             record_failure("initial", result)
@@ -555,6 +485,7 @@ def main() -> None:
         )
         still_unresolved: list[int] = []
         for n_done, result in enumerate(retry_results, start=1):
+            record_call(f"retry_{attempt}", result)
             if not result.ok:
                 print(f"  [error] [retry {attempt}, {n_done}/{len(retry_results)}] {result.error}", file=sys.stderr)
                 record_failure(f"retry_{attempt}", result)
@@ -570,6 +501,7 @@ def main() -> None:
         unresolved_indices = still_unresolved
 
     n_majority_fallback = len(unresolved_indices)
+    majority_label = None
     if unresolved_indices:
         label_counts = Counter(results_by_index.values()) + Counter(label for _, label in seed_rows)
         label_counts.pop("", None)
@@ -604,6 +536,50 @@ def main() -> None:
         print(f"  unparsed_responses (first attempt): {n_unparsed}", file=sys.stderr)
     if n_majority_fallback:
         print(f"  majority_label_fallback (after {MAX_UNPARSED_RETRIES} retries): {n_majority_fallback}", file=sys.stderr)
+
+    finished_at = utc_now()
+    successful_calls = [c for c in call_records if c["status"] != "api_error"]
+    prompt_tokens = token_totals["prompt_tokens"]
+    completion_tokens = token_totals["completion_tokens"]
+    run_entry = {
+        "run_id": run_id,
+        "source": args.source,
+        "domain": args.domain,
+        "seed_file": str(seed_file),
+        "model": args.model,
+        "model_id": model_id,
+        "provider": provider,
+        "path": str(domain_dir),
+        "input_json": str(input_json),
+        "n_seed": len(seed_rows),
+        "n_synthetic": len(synthetic_entries),
+        "n_reused": len(synthetic_entries) - len(to_label),
+        "n_to_label": len(to_label),
+        "n_calls": len(call_records),
+        "n_failed_calls": len(call_records) - len(successful_calls),
+        "n_unparsed_calls": sum(1 for c in call_records if c["status"] == "unparsed"),
+        "n_failed_first_attempt": n_failed,
+        "n_unparsed_first_attempt": n_unparsed,
+        "n_majority_fallback": n_majority_fallback,
+        "majority_label": majority_label,
+        "max_unparsed_retries": MAX_UNPARSED_RETRIES,
+        "synthetic_label_counts": dict(Counter(label for _, label in synthetic_rows)),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "model_params": model_params,
+        "sampling_verification_summary": summarize_sampling_verification(successful_calls),
+        "endpoint_catalog": endpoint_catalog.snapshot(),
+        "endpoint_catalog_fetched_at": endpoint_catalog.fetched_at,
+        "output_file": str(out_path),
+        "failed_file": str(failed_path),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "wall_clock_time": format_wall_clock_slurm(started_at, finished_at),
+        "calls": call_records,
+    }
+    append_run_log(log_path, prefix, str(domain_dir), run_entry)
+    print(f"Tokens: prompt_tokens={prompt_tokens}, completion_tokens={completion_tokens}")
 
 
 if __name__ == "__main__":

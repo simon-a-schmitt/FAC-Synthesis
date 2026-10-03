@@ -1,3 +1,11 @@
+"""Generation prompts of the claudette_tos domain (terms-of-service sentences).
+
+SYSTEM_PROMPT is shared by every generation arm (blackbox, feature-guided, hybrid). The user prompt
+is BLACKBOX_TEMPLATE in the blackbox arm / hybrid phase 1 and FEATURE_GUIDED_TEMPLATE in the
+feature-guided arm / hybrid phase 2. Placeholders: {{SEED_EXAMPLES}} (numbered context examples),
+{{FEATURE_EXPLANATION}} / {{FEATURE_SPANS}} (target SAE feature, feature-guided only).
+"""
+
 SYSTEM_PROMPT = """
 You write single sentences from the terms of service of online platforms and
 consumer services. You produce input contexts for a training corpus. Clause
@@ -49,17 +57,50 @@ clause, and do not invent statutes or case numbers.
 """.strip()
 
 
-STEP_1_PROMPT_TEMPLATE = """
-SEEDS:
+BLACKBOX_TEMPLATE = """
+EXAMPLES:
 {{SEED_EXAMPLES}}
 
-Write one new terms-of-service sentence in the same register. Take the seeds
-as orientation for voice, form, and surface conventions only. Write about a
-different matter, for a different service.
+Write one new terms-of-service sentence in the same register. Take the
+examples as orientation for voice, form, and surface conventions only. Write
+about a different matter, for a different service.
 
-The seeds' length does not carry over. Their balance does not carry over
+The examples' length does not carry over. Their balance does not carry over
 either: what you write may be even-handed or one-sided, independently of the
-seeds.
+examples.
+
+Output the sentence only. No numbering, no headers, no blank lines, no
+commentary.
+""".strip()
+
+
+FEATURE_GUIDED_TEMPLATE = """
+EXAMPLES:
+{{SEED_EXAMPLES}}
+
+TARGET PATTERN:
+{{FEATURE_EXPLANATION}}
+
+Places where the pattern occurs. Each excerpt ends where the pattern is
+strongest, so its last word carries the peak:
+{{FEATURE_SPANS}}
+
+Write one new terms-of-service sentence in the same register. Take the
+examples as orientation for voice, form, and surface conventions only. Write
+about a different matter, for a different service.
+
+The sentence must contain a clear instance of the target pattern, carried by
+what the sentence states rather than placed at its edge. The excerpts come
+from general text: carry the pattern over into a terms-of-service sentence.
+Do not take over their topics, and do not copy them. Use only as much of
+their wording as the pattern itself requires. Their casing and punctuation do
+not carry over. Where the pattern and the examples pull in different
+directions, the pattern decides the content and the examples decide voice,
+form, and surface conventions.
+
+The examples' length does not carry over. Their balance does not carry over
+either: what you write may be even-handed or one-sided, independently of the
+examples. The target pattern does not decide the balance.
 
 Output the sentence only. No numbering, no headers, no blank lines, no
 commentary.

@@ -35,7 +35,6 @@ TOXICITY_SYSTEM_PROMPT = (
     f"{format_example(TOXICITY_FRAGMENTS)}"
 )
 
-# Generic aliases so run_labeling.py can load any domain's prompt_step_2.py the same way
-# run_generation.py loads prompt_step_1.py's SYSTEM_PROMPT / STEP_1_PROMPT_TEMPLATE.
+# Generic names every consumer (labeling, SAE checks, feature coverage, dataset building) reads.
 SYSTEM_PROMPT = TOXICITY_SYSTEM_PROMPT
 LABEL_FRAGMENTS = TOXICITY_FRAGMENTS

@@ -3,7 +3,7 @@
 Unlike toxicity_detection's single "<prefix>: <label>" line, a cti_vsp label is a full
 CVSS v3.1 Base vector with 8 independent metric fields. CVSS_FRAGMENTS (kind="vector")
 declares the exact output template and, for each metric, the letters the model is
-allowed to answer with - so the prompt's worked example and run_labeling.py's parser
+allowed to answer with - so the prompt's worked example and labeling/run_labeling.py's parser
 can never drift out of sync with each other. Seed_group TSVs must store their
 ground-truth label in this exact rendered format (e.g.
 "CVSS:3.1/AV: N/AC: L/PR: L/UI: N/S: U/C: H/I: H/A: H"), so seed and model-produced
@@ -79,8 +79,7 @@ CVSS_SYSTEM_PROMPT = (
 # rather than the bare text - matches the format the labeling prompt was designed around.
 CVSS_USER_PROMPT_PREFIX = "CVE Description: "
 
-# Generic aliases so run_labeling.py can load any domain's prompt_step_2.py the same way
-# run_generation.py loads prompt_step_1.py's SYSTEM_PROMPT / STEP_1_PROMPT_TEMPLATE.
+# Generic names every consumer (labeling, SAE checks, feature coverage, dataset building) reads.
 SYSTEM_PROMPT = CVSS_SYSTEM_PROMPT
 LABEL_FRAGMENTS = CVSS_FRAGMENTS
 USER_PROMPT_PREFIX = CVSS_USER_PROMPT_PREFIX

@@ -22,7 +22,8 @@ SAE_PATH="$WS_PATH/models/sae_llama_l16/TopK7_l16_h4096_epoch3.pth"
 SCRIPT_DIR="$WS_PATH/code/FAC-Synthesis/data_synthesis/hybrid"
 
 # Adjust per run.
-DOMAIN="toxicity_detection"
+DOMAIN="toxicity_detection"  # claudette_tos | cti_vsp | toxicity_detection
+SEED_SET="k5"  # k5 | k10
 SEED_GROUP="01"
 N_BLACKBOX=3
 N_FEATURE_GUIDED=3
@@ -35,7 +36,8 @@ MAX_CONCURRENT_REQUESTS=2
 mkdir -p logs
 
 python "$SCRIPT_DIR/run_generation.py" \
-    --path "$DOMAIN" \
+    --domain "$DOMAIN" \
+    --seed-set "$SEED_SET" \
     --seed-group "$SEED_GROUP" \
     --n-blackbox "$N_BLACKBOX" \
     --n-feature-guided "$N_FEATURE_GUIDED" \
