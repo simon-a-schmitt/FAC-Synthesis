@@ -10,7 +10,7 @@ pointed at directly:
     - "LTD: ...|TER: ...|CH: ...|CR: ...|USE: ...|LAW: ...|J: ...|ARB: ..." -> claudette_tos
 
 For all three tasks, the system prompt is loaded from each domain's
-data_synthesis/labeling/<domain>/prompt/prompt_step_2.py (SYSTEM_PROMPT), the same module
+data_synthesis/prompts/<domain>/labeling.py (SYSTEM_PROMPT), the same module
 run_labeling.py uses to obtain model labels in the first place. For cti_vsp, the
 instruction is additionally prefixed with "CVE Description: ".
 
@@ -70,10 +70,10 @@ def load_rows(tsv_path: Path) -> list[tuple[str, str]]:
 
 
 def load_system_prompt(domain: str) -> str:
-    prompt_path = BASE_DIR.parent / "data_synthesis" / "labeling" / domain / "prompt" / "prompt_step_2.py"
+    prompt_path = BASE_DIR.parent / "data_synthesis" / "prompts" / domain / "labeling.py"
     if not prompt_path.exists():
         raise SystemExit(f"Expected prompt module at {prompt_path}, but it does not exist.")
-    spec = importlib.util.spec_from_file_location(f"prompt_step_2_{domain}", prompt_path)
+    spec = importlib.util.spec_from_file_location(f"labeling_prompt_{domain}", prompt_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)

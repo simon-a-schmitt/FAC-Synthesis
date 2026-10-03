@@ -3,7 +3,7 @@ und die Total-Variation-Distanz (TV) jeder Datei zu einer Referenz-TSV (i.d.R. d
 Testset der Domain).
 
 Die Träger (Wertemengen) der Verteilungen stammen direkt aus den Label-Definitionen in
-    data_synthesis/labeling/<domain>/prompt/prompt_step_2.py
+    data_synthesis/prompts/<domain>/labeling.py
 damit Analyse, Labeling-Prompt und Parser nicht auseinanderlaufen.
 
 Pro Domain (--path):
@@ -47,14 +47,14 @@ from collections import Counter, OrderedDict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-LABELING_ROOT = REPO_ROOT / "data_synthesis" / "labeling"
+PROMPTS_ROOT = REPO_ROOT / "data_synthesis" / "prompts"
 BENCHMARK_ROOT = REPO_ROOT / "benchmarks"
 OUTPUT_DIR = Path(__file__).parent / "output"
 
 
 def load_prompt_module(domain_dir: str):
-    module_path = LABELING_ROOT / domain_dir / "prompt" / "prompt_step_2.py"
-    spec = importlib.util.spec_from_file_location(f"{domain_dir}_prompt_step_2", module_path)
+    module_path = PROMPTS_ROOT / domain_dir / "labeling.py"
+    spec = importlib.util.spec_from_file_location(f"{domain_dir}_labeling_prompt", module_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

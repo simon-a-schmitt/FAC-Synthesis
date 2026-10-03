@@ -3,7 +3,7 @@ measured exactly as in coverage_common.py / run_feature_coverage_reference.py):
 
   features_active_at_t<t>       number of SAE features active on the input TSV
   feature_coverage_at_t<t>      how many of the task-relevant features (label in --feature-labels in
-                                data_synthesis/data/feature_scores/<path>_feature_relevance_scores.jsonl)
+                                benchmarks/<path>/feature_scores/<path>_feature_relevance_scores.jsonl)
                                 are active on the input TSV - absolute and as fraction, plus per label
   feature_coverage_test_at_t<t> how many of the features active on the reference (test) data at t
                                 (run_feature_coverage_reference.py output) are also active on the input
@@ -72,7 +72,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--feature-scores", type=Path, default=None,
-        help="Feature relevance JSONL (default: data_synthesis/data/feature_scores/<path>_feature_relevance_scores.jsonl).",
+        help="Feature relevance JSONL (default: benchmarks/<path>/feature_scores/<path>_feature_relevance_scores.jsonl).",
     )
     parser.add_argument(
         "--feature-labels", type=str, nargs="+", default=DEFAULT_FEATURE_LABELS,
@@ -82,7 +82,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # Validate all inputs before loading the model.
-    feature_scores = args.feature_scores or cc.FEATURE_SCORES_DIR / f"{args.path}_feature_relevance_scores.jsonl"
+    feature_scores = args.feature_scores or cc.feature_scores_path(args.path)
     relevant = load_relevant_features(feature_scores, args.feature_labels)
     reference_path = args.reference_json or find_reference_json(args.path)
     reference = json.loads(reference_path.read_text(encoding="utf-8"))
