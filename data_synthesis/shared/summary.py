@@ -7,6 +7,21 @@ import json
 from collections import Counter
 
 
+# Candidates never checked because the phase's target was already reached (shared/generation.py).
+DISCARD_REASON = "target_reached"
+
+
+def split_discarded(rejected: list[dict], discarded: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(rejected, discarded) with the discarded candidates of older runs moved over: before the
+    "discarded" status existed, they were written to _rejected.json with rejected_reason
+    "target_reached". Reclassified in memory only (marked "_reclassified"); the files stay as they are."""
+    legacy = [e for e in rejected if e.get("rejected_reason") == DISCARD_REASON]
+    checked = [e for e in rejected if e.get("rejected_reason") != DISCARD_REASON]
+    reclassified = [{**e, "discarded_text": e.get("rejected_text"), "discarded_reason": DISCARD_REASON,
+                     "_reclassified": True} for e in legacy]
+    return checked, reclassified + discarded
+
+
 def format_seconds(seconds: float | None) -> str | None:
     """HH:MM:SS, as shared.run_io.format_wall_clock_slurm."""
     if seconds is None:

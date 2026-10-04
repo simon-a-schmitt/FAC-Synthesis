@@ -18,6 +18,11 @@ arm on the same seed group draws identical contexts. After the whole wave has re
 the results are applied strictly in slot order (never completion order), so a candidate is deduped
 against the snapshot plus whatever earlier slots of the same wave accepted. Outputs and the
 checkpoint are written after every wave; --resume continues from there.
+
+Discarded: once a phase has reached its target, the remaining candidates of the same wave are not
+checked at all. They are neither accepted nor rejected but "discarded" (reason "target_reached"),
+kept with their text in <prefix>_discarded.json (their API cost was paid) and counted separately
+(n_discarded), never in n_rejected.
 """
 
 from __future__ import annotations
@@ -64,6 +69,7 @@ from shared.run_io import (
     save_json,
     utc_now,
 )
+from shared.summary import DISCARD_REASON
 from shared.text_cleaning import assert_clean, load_seed_examples
 
 BASE_GENERATION_PARAMS = {
@@ -101,7 +107,7 @@ def add_generation_args(parser: argparse.ArgumentParser) -> None:
                         help="benchmarks/<domain>/seed_groups (k5) or seed_groups_k10 (k10) (default: %(default)s).")
     parser.add_argument("--seed-group", type=str, required=True, choices=SEED_GROUPS)
     parser.add_argument("--prefix", type=str, required=True,
-                        help="Filename prefix of the output (<prefix>_accepted/_rejected/_failed.json) and log files.")
+                        help="Filename prefix of the output (<prefix>_accepted/_rejected/_discarded/_failed.json) and log files.")
     parser.add_argument("--rouge-threshold", type=float, required=True,
                         help="Reject a candidate whose best ROUGE-L F-measure against seeds + accepted pool exceeds this.")
     parser.add_argument("--resume", action="store_true",
@@ -404,6 +410,7 @@ def new_phase_state(started_at: str) -> dict:
             "n_failed_calls": 0,
             "n_accepted_this_run": 0,
             "n_rejected_this_run": 0,
+            "n_discarded_this_run": 0,
             "n_rouge_duplicate": 0,
             "n_feature_inactive": 0,
             "total_prompt_tokens": 0,
@@ -423,8 +430,13 @@ class Phase:
     max_calls: int
     template: str
     rejected: list[dict]
+    discarded: list[dict]
     failed: list[dict]
     tag: str | None = None  # hybrid: "bb" / "fg" (call ids, file names, log lines)
+
+    def __post_init__(self):
+        # Checkpoints written before "discarded" existed lack the counter.
+        self.counters.setdefault("n_discarded_this_run", 0)
 
     @property
     def counters(self) -> dict:
@@ -442,6 +454,7 @@ class Phase:
             "n_failed_calls": c["n_failed_calls"],
             "n_accepted": c["n_accepted_this_run"],
             "n_rejected": c["n_rejected_this_run"],
+            "n_discarded": c["n_discarded_this_run"],
             "n_rouge_duplicate": c["n_rouge_duplicate"],
             "n_feature_inactive": c["n_feature_inactive"],
             "prompt_tokens": c["total_prompt_tokens"],
@@ -489,8 +502,8 @@ def process_call_result(run: GenerationRun, phase: Phase, result: CallResult, sl
 
     `checks` (feature-guided only) holds the SAE check of each candidate: {"active", "fields",
     "summary"}. Returns (outcome, per-candidate outcomes); outcome is "failed" (API error),
-    "accepted" (>= 1 candidate accepted), "rejected" (no candidate, or all rejected) or
-    "target_reached" (candidate never checked because the phase's target was already reached)."""
+    "accepted" (>= 1 candidate accepted), "rejected" (no candidate, or all checked ones rejected) or
+    "discarded" (every candidate discarded unchecked because the phase's target was already reached)."""
     counters = phase.counters
     context_texts = [c["text"] for c in result.context_examples]
     base = {
@@ -529,12 +542,12 @@ def process_call_result(run: GenerationRun, phase: Phase, result: CallResult, sl
         check_fields = check["fields"] if check else {}
         summary = f"{check['summary']} " if check else ""
         if phase.target_reached():
-            phase.rejected.append({**base, "rejected_text": text, "rejected_reason": "target_reached", **check_fields,
-                                   "context_examples": context_texts, "timestamp": utc_now()})
-            counters["n_rejected_this_run"] += 1
-            call_outcomes.append({"status": "rejected", "rejected_reason": "target_reached"})
-            if outcome == "rejected":
-                outcome = "target_reached"
+            phase.discarded.append({**base, "discarded_text": text, "discarded_reason": DISCARD_REASON, **check_fields,
+                                    "context_examples": context_texts, "timestamp": utc_now()})
+            counters["n_discarded_this_run"] += 1
+            call_outcomes.append({"status": "discarded", "discarded_reason": DISCARD_REASON})
+            if outcome == "rejected" and all(o["status"] == "discarded" for o in call_outcomes):
+                outcome = "discarded"
             continue
 
         tokens = rouge_tokenize(text)
@@ -563,6 +576,15 @@ def process_call_result(run: GenerationRun, phase: Phase, result: CallResult, sl
             outcome = "accepted"
             print(f"  [accept] ({counters['n_accepted_this_run']}/{phase.target_n}) {summary}rouge={score:.3f}: {text[:80]!r}")
     return outcome, call_outcomes
+
+
+def phase_counts_line(phase: Phase) -> str:
+    """accepted / rejected / discarded / failed of a phase, for the "Done:" lines."""
+    c = phase.counters
+    return (f"{c['n_accepted_this_run']} accepted / {c['n_rejected_this_run']} rejected "
+            f"({c['n_rouge_duplicate']} ROUGE duplicate, {c['n_feature_inactive']} feature inactive) / "
+            f"{c['n_discarded_this_run']} discarded ({DISCARD_REASON}) / {c['n_failed_calls']} failed call(s) "
+            f"over {c['n_calls']} call(s)")
 
 
 def run_phase(run: GenerationRun, phase: Phase, guidance=None) -> str | None:
@@ -667,12 +689,14 @@ def run_standalone_arm(args: argparse.Namespace, arm: str, arm_dir: Path, featur
     phase = Phase(
         PHASE_FEATURE_GUIDED if feature_guided else PHASE_BLACKBOX, state, args.n, max_calls,
         setup.prompts.feature_guided_template if feature_guided else setup.prompts.blackbox_template,
-        load_json_list(setup.output_path("rejected")), load_json_list(setup.output_path("failed")),
+        load_json_list(setup.output_path("rejected")), load_json_list(setup.output_path("discarded")),
+        load_json_list(setup.output_path("failed")),
     )
 
     def persist() -> None:
         pool.save(setup.output_path("accepted"))
         save_json(setup.output_path("rejected"), phase.rejected)
+        save_json(setup.output_path("discarded"), phase.discarded)
         save_json(setup.output_path("failed"), phase.failed)
         save_checkpoint(checkpoint_path, {"run_id": run_id, **state, "resolved_args": resolved_args})
 
@@ -698,6 +722,7 @@ def run_standalone_arm(args: argparse.Namespace, arm: str, arm_dir: Path, featur
         "endpoint_catalog_fetched_at": run.endpoint_catalog.fetched_at,
         "accepted_file": str(setup.output_path("accepted")),
         "rejected_file": str(setup.output_path("rejected")),
+        "discarded_file": str(setup.output_path("discarded")),
         "failed_file": str(setup.output_path("failed")),
         "started_at": state["started_at"],
         "finished_at": state["finished_at"],
@@ -706,10 +731,7 @@ def run_standalone_arm(args: argparse.Namespace, arm: str, arm_dir: Path, featur
         "calls": state["call_records"],
     })
     checkpoint_path.unlink(missing_ok=True)
-    c = phase.counters
-    print(f"Done: {c['n_accepted_this_run']} accepted / {c['n_rejected_this_run']} rejected "
-          f"({c['n_rouge_duplicate']} ROUGE duplicate, {c['n_feature_inactive']} feature inactive) over "
-          f"{c['n_calls']} call(s) ({c['n_failed_calls']} failed); prompt_tokens={c['total_prompt_tokens']}, "
-          f"completion_tokens={c['total_completion_tokens']}")
+    print(f"Done: {phase_counts_line(phase)}; prompt_tokens={phase.counters['total_prompt_tokens']}, "
+          f"completion_tokens={phase.counters['total_completion_tokens']}")
     if guidance:
         guidance.print_sae_summary()

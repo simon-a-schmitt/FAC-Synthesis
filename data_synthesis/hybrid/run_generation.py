@@ -13,8 +13,8 @@ shared/feature_guidance.FeatureGuidance in phase 2) and share one run_id, genera
       deduped against) a pool that already holds the blackbox examples.
 
 Output (hybrid/<domain>/output and /log, named after --prefix):
-  <prefix>_bb_accepted / _bb_rejected / _bb_failed.json, log/<prefix>_bb_log.json   phase 1
-  <prefix>_fg_accepted / _fg_rejected / _fg_failed.json, log/<prefix>_fg_log.json   phase 2
+  <prefix>_bb_accepted / _bb_rejected / _bb_discarded / _bb_failed.json, log/<prefix>_bb_log.json   phase 1
+  <prefix>_fg_accepted / _fg_rejected / _fg_discarded / _fg_failed.json, log/<prefix>_fg_log.json   phase 2
   <prefix>_accepted.json, log/<prefix>_log.json   seeds + both phases (each synthetic entry tagged
       with "phase") and a run summary - same naming as the other arms, so labeling works on it.
 A run always starts from the seeds alone (use a fresh --prefix); an interrupted run is continued
@@ -44,6 +44,7 @@ from shared.generation import (  # noqa: E402
     add_generation_args,
     default_max_calls,
     new_phase_state,
+    phase_counts_line,
     run_phase,
     setup_generation,
     start_run,
@@ -111,19 +112,21 @@ def main() -> None:
 
     pool = Pool.load(setup.output_path("accepted"), setup.seed_examples, started_at)
     rejected = {p: load_json_list(setup.output_path(f"{tag}_rejected")) for p, tag in PHASE_TAGS.items()}
+    discarded = {p: load_json_list(setup.output_path(f"{tag}_discarded")) for p, tag in PHASE_TAGS.items()}
     failed = {p: load_json_list(setup.output_path(f"{tag}_failed")) for p, tag in PHASE_TAGS.items()}
     targets = {PHASE_BLACKBOX: args.n_blackbox, PHASE_FEATURE_GUIDED: args.n_feature_guided}
     templates = {PHASE_BLACKBOX: setup.prompts.blackbox_template, PHASE_FEATURE_GUIDED: setup.prompts.feature_guided_template}
 
     def make_phase(name: str) -> Phase:
         return Phase(name, states[name], targets[name], max_calls[name], templates[name],
-                     rejected[name], failed[name], tag=PHASE_TAGS[name])
+                     rejected[name], discarded[name], failed[name], tag=PHASE_TAGS[name])
 
     def persist() -> None:
         pool.save(setup.output_path("accepted"))
         for name, tag in PHASE_TAGS.items():
             pool.save(setup.output_path(f"{tag}_accepted"), phase=name)
             save_json(setup.output_path(f"{tag}_rejected"), rejected[name])
+            save_json(setup.output_path(f"{tag}_discarded"), discarded[name])
             save_json(setup.output_path(f"{tag}_failed"), failed[name])
         save_checkpoint(checkpoint_path, {
             "run_id": run_id, "started_at": started_at, "phase": current,
@@ -144,6 +147,7 @@ def main() -> None:
             "endpoint_catalog_fetched_at": run.endpoint_catalog.fetched_at,
             "accepted_file": str(setup.output_path(f"{tag}_accepted")),
             "rejected_file": str(setup.output_path(f"{tag}_rejected")),
+            "discarded_file": str(setup.output_path(f"{tag}_discarded")),
             "failed_file": str(setup.output_path(f"{tag}_failed")),
             "started_at": state["started_at"],
             "finished_at": state["finished_at"],
@@ -197,6 +201,14 @@ def main() -> None:
         "n_accepted_blackbox": bb.counters["n_accepted_this_run"],
         "n_accepted_feature_guided": fg.counters["n_accepted_this_run"],
         "n_accepted": sum(p.counters["n_accepted_this_run"] for p in phases),
+        "n_rejected_blackbox": bb.counters["n_rejected_this_run"],
+        "n_rejected_feature_guided": fg.counters["n_rejected_this_run"],
+        "n_rejected": sum(p.counters["n_rejected_this_run"] for p in phases),
+        "n_discarded_blackbox": bb.counters["n_discarded_this_run"],
+        "n_discarded_feature_guided": fg.counters["n_discarded_this_run"],
+        "n_discarded": sum(p.counters["n_discarded_this_run"] for p in phases),
+        "n_failed_calls_blackbox": bb.counters["n_failed_calls"],
+        "n_failed_calls_feature_guided": fg.counters["n_failed_calls"],
         "n_calls_blackbox": bb.counters["n_calls"],
         "n_calls_feature_guided": fg.counters["n_calls"],
         "n_relevant_features": len(guidance.features),
@@ -221,6 +233,8 @@ def main() -> None:
     print(f"Done: {bb.counters['n_accepted_this_run']} blackbox + {fg.counters['n_accepted_this_run']} feature-guided "
           f"accepted over {bb.counters['n_calls']} + {fg.counters['n_calls']} call(s); "
           f"prompt_tokens={prompt_tokens}, completion_tokens={completion_tokens}")
+    print(f"  blackbox:       {phase_counts_line(bb)}")
+    print(f"  feature-guided: {phase_counts_line(fg)}")
     guidance.print_sae_summary()
 
 

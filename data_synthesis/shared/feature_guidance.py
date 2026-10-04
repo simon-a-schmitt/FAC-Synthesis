@@ -19,7 +19,7 @@ Schedule:
     features; passes repeat until the target is reached.
   - Within a pass each feature gets up to --attempts-per-feature calls and is done after its first
     accepted candidate. A call is an attempt if the API returned a response and it was checked
-    (failed calls / target_reached candidates are not). A feature whose attempts in a pass all end
+    (failed calls / discarded candidates are not). A feature whose attempts in a pass all end
     in rejections is exhausted and skipped in every later pass.
   - A wave holds at most one call per feature, so "done after the first accept" holds exactly.
 
@@ -398,7 +398,7 @@ class FeatureGuidance:
 
     def _update_schedule(self, feature_id: int, outcome: str) -> None:
         if outcome not in ("accepted", "rejected"):
-            return  # API failure / never checked: not an attempt
+            return  # API failure / discarded (never checked): not an attempt
         schedule, key = self.schedule, str(feature_id)
         schedule["pass_attempts"][key] = schedule["pass_attempts"].get(key, 0) + 1
         if outcome == "accepted":
@@ -476,10 +476,12 @@ class FeatureGuidance:
         elif not call_outcomes:
             stats["no_candidate"] += 1
         for call_outcome in call_outcomes:
+            if call_outcome["status"] == "discarded":
+                continue  # never checked
             reason = "accepted" if call_outcome["status"] == "accepted" else call_outcome["rejected_reason"]
             if reason in stats:
                 stats[reason] += 1
-        # Every SAE pass of the call ran (also those of later target_reached candidates).
+        # Every SAE pass of the call ran (also those of later discarded candidates).
         for check in checks:
             add_sae_pass(self.state["counters"]["sae_candidate_check"],
                          check["fields"]["sae_n_forward_tokens"], check["fields"]["sae_seconds"])

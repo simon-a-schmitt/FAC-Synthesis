@@ -6,7 +6,7 @@ feature-guided phase (<prefix>_fg_*) of every run. Requires hybrid/<domain>/outp
 and _bb_rejected.json plus at least one of hybrid/<domain>/log/<prefix>_bb_log.json (runs whose blackbox
 phase completed) and hybrid/<domain>/output/<prefix>_checkpoint.json (a run that has not finished yet;
 reported with "status": "incomplete" and the phase it stopped in). The _fg_* files, _fg_log.json,
-_log.json and both _failed.json files are read if present. Computes, in total and per run_id:
+_log.json and both _discarded.json and _failed.json files are read if present. Computes, in total and per run_id:
   - overall: API calls, token usage and samples of both phases together, plus the token usage
     split by phase ("tokens_by_phase": total / blackbox / feature_guided).
   - blackbox: the blackbox phase, counted as in the blackbox summary (only "rouge_duplicate" is
@@ -17,9 +17,11 @@ _log.json and both _failed.json files are read if present. Computes, in total an
     the candidate checks and of the seed + blackbox coverage check (not tracked by older runs).
   - coverage (per run): relevant features covered by the seeds, by the blackbox examples, by the
     blackbox examples only, and left uncovered (= the features of pass 0), in total and per label.
-In every phase, "target_reached" samples (never checked, the phase's target already reached) are
-reported separately under "target_reached" and left out of the sample counts and the SAE compute;
-a call whose every sample was target_reached is likewise left out of the call count and tokens.
+In every phase, discarded samples (reason "target_reached": never checked, the phase's target
+already reached) are reported separately under "discarded" and left out of the sample counts, the
+acceptance rate (accepted / (accepted + rejected)) and the SAE compute; a call whose every sample was
+discarded is likewise left out of the call count and tokens. Older runs stored discarded samples in
+_rejected.json (rejected_reason "target_reached"); they are reclassified on reading.
 Writes hybrid/<domain>/log/<prefix>_summary.json.
 
 Calls and samples are joined on (run_id, wave_idx, slot_index) WITHIN a phase: both phases share
@@ -44,7 +46,7 @@ from feature_guided import summarize_generation_run as fgs  # noqa: E402
 from shared.benchmarks import DOMAINS  # noqa: E402
 from shared.generation import PHASE_BLACKBOX, PHASE_FEATURE_GUIDED  # noqa: E402
 from shared.run_io import load_json_dict, load_json_list, save_json, utc_now  # noqa: E402
-from shared.summary import is_generation_failure, slot_key, verification_summary  # noqa: E402
+from shared.summary import is_generation_failure, slot_key, split_discarded, verification_summary  # noqa: E402
 
 PHASES = (PHASE_BLACKBOX, PHASE_FEATURE_GUIDED)
 TOKEN_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens", "cached_prompt_tokens", "cost")
@@ -56,11 +58,11 @@ def sum_tokens(blocks: list[dict]) -> dict:
     return total
 
 
-def counted_calls(call_records: list[dict], accepted: list[dict], rejected: list[dict]) -> list[dict]:
-    """The calls both summaries count: all but those whose every sample was target_reached."""
-    checked_keys = {e["_key"] for e in accepted + rejected if e.get("rejected_reason") != fgs.TARGET_REACHED_REASON}
-    tr_keys = {e["_key"] for e in rejected if e.get("rejected_reason") == fgs.TARGET_REACHED_REASON} - checked_keys
-    return [c for c in call_records if c["_key"] not in tr_keys]
+def counted_calls(call_records: list[dict], accepted: list[dict], rejected: list[dict], discarded: list[dict]) -> list[dict]:
+    """The calls both summaries count: all but those whose every sample was discarded."""
+    checked_keys = {e["_key"] for e in accepted + rejected}
+    dc_keys = {e["_key"] for e in discarded} - checked_keys
+    return [c for c in call_records if c["_key"] not in dc_keys]
 
 
 # ---------------------------------------------------------------------------
@@ -184,9 +186,10 @@ def coverage(run: dict) -> dict | None:
 # Per-phase / overall stats
 # ---------------------------------------------------------------------------
 
-def blackbox_stats(calls: list[dict], accepted: list[dict], rejected: list[dict], failed: list[dict]) -> dict:
+def blackbox_stats(calls: list[dict], accepted: list[dict], rejected: list[dict], discarded: list[dict],
+                   failed: list[dict]) -> dict:
     """The blackbox summary's counts, in the feature-guided summary's layout."""
-    s = bbs.run_stats(calls, accepted, rejected, failed)
+    s = bbs.run_stats(calls, accepted, rejected, discarded, failed)
     return {
         "api": {
             "n_calls": s["n_calls"],
@@ -202,12 +205,13 @@ def blackbox_stats(calls: list[dict], accepted: list[dict], rejected: list[dict]
             "n_rejected_rouge_duplicate": s["n_rejected"],
             "acceptance_rate": s["acceptance_rate"],
         },
-        "target_reached": s["target_reached"],
+        "discarded": s["discarded"],
     }
 
 
-def feature_guided_stats(runs: list[dict], accepted: list[dict], rejected: list[dict], failed: list[dict]) -> dict:
-    stats = fgs.run_stats([fg_summary_run(r) for r in runs], accepted, rejected, failed)
+def feature_guided_stats(runs: list[dict], accepted: list[dict], rejected: list[dict], discarded: list[dict],
+                         failed: list[dict]) -> dict:
+    stats = fgs.run_stats([fg_summary_run(r) for r in runs], accepted, rejected, discarded, failed)
     stats.pop("seed_check", None)
     triggering = stats.pop("feature_triggering", None)
     if triggering is not None:
@@ -244,18 +248,18 @@ def overall_stats(phase_stats: dict[str, dict], counted: list[dict]) -> dict:
         },
         "tokens_by_phase": {"total": sum_tokens(list(tokens_by_phase.values())), **tokens_by_phase},
         "samples": samples,
-        "target_reached": {
-            "n_samples": sum(s["target_reached"]["n_samples"] for s in both),
-            "n_calls": sum(s["target_reached"]["n_calls"] for s in both),
-            "tokens": sum_tokens([s["target_reached"]["tokens"] for s in both]),
+        "discarded": {
+            "reason": fg_s["discarded"]["reason"],
+            **{key: sum(s["discarded"][key] for s in both) for key in ("n_samples", "n_reclassified_from_rejected", "n_calls")},
+            "tokens": sum_tokens([s["discarded"]["tokens"] for s in both]),
             # Only the feature-guided phase runs candidates through the SAE.
-            "sae": fg_s["target_reached"]["sae"],
+            "sae": fg_s["discarded"]["sae"],
         },
     }
 
 
 def hybrid_stats(runs: list[dict], data: dict[str, dict[str, list[dict]]]) -> dict:
-    """Stats over the given runs; data[phase] holds that phase's accepted/rejected/failed entries."""
+    """Stats over the given runs; data[phase] holds that phase's accepted/rejected/discarded/failed entries."""
     run_ids = {r["run_id"] for r in runs}
     picked = {
         phase: {kind: [e for e in entries if e.get("run_id") in run_ids] for kind, entries in data[phase].items()}
@@ -268,7 +272,7 @@ def hybrid_stats(runs: list[dict], data: dict[str, dict[str, list[dict]]]) -> di
     }
     counted = [
         c for phase in PHASES
-        for c in counted_calls(calls[phase], picked[phase]["accepted"], picked[phase]["rejected"])
+        for c in counted_calls(calls[phase], picked[phase]["accepted"], picked[phase]["rejected"], picked[phase]["discarded"])
     ]
     stats = {"overall": overall_stats(phase_stats, counted), **phase_stats}
     if len(runs) == 1:
@@ -293,7 +297,7 @@ def main() -> None:
     log_dir = domain_dir / "log"
     files = {
         **{f"{p}_{kind}": output_dir / f"{args.prefix}_{p}_{kind}.json"
-           for p in ("bb", "fg") for kind in ("accepted", "rejected", "failed")},
+           for p in ("bb", "fg") for kind in ("accepted", "rejected", "discarded", "failed")},
         "accepted": output_dir / f"{args.prefix}_accepted.json",
         "checkpoint": output_dir / f"{args.prefix}_checkpoint.json",
         "bb_log": log_dir / f"{args.prefix}_bb_log.json",
@@ -308,9 +312,12 @@ def main() -> None:
 
     data: dict[str, dict[str, list[dict]]] = {}
     for phase, short in zip(PHASES, ("bb", "fg")):
+        rejected, discarded = split_discarded(load_json_list(files[f"{short}_rejected"]),
+                                              load_json_list(files[f"{short}_discarded"]))
         data[phase] = {
             "accepted": [e for e in load_json_list(files[f"{short}_accepted"]) if e.get("type") == "synthetic"],
-            "rejected": load_json_list(files[f"{short}_rejected"]),
+            "rejected": rejected,
+            "discarded": discarded,
             "failed": [e for e in load_json_list(files[f"{short}_failed"]) if is_generation_failure(e)],
         }
         for entries in data[phase].values():
@@ -340,9 +347,11 @@ def main() -> None:
         "counting_rules": (
             "Each phase is counted on its own files. Blackbox phase: only 'rouge_duplicate' is a rejection. "
             "Feature-guided phase: 'feature_inactive' (SAE activation check) and 'rouge_duplicate' (ROUGE-L dedup). "
-            "n_generated = n_accepted + n_rejected. 'target_reached' samples and their calls are reported under "
-            "'target_reached' and excluded from api, samples and sae (target_reached.sae holds the SAE passes of "
-            "exactly the target_reached samples, also those of calls that produced a checked sample). overall = blackbox + feature_guided; "
+            "n_generated = n_accepted + n_rejected; acceptance_rate = n_accepted / n_generated. Discarded samples "
+            "(reason 'target_reached', never checked; in older runs stored in _rejected.json and reclassified on "
+            "reading) and their calls are reported under 'discarded' and excluded from api, samples and sae "
+            "(discarded.sae holds the SAE passes of exactly the discarded samples, also those of calls that produced "
+            "a checked sample). overall = blackbox + feature_guided; "
             "tokens_by_phase splits overall.api.tokens. Feature triggering and mean_attempts_to_reach as in "
             "feature_guided/summarize_generation_run.py, with pass 0 = the relevant features covered neither by the "
             "seeds nor by the blackbox examples."
@@ -365,12 +374,13 @@ def main() -> None:
             print(f"    tokens {name:<14}: prompt {tokens['prompt_tokens']} + completion {tokens['completion_tokens']} "
                   f"= total {tokens['total_tokens']} (cost {tokens['cost']})")
         for name, block in (("overall", overall), *((p, run[p]) for p in PHASES)):
-            api, samples, tr = block["api"], block["samples"], block["target_reached"]
+            api, samples, dc = block["api"], block["samples"], block["discarded"]
             print(f"    {name:<14}: {api['n_calls']} call(s) ({api['n_failed_calls']} failed), "
                   f"generated {samples['n_generated']} = accepted {samples['n_accepted']} + rejected {samples['n_rejected']} "
                   f"(feature inactive {samples.get('n_rejected_feature_inactive', 0)}, "
                   f"ROUGE duplicate {samples['n_rejected_rouge_duplicate']}) -> acceptance rate {samples['acceptance_rate']}; "
-                  f"excluded target_reached {tr['n_samples']} sample(s) / {tr['n_calls']} call(s)")
+                  f"discarded {dc['n_samples']} sample(s) [{dc['n_reclassified_from_rejected']} reclassified] / "
+                  f"{dc['n_calls']} call(s)")
         cov = run.get("coverage")
         if cov is not None:
             labels = ", ".join(f"{label} {v['n_uncovered']}/{v['n_relevant']}" for label, v in (cov["by_label"] or {}).items())
@@ -392,9 +402,9 @@ def main() -> None:
             cov_sae = sae["coverage_check"]
             print("    SAE coverage check: " + ("not tracked (older run)" if cov_sae is None else
                   f"{cov_sae['n_forward_passes']} forward pass(es), {cov_sae['gpu_seconds']:.2f} s"))
-            tr_sae = run[PHASE_FEATURE_GUIDED]["target_reached"]["sae"]
-            print(f"    excluded SAE of target_reached samples: {tr_sae['n_forward_passes']} forward pass(es), "
-                  f"{tr_sae['gpu_seconds']:.2f} s")
+            dc_sae = run[PHASE_FEATURE_GUIDED]["discarded"]["sae"]
+            print(f"    excluded SAE of discarded samples: {dc_sae['n_forward_passes']} forward pass(es), "
+                  f"{dc_sae['gpu_seconds']:.2f} s")
         else:
             print("    SAE: not tracked for this run")
     if len(runs) > 1:

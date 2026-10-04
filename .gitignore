@@ -227,6 +227,29 @@ sae_feature_analysis/interpret_features_exp/xxx
 
 
 models--mistralai--Mistral-7B-Instruct-v0.2
+models--meta-llama--Llama-3.1-8B-Instruct
 
 
-fine_tuning/casehold_gold_*
+fine_tuning/casehold_gold*
+fine_tuning/cti_vsp*
+fine_tuning/*
+
+
+benchmark_play_ground/archive
+
+*.tsv
+
+*.json
+*.jsonl
+*.txt
+*.pkl
+
+*.npz
+*.npy
+
+
+**/logs/*.out
+**/logs/*.err
+# Per-run artifacts of the experiment orchestration (experiments/runs.py)
+experiments/runs/*
+!experiments/runs/.gitkeep

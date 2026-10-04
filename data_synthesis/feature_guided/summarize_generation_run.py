@@ -1,30 +1,32 @@
 """Summarize a feature-guided generation run (all runs written under one --prefix) into a JSON file.
 
 Feature-guided counterpart of ../blackbox/summarize_generation_run.py. Requires
-feature_guided/<domain>/output/<prefix>_accepted.json and _rejected.json plus at least one of
+feature_guided/<domain>/output/<prefix>_accepted.json and _rejected.json (_discarded.json if present) plus at least one of
 feature_guided/<domain>/log/<prefix>_log.json (completed runs) and feature_guided/<domain>/output/<prefix>_checkpoint.json (a run
 that has not reached --n yet, e.g. between two --resume invocations; reported with
 "status": "incomplete"). feature_guided/<domain>/output/<prefix>_failed.json is read if present. Computes, in total
 and per run_id:
   - API: calls (successful / failed) and token usage summed over the calls' OpenRouter usage, plus
     the provider/sampling-parameter verification. As in the blackbox summary, a call whose every
-    sample was rejected as "target_reached" (never checked, --n already reached) is reported
-    separately and left out of the call count, the tokens and the acceptance rate.
+    sample was discarded (reason "target_reached": never checked, --n already reached) is reported
+    separately under "discarded" and left out of the call count, the tokens and the acceptance rate.
+    Discarded samples of older runs, stored in _rejected.json, are reclassified on reading.
   - Samples: n_generated = n_accepted + n_rejected, with n_rejected split into
-    "feature_inactive" (SAE activation check) and "rouge_duplicate" (ROUGE-L dedup).
+    "feature_inactive" (SAE activation check) and "rouge_duplicate" (ROUGE-L dedup);
+    acceptance rate = n_accepted / n_generated.
   - Seed check: task-relevant features (per label, e.g. Yes/Probably/Maybe) and how many of them
     the seeds already cover vs. how many were left missing (= the features of pass 0).
   - Feature triggering: which features were attempted, reached (>= 1 accepted sample), exhausted
     (no accepted sample after --attempts-per-feature attempts in a pass) or still open (the run
     ended first), and the mean number of attempts reached features needed. An attempt is a call
-    that returned a response and was checked, i.e. neither failed nor target_reached - exactly
+    that returned a response and was checked, i.e. neither failed nor discarded - exactly
     what the run's feature schedule counts. Reported for pass 0 (the seed-missing features), per
     pass, and over all passes (a feature counts as reached once, with the attempts of its first
     successful pass).
   - SAE compute: forward passes, forward tokens and net GPU seconds of the seed check and of the
     candidate activation checks (for runs of run_generation.py versions that tracked it; older
-    runs report null). The SAE passes of target_reached samples did run, but are left out of
-    these numbers like their tokens and reported on their own under "target_reached".
+    runs report null). The SAE passes of discarded samples did run, but are left out of these
+    numbers like their tokens and reported on their own under "discarded".
 and writes it to feature_guided/<domain>/log/<prefix>_summary.json.
 
 Calls and samples are joined on (run_id, wave_idx, slot_index), which every version of
@@ -48,15 +50,16 @@ from shared.benchmarks import DOMAINS  # noqa: E402
 from shared.feature_guidance import load_features  # noqa: E402
 from shared.run_io import load_json_dict, load_json_list, save_json, utc_now  # noqa: E402
 from shared.summary import (  # noqa: E402
+    DISCARD_REASON,
     format_seconds,
     is_generation_failure,
     slot_key,
+    split_discarded,
     sum_usage,
     verification_summary,
 )
 
 REJECTION_REASONS = ("feature_inactive", "rouge_duplicate")
-TARGET_REACHED_REASON = "target_reached"
 SAE_STAT_KEYS = ("n_forward_passes", "n_forward_tokens", "gpu_seconds")
 
 
@@ -206,7 +209,7 @@ def feature_attempts(call_records: list[dict], accepted_keys: set, checked_keys:
     for record in sorted(call_records, key=lambda r: (r.get("wave_idx", 0), r.get("slot_index", 0))):
         key = record["_key"]
         if record.get("n_parsed_candidates", 0) > 0 and key not in checked_keys:
-            continue  # target_reached only: never checked, not an attempt
+            continue  # discarded only: never checked, not an attempt
         entry = per_pass.setdefault(
             (record.get("pass_idx", 0), record["feature_id"]),
             {"label": record.get("feature_label"), "attempts": 0, "reached_at_attempt": None},
@@ -317,54 +320,54 @@ def sae_from_samples(samples: list[dict]) -> dict:
     }
 
 
-def sae_stats(runs: list[dict], tr_samples: list[dict]) -> tuple[dict, dict | None]:
-    """(SAE block without target_reached samples, SAE block of the target_reached samples).
-    The runs' candidate-check counters include the target_reached samples (their SAE pass ran
+def sae_stats(runs: list[dict], dc_samples: list[dict]) -> tuple[dict, dict | None]:
+    """(SAE block without discarded samples, SAE block of the discarded samples).
+    The runs' candidate-check counters include the discarded samples (their SAE pass ran
     before the target check), so these are subtracted sample by sample - also those of calls
     that additionally produced a checked sample."""
     tracked = [r for r in runs if r["sae_tracked"]]
     if not tracked:
         return {"tracked": False, "note": "SAE compute was not tracked by the generator version of these run(s)."}, None
     tracked_ids = {r["run_id"] for r in tracked}
-    tr_tracked = [e for e in tr_samples if e.get("run_id") in tracked_ids]
-    tr_complete = all("sae_seconds" in e and "sae_n_forward_tokens" in e for e in tr_tracked)
-    tr = sae_from_samples([e for e in tr_tracked if "sae_seconds" in e and "sae_n_forward_tokens" in e])
+    dc_tracked = [e for e in dc_samples if e.get("run_id") in tracked_ids]
+    dc_complete = all("sae_seconds" in e and "sae_n_forward_tokens" in e for e in dc_tracked)
+    dc = sae_from_samples([e for e in dc_tracked if "sae_seconds" in e and "sae_n_forward_tokens" in e])
     seed = sum_sae([r["sae_seed_check"] for r in tracked])
     candidate_all = sum_sae([r["sae_candidate_check"] for r in tracked])
-    candidate = {k: candidate_all[k] - tr[k] for k in SAE_STAT_KEYS} if candidate_all is not None else None
+    candidate = {k: candidate_all[k] - dc[k] for k in SAE_STAT_KEYS} if candidate_all is not None else None
     if candidate is not None:
         candidate["gpu_seconds"] = round(max(candidate["gpu_seconds"], 0.0), 6)
     total = sum_sae([seed, candidate])
     return {
         "tracked": True,
-        "tracking_complete": (len(tracked) == len(runs) and tr_complete
+        "tracking_complete": (len(tracked) == len(runs) and dc_complete
                               and all(r["sae_tracking_complete"] for r in tracked)),
         "seed_check": sae_block(seed),
         "candidate_check": sae_block(candidate),
         "total": sae_block(total),
-    }, sae_block(tr)
+    }, sae_block(dc)
 
 
 # ---------------------------------------------------------------------------
 # Per-run / total stats
 # ---------------------------------------------------------------------------
 
-def run_stats(runs: list[dict], accepted: list[dict], rejected: list[dict], failed: list[dict]) -> dict:
+def run_stats(runs: list[dict], accepted: list[dict], rejected: list[dict], discarded: list[dict],
+              failed: list[dict]) -> dict:
     call_records = [c for r in runs for c in r["calls"]]
     by_reason = {reason: [e for e in rejected if e.get("rejected_reason") == reason] for reason in REJECTION_REASONS}
-    target_reached = [e for e in rejected if e.get("rejected_reason") == TARGET_REACHED_REASON]
     checked = accepted + by_reason["feature_inactive"] + by_reason["rouge_duplicate"]
     accepted_keys = {e["_key"] for e in accepted}
     checked_keys = {e["_key"] for e in checked}
 
-    tr_call_keys = {e["_key"] for e in target_reached} - checked_keys
-    counted_calls = [c for c in call_records if c["_key"] not in tr_call_keys]
-    tr_calls = [c for c in call_records if c["_key"] in tr_call_keys]
+    dc_call_keys = {e["_key"] for e in discarded} - checked_keys
+    counted_calls = [c for c in call_records if c["_key"] not in dc_call_keys]
+    dc_calls = [c for c in call_records if c["_key"] in dc_call_keys]
 
     n_accepted = len(accepted)
     n_rejected = sum(len(v) for v in by_reason.values())
     n_generated = n_accepted + n_rejected
-    sae, tr_sae = sae_stats(runs, target_reached)
+    sae, dc_sae = sae_stats(runs, discarded)
     stats = {
         "api": {
             "n_calls": len(counted_calls) + len(failed),
@@ -383,11 +386,13 @@ def run_stats(runs: list[dict], accepted: list[dict], rejected: list[dict], fail
             "acceptance_rate": round(n_accepted / n_generated, 4) if n_generated else None,
         },
         # Reported only, excluded from api, samples and sae.
-        "target_reached": {
-            "n_samples": len(target_reached),
-            "n_calls": len(tr_calls),
-            "tokens": sum_usage(tr_calls),
-            "sae": tr_sae,
+        "discarded": {
+            "reason": DISCARD_REASON,
+            "n_samples": len(discarded),
+            "n_reclassified_from_rejected": sum(1 for e in discarded if e.get("_reclassified")),
+            "n_calls": len(dc_calls),
+            "tokens": sum_usage(dc_calls),
+            "sae": dc_sae,
         },
         "sae": sae,
     }
@@ -416,6 +421,7 @@ def main() -> None:
     files = {
         "accepted": output_dir / f"{args.prefix}_accepted.json",
         "rejected": output_dir / f"{args.prefix}_rejected.json",
+        "discarded": output_dir / f"{args.prefix}_discarded.json",
         "failed": output_dir / f"{args.prefix}_failed.json",
         "log": log_dir / f"{args.prefix}_log.json",
         "checkpoint": output_dir / f"{args.prefix}_checkpoint.json",
@@ -427,14 +433,14 @@ def main() -> None:
         raise SystemExit(f"Neither {files['log']} nor {files['checkpoint']} exists for prefix {args.prefix!r}.")
 
     accepted = [e for e in load_json_list(files["accepted"]) if e.get("type") == "synthetic"]
-    rejected = load_json_list(files["rejected"])
+    rejected, discarded = split_discarded(load_json_list(files["rejected"]), load_json_list(files["discarded"]))
     failed = [e for e in load_json_list(files["failed"]) if is_generation_failure(e)]
     runs = [run_from_log(r) for r in (load_json_dict(files["log"]) or {}).get("runs", [])]
     checkpoint = load_json_dict(files["checkpoint"])
     if checkpoint is not None:
         runs.append(run_from_checkpoint(checkpoint))
 
-    for entry in accepted + rejected + failed:
+    for entry in accepted + rejected + discarded + failed:
         entry["_key"] = slot_key(entry.get("run_id"), entry)
     for run in runs:
         for record in run["calls"]:
@@ -453,6 +459,7 @@ def main() -> None:
                     [run],
                     [e for e in accepted if e.get("run_id") == run_id],
                     [e for e in rejected if e.get("run_id") == run_id],
+                    [e for e in discarded if e.get("run_id") == run_id],
                     [e for e in failed if e.get("run_id") == run_id],
                 ),
             }
@@ -460,7 +467,7 @@ def main() -> None:
 
     run_ids = {run["run_id"] for run in runs}
     in_runs = lambda entries: [e for e in entries if e.get("run_id") in run_ids]  # noqa: E731
-    totals = {"n_runs": len(runs), **run_stats(runs, in_runs(accepted), in_runs(rejected), in_runs(failed))}
+    totals = {"n_runs": len(runs), **run_stats(runs, in_runs(accepted), in_runs(rejected), in_runs(discarded), in_runs(failed))}
     if len(runs) == 1:
         # Same run as runs[0]; per-run blocks already hold them.
         totals.pop("seed_check", None)
@@ -472,10 +479,12 @@ def main() -> None:
         "generated_at": utc_now(),
         "counting_rules": (
             "Rejections are 'feature_inactive' (SAE activation check) and 'rouge_duplicate' (ROUGE-L dedup); "
-            "n_generated = n_accepted + n_rejected. 'target_reached' samples and their calls are reported under "
-            "'target_reached' and excluded from api, samples and sae (target_reached.sae holds the SAE passes of "
-            "exactly the target_reached samples, also those of calls that produced a checked sample). A feature attempt is a call that returned a "
-            "response and was checked (not failed, not target_reached). mean_attempts_to_reach = mean over reached "
+            "n_generated = n_accepted + n_rejected; acceptance_rate = n_accepted / n_generated. Discarded samples "
+            f"(reason '{DISCARD_REASON}', never checked; in older runs stored in _rejected.json and reclassified on "
+            "reading) and their calls are reported under 'discarded' and excluded from api, samples and sae "
+            "(discarded.sae holds the SAE passes of exactly the discarded samples, also those of calls that produced "
+            "a checked sample). A feature attempt is a call that returned a "
+            "response and was checked (not failed, not discarded). mean_attempts_to_reach = mean over reached "
             "features of the 1-based attempt (within the pass) that produced the first accepted sample. SAE "
             "gpu_seconds = net wall-clock time of the SAE forward passes between CUDA synchronizations; waves "
             "interrupted before their checkpoint are not counted."
@@ -488,7 +497,7 @@ def main() -> None:
     output_path = log_dir / f"{args.prefix}_summary.json"
     save_json(output_path, summary)
 
-    api, samples, tr, sae = totals["api"], totals["samples"], totals["target_reached"], totals["sae"]
+    api, samples, dc, sae = totals["api"], totals["samples"], totals["discarded"], totals["sae"]
     tokens = api["tokens"]
     n_incomplete = sum(r["status"] == "incomplete" for r in runs)
     print(f"Prefix {args.prefix!r}: {len(runs)} run(s) ({n_incomplete} incomplete), "
@@ -498,8 +507,9 @@ def main() -> None:
           f"-> acceptance rate {samples['acceptance_rate']}")
     print(f"  tokens: prompt {tokens['prompt_tokens']} + completion {tokens['completion_tokens']} "
           f"= total {tokens['total_tokens']} (cost {tokens['cost']})")
-    print(f"  excluded target_reached: {tr['n_samples']} sample(s) from {tr['n_calls']} call(s), "
-          f"{tr['tokens']['total_tokens']} token(s)")
+    print(f"  discarded ({dc['reason']}, excluded above): {dc['n_samples']} sample(s) "
+          f"[{dc['n_reclassified_from_rejected']} reclassified from _rejected.json] from {dc['n_calls']} call(s), "
+          f"{dc['tokens']['total_tokens']} token(s)")
     for run in run_summaries:
         print(f"  run {run['run_id']} ({run['status']}):")
         seed = run.get("seed_check")
@@ -519,9 +529,9 @@ def main() -> None:
         print(f"  SAE: {total['n_forward_passes']} forward pass(es), {total['n_forward_tokens']} token(s), "
               f"{total['gpu_seconds']:.2f} s ({total['gpu_time']}) net GPU time"
               + ("" if sae["tracking_complete"] else " [incomplete tracking]"))
-        tr_sae = tr["sae"]
-        print(f"  excluded SAE of target_reached samples: {tr_sae['n_forward_passes']} forward pass(es), "
-              f"{tr_sae['gpu_seconds']:.2f} s")
+        dc_sae = dc["sae"]
+        print(f"  excluded SAE of discarded samples: {dc_sae['n_forward_passes']} forward pass(es), "
+              f"{dc_sae['gpu_seconds']:.2f} s")
     else:
         print("  SAE: not tracked for these run(s)")
     print(f"Wrote summary to {output_path}")

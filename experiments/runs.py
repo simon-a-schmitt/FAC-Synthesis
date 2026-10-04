@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import sys
@@ -36,9 +37,14 @@ import yaml
 
 EXPERIMENTS_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = EXPERIMENTS_DIR.parent
-WS_PATH = PROJECT_DIR.parents[1]  # <ws>/code/FAC-Synthesis
 DEFAULT_CONFIG = EXPERIMENTS_DIR / "config" / "experiments.yaml"
 RUNS_DIR = EXPERIMENTS_DIR / "runs"
+
+if os.environ.get("WS_PATH"):
+    WS_PATH = Path(os.environ["WS_PATH"])
+else:
+    WS_PATH = PROJECT_DIR.parents[1]  # <ws>/code/FAC-Synthesis
+    print(f"[runs.py] warning: $WS_PATH not set, falling back to {WS_PATH}", file=sys.stderr)
 
 sys.path.insert(0, str(PROJECT_DIR / "data_synthesis"))
 sys.path.insert(0, str(PROJECT_DIR / "benchmarks"))
@@ -133,16 +139,26 @@ def parse_run_id(run_id: str) -> RunSpec:
 def load_config(path: Path = DEFAULT_CONFIG) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
-    n = config["global"]["n_synthetic"]
-    for n_bb, n_fg in config["hybrid_ratios"]:
-        if n_bb + n_fg != n:
-            raise ValueError(f"hybrid ratio {n_bb}/{n_fg} does not sum to n_synthetic={n}.")
     for seed_set, spec in config["global"]["seed_sets"].items():
         if seed_set not in SEED_SETS:
             raise ValueError(f"Seed set {seed_set!r} unknown to shared/benchmarks.py SEED_SETS.")
         if len(set(spec["groups"])) != len(spec["groups"]):
             raise ValueError(f"Seed set {seed_set!r} lists a group twice: {spec['groups']}.")
+        for n_bb, n_fg in hybrid_splits(config, seed_set):
+            if n_bb <= 0 or n_fg <= 0:
+                raise ValueError(f"Seed set {seed_set!r}: hybrid split {n_bb}/{n_fg} must be > 0 on both sides.")
     return config
+
+
+def n_synthetic(config: dict, seed_set: str) -> int:
+    """Generated (or, for gold, drawn) examples of a training set: n_total minus its seeds."""
+    return config["global"]["n_total"] - config["global"]["seed_sets"][seed_set]["n_examples"]
+
+
+def hybrid_splits(config: dict, seed_set: str) -> list[tuple[int, int]]:
+    """(n_bb, n_fg) of every hybrid variant of a seed set."""
+    n = n_synthetic(config, seed_set)
+    return [(n - n_fg, n_fg) for n_fg in config["hybrid_n_feature_guided"]]
 
 
 def expand(config: dict) -> list[RunSpec]:
@@ -158,7 +174,7 @@ def expand(config: dict) -> list[RunSpec]:
         for arm in ("bb", "fg"):
             specs += [RunSpec(bench, arm, setup, s, g) for setup in config["setups"] for s, g in seeds]
         specs += [RunSpec(bench, "hybrid", setup, s, g, n_bb, n_fg)
-                  for setup in config["setups"] for s, g in seeds for n_bb, n_fg in config["hybrid_ratios"]]
+                  for setup in config["setups"] for s, g in seeds for n_bb, n_fg in hybrid_splits(config, s)]
     return specs
 
 
@@ -175,7 +191,7 @@ def gold_tsv_path(bench: str, seed_set: str, seed_file: Path) -> Path:
 
 def generation_paths(arm_dir: str, domain: str, prefix: str) -> dict:
     """Output of <arm>/run_generation.py --prefix <prefix> (SetupGeneration.output_path/log_path).
-    hybrid writes rejected/failed and an extra accepted file + log per phase (bb_, fg_)."""
+    hybrid writes rejected/discarded/failed and an extra accepted file + log per phase (bb_, fg_)."""
     domain_dir = PROJECT_DIR / "data_synthesis" / arm_dir / domain
     out, log = domain_dir / "output", domain_dir / "log"
     paths = {
@@ -189,11 +205,13 @@ def generation_paths(arm_dir: str, domain: str, prefix: str) -> dict:
             paths.update({
                 f"gen_{tag}_accepted_json": out / f"{prefix}_{tag}_accepted.json",
                 f"gen_{tag}_rejected_json": out / f"{prefix}_{tag}_rejected.json",
+                f"gen_{tag}_discarded_json": out / f"{prefix}_{tag}_discarded.json",
                 f"gen_{tag}_failed_json": out / f"{prefix}_{tag}_failed.json",
                 f"gen_{tag}_log_json": log / f"{prefix}_{tag}_log.json",
             })
     else:
-        paths.update(gen_rejected_json=out / f"{prefix}_rejected.json", gen_failed_json=out / f"{prefix}_failed.json")
+        paths.update(gen_rejected_json=out / f"{prefix}_rejected.json", gen_discarded_json=out / f"{prefix}_discarded.json",
+                     gen_failed_json=out / f"{prefix}_failed.json")
     return paths
 
 
@@ -216,8 +234,9 @@ def resolve(spec: RunSpec, config: dict) -> dict:
         raise ValueError(f"Setup {spec.setup!r} not in config.")
     if spec.seed_set is not None and spec.group not in config["global"]["seed_sets"].get(spec.seed_set, {}).get("groups", []):
         raise ValueError(f"Seed group {spec.seed_set}-{spec.group} not in config.")
-    if spec.arm == "hybrid" and [spec.n_bb, spec.n_fg] not in [list(r) for r in config["hybrid_ratios"]]:
-        raise ValueError(f"Hybrid ratio {spec.n_bb}/{spec.n_fg} not in config.")
+    if spec.arm == "hybrid" and (spec.n_bb, spec.n_fg) not in hybrid_splits(config, spec.seed_set):
+        raise ValueError(f"Hybrid ratio {spec.n_bb}/{spec.n_fg} does not match seed set {spec.seed_set} "
+                         f"(valid: {', '.join(f'r{a}-{b}' for a, b in hybrid_splits(config, spec.seed_set))}).")
 
     g, b = config["global"], config["benchmarks"][spec.bench]
     run_id = spec.run_id
@@ -253,7 +272,7 @@ def resolve(spec: RunSpec, config: dict) -> dict:
         r.update(icl_k=r["seed_n_examples"], few_shot_tsv=r["seed_file"])
     if spec.arm == "gold":
         r.update(gold_tsv=gold_tsv_path(spec.bench, spec.seed_set, r["seed_file"]),
-                 gold_pool_tsv=PROJECT_DIR / b["gold_pool_tsv"], gold_n=b["gold_n"])
+                 gold_pool_tsv=PROJECT_DIR / b["gold_pool_tsv"], gold_n=n_synthetic(config, spec.seed_set))
     if spec.arm in GEN_ARMS:
         setup = config["setups"][spec.setup]
         arm_dir = GEN_ARM_DIRS[spec.arm]
@@ -262,7 +281,7 @@ def resolve(spec: RunSpec, config: dict) -> dict:
         if spec.arm == "hybrid":
             r.update(n_blackbox=spec.n_bb, n_feature_guided=spec.n_fg)
         else:
-            r.update(n_synthetic=g["n_synthetic"])
+            r.update(n_synthetic=n_synthetic(config, spec.seed_set))
         if spec.arm in ("fg", "hybrid"):
             r.update(activation_threshold=b["activation_threshold"], sae_ckpt=WS_PATH / g["sae_ckpt"])
         r.update(generation_paths(arm_dir, spec.bench, run_id))

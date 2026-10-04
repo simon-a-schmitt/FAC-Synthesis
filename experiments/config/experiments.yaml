@@ -15,14 +15,18 @@
 #       claudette_tos: job scripts (0.5 / 0.0). toxicity_detection / cti_vsp: not in any job
 #       script; taken from the logs of the latest fg/hybrid runs
 #       (*_fg_*_d0_6_t0_0 / *_d0_9_t0_0: rouge_threshold 0.6 / 0.9, threshold 0.0).
-#   gold_pool_tsv / gold_n
+#   gold_pool_tsv
 #       inputs that reproduce the existing benchmarks/<name>/gold_ft_sets/ byte-identically
-#       (checked with benchmarks/sample_gold_ft_sets.py, --n 400).
+#       (checked with benchmarks/sample_gold_ft_sets.py, k5 with --n 400 = n_total - 5).
+#
+# Training set size: every training set (gold and synthetic) has n_total examples in all,
+# seeds included. Per seed set: n_synthetic = n_total - n_examples (k5: 400, k10: 395); gold draws
+# the same number from the pool; hybrid splits it into n_bb + n_fg (n_bb = n_synthetic - n_fg).
 
 global:
   base_model: models/llama-3.1-8b
   sae_ckpt: models/sae_llama_l16/TopK7_l16_h4096_epoch3.pth
-  n_synthetic: 400
+  n_total: 405
   # 5 seed groups per seed set; n_examples = examples per group (checked against the seed file)
   # and the number of ICL examples of the icl runs.
   seed_sets:
@@ -49,10 +53,9 @@ setups:
   deepseek: {gen_model: deepseek, label_model: deepseek}
   llama: {gen_model: llama, label_model: gpt}
 
-# [n_blackbox, n_feature_guided]; each pair must sum to global.n_synthetic
-hybrid_ratios:
-  - [350, 50]
-  - [300, 100]
+# n_feature_guided per hybrid variant; n_blackbox = n_synthetic - n_feature_guided of the seed set
+# (k5: 350/50, 300/100; k10: 345/50, 295/100). The run_id carries both: r{n_bb}-{n_fg}.
+hybrid_n_feature_guided: [50, 100]
 
 benchmarks:
   toxicity_detection:
@@ -63,7 +66,6 @@ benchmarks:
     max_prompts: 3000
     bench_extra_args: ["--max-input-tokens", "1024", "--batch-size", "8"]
     gold_pool_tsv: benchmarks/toxicity_detection/tsv_files/toxicity_holdout_set.tsv
-    gold_n: 400
 
   claudette_tos:
     rouge_threshold: 0.5
@@ -73,7 +75,6 @@ benchmarks:
     max_prompts: 2000
     bench_extra_args: []
     gold_pool_tsv: benchmarks/claudette_tos/tsv_files/claudette_tos_val_backup.tsv
-    gold_n: 400
 
   cti_vsp:
     rouge_threshold: 0.9
@@ -83,4 +84,3 @@ benchmarks:
     max_prompts: 1000
     bench_extra_args: ["--batch-size", "8", "--max-new-tokens", "48"]
     gold_pool_tsv: benchmarks/cti_vsp/tsv_files/cti_vsp_holdout.tsv
-    gold_n: 400
