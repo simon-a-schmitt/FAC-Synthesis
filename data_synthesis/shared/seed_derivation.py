@@ -12,19 +12,25 @@
 The examples are read straight from the seed TSV (first column, CSV-unquoted) rather than taken
 from an arm's own loader: the arms clean the texts differently for their prompts, and the seed must
 not depend on that.
+
+CLI (stdout: only the seed; seed file and diagnostics go to stderr), callable from any cwd:
+    SEED=$(python data_synthesis/shared/seed_derivation.py --benchmark claudette_tos \
+        --seed-set k10 --seed-group 01 --purpose fine_tuning_seed)
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import hashlib
+import sys
 import unicodedata
 from pathlib import Path
 
 BENCHMARKS = ("toxicity_detection", "claudette_tos", "cti_vsp")
 
 PURPOSE_GENERATION = "generation_seed"
-# Not used yet; reserved for seeding fine-tuning runs on the same seed group.
+# Seeds the fine-tuning runs on a seed group (derived at job runtime via the CLI below).
 PURPOSE_FINE_TUNING = "fine_tuning_seed"
 # Seeds the sampling of the gold fine-tuning set that belongs to a seed group.
 PURPOSE_GOLD_SAMPLING = "gold_sampling_seed"
@@ -75,3 +81,26 @@ def load_seed_texts(seed_file: Path) -> list[str]:
 
 def derive_seed_from_file(benchmark: str, seed_file: Path, purpose: str) -> int:
     return derive_seed(benchmark, load_seed_texts(seed_file), purpose)
+
+
+def main() -> None:
+    # benchmarks.py imports via the package path "shared.", so data_synthesis/ has to be on sys.path.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from shared.benchmarks import SEED_SETS, find_seed_file
+
+    parser = argparse.ArgumentParser(description="Print the derived seed of a seed group (stdout: the seed only).")
+    parser.add_argument("--benchmark", required=True, choices=BENCHMARKS)
+    parser.add_argument("--seed-set", required=True, choices=sorted(SEED_SETS))
+    parser.add_argument("--seed-group", required=True, help="Seed group id, e.g. 01.")
+    parser.add_argument("--purpose", required=True, choices=PURPOSES)
+    args = parser.parse_args()
+
+    # find_seed_file exits with its message on stderr (exit code 1) if there is no unique match.
+    seed_file = find_seed_file(args.benchmark, args.seed_set, args.seed_group)
+    seed = derive_seed_from_file(args.benchmark, seed_file, args.purpose)
+    print(f"seed_file={seed_file} purpose={args.purpose} seed={seed}", file=sys.stderr)
+    print(seed)
+
+
+if __name__ == "__main__":
+    main()

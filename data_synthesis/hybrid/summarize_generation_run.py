@@ -92,6 +92,8 @@ def collect_runs(logs: dict[str, dict | None], checkpoint: dict | None) -> list[
             "run_id": run_id,
             "status": "completed" if completed else "incomplete",
             "stopped_in_phase": None if completed else (cp or {}).get("phase"),
+            "slurm_job_id": meta_src.get("slurm_job_id"),
+            "hardware": meta_src.get("hardware"),
             "model": meta_src.get("model", resolved.get("model")),
             "model_id": meta_src.get("model_id"),
             "seed_group": meta_src.get("seed_group", resolved.get("seed_group")),

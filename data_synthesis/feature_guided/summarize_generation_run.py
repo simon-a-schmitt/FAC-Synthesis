@@ -74,6 +74,8 @@ def run_from_log(run: dict) -> dict:
     return {
         "status": "completed",
         "run_id": run["run_id"],
+        "slurm_job_id": run.get("slurm_job_id"),
+        "hardware": run.get("hardware"),
         "model_id": run.get("model_id"),
         "seed_group": run.get("seed_group"),
         "n_requested": run.get("n_requested"),
@@ -106,6 +108,8 @@ def run_from_checkpoint(checkpoint: dict) -> dict:
     return {
         "status": "incomplete",
         "run_id": checkpoint["run_id"],
+        "slurm_job_id": None,
+        "hardware": None,
         "model_id": None,
         "model": resolved.get("model"),
         "seed_group": resolved.get("seed_group"),

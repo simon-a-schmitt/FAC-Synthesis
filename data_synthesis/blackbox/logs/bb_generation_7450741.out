@@ -1,0 +1,22 @@
+Job ID: 7450741 | Node: uc3n007.localdomain
+----------------------------------------------------
+Llama-Projekt Umgebung erfolgreich geladen!
+Workspace: /pfs/work9/workspace/scratch/ka_ai3967-master_thesis_exp
+----------------------------------------------------
+Domain: claudette_tos | seed file: /pfs/work9/workspace/scratch/ka_ai3967-master_thesis_exp/code/FAC-Synthesis/benchmarks/claudette_tos/seed_groups/claudette_seed_group_01.tsv (5 seeds) | generation seed: 754219333
+Model: deepseek/deepseek-v4-flash-0731 | ROUGE-L threshold: 0.5 | output: /pfs/work9/workspace/scratch/ka_ai3967-master_thesis_exp/code/FAC-Synthesis/data_synthesis/blackbox/claudette_tos
+
+============================= JOB FEEDBACK =============================
+
+NodeName=uc3n007
+Job ID: 7450741
+Cluster: uc3
+User/Group: ka_ai3967/ka_ksri
+State: FAILED (exit code 1)
+Nodes: 1
+Cores per node: 4
+CPU Utilized: 00:00:02
+CPU Efficiency: 1.56% of 00:02:08 core-walltime
+Job Wall-clock time: 00:00:32
+Memory Utilized: 34.57 MB
+Memory Efficiency: 0.21% of 16.00 GB (16.00 GB/node)

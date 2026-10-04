@@ -116,6 +116,8 @@ def main() -> None:
         runs.append(
             {
                 "run_id": run_id,
+                "slurm_job_id": run.get("slurm_job_id"),
+                "hardware": run.get("hardware"),
                 "model_id": run.get("model_id"),
                 "seed_group": run.get("seed_group"),
                 "n_requested": run.get("n_requested"),

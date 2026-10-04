@@ -1,12 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=bb_generation
-#SBATCH --partition=gpu_a100_short
+#SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=120gb
+#SBATCH --mem=16gb
 #SBATCH --time=00:30:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
@@ -47,7 +46,6 @@ python "$SCRIPT_DIR/run_generation.py" \
     --max-concurrent-requests "$MAX_CONCURRENT_REQUESTS" \
     --model "$MODEL" \
     --env-file "$WS_PATH/code/FAC-Synthesis/.env" \
-    --resume \
     "$@"
 
 echo "Script finished with exit code: $?"
