@@ -22,16 +22,20 @@ SAE_PATH="$WS_PATH/models/sae_llama_l16/TopK7_l16_h4096_epoch3.pth"
 SCRIPT_DIR="$WS_PATH/code/FAC-Synthesis/data_synthesis/hybrid"
 
 # Adjust per run.
-DOMAIN="toxicity_detection"  # claudette_tos | cti_vsp | toxicity_detection
-SEED_SET="k5"  # k5 | k10
+
+DOMAIN="claudette_tos"
+SEED_SET="k5"   # k5 | k10
 SEED_GROUP="01"
-N_BLACKBOX=3
-N_FEATURE_GUIDED=3
+N_BLACKBOX=50
+N_FEATURE_GUIDED=50
 THRESHOLD=0.0
-ROUGE_THRESHOLD=0.7
+ROUGE_THRESHOLD=0.5
 MODEL="deepseek"  # llama | deepseek
-PREFIX="hybrid_test"
+PREFIX="claudette_tos_reporting_test"  # hybrid always needs a fresh prefix; to continue an interrupted run pass --resume
 MAX_CONCURRENT_REQUESTS=2
+
+
+
 
 mkdir -p logs
 

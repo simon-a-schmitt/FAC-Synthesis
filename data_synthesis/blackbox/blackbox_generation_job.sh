@@ -1,12 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=bb_generation
-#SBATCH --partition=cpu
+#SBATCH --partition=gpu_a100_short
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=8gb
-#SBATCH --time=02:00:00
+#SBATCH --mem=120gb
+#SBATCH --time=00:30:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
@@ -16,30 +17,37 @@ echo "Job ID: $SLURM_JOB_ID | Node: $(hostname)"
 
 source "$(ws_find master_thesis_exp)/start_llama.sh"
 
+MODEL="deepseek"
+
 SCRIPT_DIR="$WS_PATH/code/FAC-Synthesis/data_synthesis/blackbox"
 
+TEMPERATURE=1.0
+TOP_P=0.95
+
 # Adjust per run.
-MODEL="deepseek"  # llama | deepseek
-DOMAIN="toxicity_detection"  # claudette_tos | cti_vsp | toxicity_detection
-SEED_SET="k5"  # k5 | k10
+DOMAIN="claudette_tos"
+SEED_SET="k5"   # k5 | k10
 SEED_GROUP="01"
-N=400
-ROUGE_THRESHOLD=0.7
-PREFIX="bb_test"
-MAX_CONCURRENT_REQUESTS=8
+N=50
+ROUGE_THRESHOLD=0.5
+PREFIX="claudette_tos_bb_deepseek_prompt_verification"
+MAX_CONCURRENT_REQUESTS=2
 
 mkdir -p logs
 
 python "$SCRIPT_DIR/run_generation.py" \
-    --model "$MODEL" \
     --domain "$DOMAIN" \
     --seed-set "$SEED_SET" \
     --seed-group "$SEED_GROUP" \
     --n "$N" \
     --rouge-threshold "$ROUGE_THRESHOLD" \
+    --temperature "$TEMPERATURE" \
+    --top-p "$TOP_P" \
     --prefix "$PREFIX" \
     --max-concurrent-requests "$MAX_CONCURRENT_REQUESTS" \
+    --model "$MODEL" \
     --env-file "$WS_PATH/code/FAC-Synthesis/.env" \
+    --resume \
     "$@"
 
 echo "Script finished with exit code: $?"

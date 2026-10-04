@@ -22,26 +22,26 @@ SAE_PATH="$WS_PATH/models/sae_llama_l16/TopK7_l16_h4096_epoch3.pth"
 SCRIPT_DIR="$WS_PATH/code/FAC-Synthesis/data_synthesis/feature_guided"
 
 # Adjust per run.
-MODEL="deepseek"  # llama | deepseek
-DOMAIN="toxicity_detection"  # claudette_tos | cti_vsp | toxicity_detection
-SEED_SET="k5"  # k5 | k10
+DOMAIN="claudette_tos"
+SEED_SET="k5"   # k5 | k10
 SEED_GROUP="01"
-N=6
+N=50
 THRESHOLD=0.0
-ROUGE_THRESHOLD=0.7
-PREFIX="fg_test"
+ROUGE_THRESHOLD=0.5
+MODEL="llama"  # llama | deepseek
+PREFIX="claudette_reporting_test"
 MAX_CONCURRENT_REQUESTS=2
 
 mkdir -p logs
 
 python "$SCRIPT_DIR/run_generation.py" \
-    --model "$MODEL" \
     --domain "$DOMAIN" \
     --seed-set "$SEED_SET" \
     --seed-group "$SEED_GROUP" \
     --n "$N" \
     --threshold "$THRESHOLD" \
     --rouge-threshold "$ROUGE_THRESHOLD" \
+    --model "$MODEL" \
     --prefix "$PREFIX" \
     --max-concurrent-requests "$MAX_CONCURRENT_REQUESTS" \
     --model-name "$MODEL_PATH" \
