@@ -1,0 +1,86 @@
+# Declarative experiment definition, expanded into runs by experiments/runs.py.
+#
+# Path conventions:
+#   global.base_model, global.sae_ckpt      relative to $WS_PATH
+#   everything under benchmarks.<name>      relative to the repo root (FAC-Synthesis/)
+#
+# Sources of the values (as of 2026-10-04):
+#   fine_tuning, base_model, bench_script/test_tsv/max_prompts/bench_extra_args
+#       ~/ft_bench_{claudette,toxicity,cti_vsp}.sh (identical FT hyperparameters in all three;
+#       claudette defines them as variables, toxicity/cti_vsp hard-code the same values).
+#       The FT seed is deliberately NOT here: it is derived per run (PURPOSE_FINE_TUNING).
+#   sae_ckpt
+#       data_synthesis/{feature_guided,hybrid}/*_generation_job.sh
+#   rouge_threshold / activation_threshold
+#       claudette_tos: job scripts (0.5 / 0.0). toxicity_detection / cti_vsp: not in any job
+#       script; taken from the logs of the latest fg/hybrid runs
+#       (*_fg_*_d0_6_t0_0 / *_d0_9_t0_0: rouge_threshold 0.6 / 0.9, threshold 0.0).
+#   gold_pool_tsv / gold_n
+#       inputs that reproduce the existing benchmarks/<name>/gold_ft_sets/ byte-identically
+#       (checked with benchmarks/sample_gold_ft_sets.py, --n 400).
+
+global:
+  base_model: models/llama-3.1-8b
+  sae_ckpt: models/sae_llama_l16/TopK7_l16_h4096_epoch3.pth
+  n_synthetic: 400
+  # 5 seed groups per seed set; n_examples = examples per group (checked against the seed file)
+  # and the number of ICL examples of the icl runs.
+  seed_sets:
+    k5: {groups: ["01", "02", "03", "04", "05"], n_examples: 5}
+    k10: {groups: ["01", "02", "03", "04", "05"], n_examples: 10}
+  fine_tuning:
+    template: llama3
+    epochs: 3
+    lora_rank: 8
+    lora_alpha: 16
+    lora_target: all
+    lora_dropout: 0.1
+    learning_rate: 1.0e-4
+    lr_scheduler_type: linear
+    weight_decay: 0.0
+    warmup_ratio: 0.0
+    batch_size: 4      # per_device_train_batch_size
+    grad_accum: 4      # gradient_accumulation_steps
+    cutoff_len: 1024
+
+# gen_model: preset of data_synthesis/shared/openrouter.py GENERATION_MODEL_PRESETS
+# label_model: preset of data_synthesis/labeling/run_labeling.py MODEL_PRESETS
+setups:
+  deepseek: {gen_model: deepseek, label_model: deepseek}
+  llama: {gen_model: llama, label_model: gpt}
+
+# [n_blackbox, n_feature_guided]; each pair must sum to global.n_synthetic
+hybrid_ratios:
+  - [350, 50]
+  - [300, 100]
+
+benchmarks:
+  toxicity_detection:
+    rouge_threshold: 0.6
+    activation_threshold: 0.0
+    bench_script: benchmark_play_ground/run_toxicity_benchmark.py
+    test_tsv: benchmarks/toxicity_detection/tsv_files/toxicity_test_set.tsv
+    max_prompts: 3000
+    bench_extra_args: ["--max-input-tokens", "1024", "--batch-size", "8"]
+    gold_pool_tsv: benchmarks/toxicity_detection/tsv_files/toxicity_holdout_set.tsv
+    gold_n: 400
+
+  claudette_tos:
+    rouge_threshold: 0.5
+    activation_threshold: 0.0
+    bench_script: benchmark_play_ground/run_claudette_benchmark.py
+    test_tsv: benchmarks/claudette_tos/tsv_files/claudette_tos_test.tsv
+    max_prompts: 2000
+    bench_extra_args: []
+    gold_pool_tsv: benchmarks/claudette_tos/tsv_files/claudette_tos_val_backup.tsv
+    gold_n: 400
+
+  cti_vsp:
+    rouge_threshold: 0.9
+    activation_threshold: 0.0
+    bench_script: benchmark_play_ground/run_cti_vsp_benchmark.py
+    test_tsv: benchmarks/cti_vsp/tsv_files/cti_vsp_test.tsv
+    max_prompts: 1000
+    bench_extra_args: ["--batch-size", "8", "--max-new-tokens", "48"]
+    gold_pool_tsv: benchmarks/cti_vsp/tsv_files/cti_vsp_holdout.tsv
+    gold_n: 400
