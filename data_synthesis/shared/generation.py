@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import random
 import re
 import sys
@@ -55,6 +56,7 @@ from shared.openrouter import (
 )
 from shared.run_io import (
     append_run_log,
+    collect_hardware,
     format_wall_clock_slurm,
     load_checkpoint,
     load_json_list,
@@ -149,6 +151,8 @@ class GenerationSetup:
         args = self.args
         return {
             "run_id": run_id,
+            "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+            "hardware": collect_hardware(),
             "arm": self.arm,
             "model": args.model,
             "model_id": self.model_id,

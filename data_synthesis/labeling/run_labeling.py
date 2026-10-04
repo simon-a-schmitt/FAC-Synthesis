@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import sys
 import uuid
@@ -97,6 +98,7 @@ from shared.openrouter import (  # noqa: E402
 )
 from shared.run_io import (  # noqa: E402
     append_run_log,
+    collect_hardware,
     format_wall_clock_slurm,
     load_json_dict,
     load_json_list,
@@ -543,6 +545,8 @@ def main() -> None:
     completion_tokens = token_totals["completion_tokens"]
     run_entry = {
         "run_id": run_id,
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "hardware": collect_hardware(),
         "source": args.source,
         "domain": args.domain,
         "seed_file": str(seed_file),

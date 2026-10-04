@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,6 +41,69 @@ def format_wall_clock_slurm(started_at: str, finished_at: str) -> str:
     hours, remainder = divmod(max(elapsed, 0), 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _env_int(*keys: str) -> int | None:
+    for key in keys:
+        try:
+            return int(os.environ[key])
+        except (KeyError, ValueError):
+            pass
+    return None
+
+
+def collect_hardware() -> dict:
+    """Hardware of the current (SLURM) job, same fields as the fine-tuning log's "hardware" block
+    (plus cpu_model). GPU fields are empty on nodes without nvidia-smi (e.g. the cpu partition)."""
+    gpus, driver = [], None
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, check=True).stdout
+        for line in out.strip().splitlines():
+            name, mem, driver = (x.strip() for x in line.split(","))
+            gpus.append({"name": name, "memory_total_mib": int(mem)})
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f"[warn] nvidia-smi query failed: {exc}", file=sys.stderr)
+
+    node_ram_gb, cpu_model = None, None
+    try:
+        with open("/proc/meminfo") as f:
+            kb = int(next(line for line in f if line.startswith("MemTotal:")).split()[1])
+        node_ram_gb = round(kb / 1024**2, 1)
+    except Exception:
+        pass
+    try:
+        with open("/proc/cpuinfo") as f:
+            cpu_model = next(line for line in f if line.startswith("model name")).split(":", 1)[1].strip()
+    except Exception:
+        pass
+
+    mem_per_node_mb = _env_int("SLURM_MEM_PER_NODE")
+    mem_per_cpu_mb = _env_int("SLURM_MEM_PER_CPU")
+    cpus_on_node = _env_int("SLURM_CPUS_ON_NODE")
+    if mem_per_node_mb is None and mem_per_cpu_mb and cpus_on_node:
+        mem_per_node_mb = mem_per_cpu_mb * cpus_on_node
+
+    t_start, t_end = _env_int("SLURM_JOB_START_TIME"), _env_int("SLURM_JOB_END_TIME")
+    return {
+        "node": os.uname().nodename,
+        "partition": os.environ.get("SLURM_JOB_PARTITION"),
+        "num_nodes": _env_int("SLURM_JOB_NUM_NODES", "SLURM_NNODES"),
+        "ntasks": _env_int("SLURM_NTASKS"),
+        "num_gpus": len(gpus) or None,
+        "gpus_requested_per_node": os.environ.get("SLURM_GPUS_ON_NODE") or os.environ.get("SLURM_GPUS_PER_NODE"),
+        "gpu_model": gpus[0]["name"] if gpus else None,
+        "gpus": gpus,
+        "gpu_driver": driver,
+        "cpu_model": cpu_model,
+        "cpus_allocated": cpus_on_node or len(os.sched_getaffinity(0)),
+        "mem_requested_gb": round(mem_per_node_mb / 1024, 1) if mem_per_node_mb else None,
+        "node_ram_total_gb": node_ram_gb,
+        "time_limit_min": (t_end - t_start) // 60 if t_start and t_end else None,
+    }
 
 
 def append_run_log(log_path: Path, prefix: str, path: str, run_entry: dict) -> None:
