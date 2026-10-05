@@ -14,7 +14,7 @@ data_synthesis/prompts/<domain>/labeling.py (SYSTEM_PROMPT), the same module
 run_labeling.py uses to obtain model labels in the first place. For cti_vsp, the
 instruction is additionally prefixed with "CVE Description: ".
 
-Writes <tsv-stem>.json to data_processing/output/, as a JSON list of
+Writes <tsv-stem>.json to data_processing/output/ (or to --output), as a JSON list of
     {"system": ..., "instruction": ..., "input": "", "output": ...}
 entries.
 """
@@ -87,6 +87,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Build a LLaMA-Factory-style JSON dataset from a labeled blackbox TSV."
     )
     parser.add_argument("--tsv", type=Path, required=True, help="Path to the labeled TSV file (prompt<TAB>label).")
+    parser.add_argument("--output", type=Path, default=None,
+                        help=f"Output JSON path (default: {OUTPUT_DIR}/<tsv-stem>.json).")
     return parser
 
 
@@ -115,8 +117,8 @@ def main() -> None:
             for text, label in rows
         ]
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUTPUT_DIR / f"{tsv_path.stem}.json"
+    out_path = args.output or OUTPUT_DIR / f"{tsv_path.stem}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(dataset, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote {len(dataset)} example(s) to {out_path}")
 
