@@ -20,11 +20,11 @@
 #   sbatch --time=01:00:00 --partition=<CPU_PARTITION> experiments/slurm/label_build_job.sh <run_id>
 #
 # Ablauf:
-#   Erledigt (-> [SKIP]): experiments/prepare_lf_dataset.py <run_id> --check (Dataset da, Gate grün).
-#   Vorbedingung: Generierung abgeschlossen (experiments/label_build_checks.py gen-done), sonst
+#   Erledigt (-> [SKIP]): experiments/stages.py label-build-done (Dataset da, Gate grün).
+#   Vorbedingung: Generierung abgeschlossen (experiments/stages.py gen-done), sonst
 #                 Abbruch ohne Labeling.
 #   Labeling:     data_synthesis/labeling/run_labeling.py (fortsetzbar), bis zu $MAX_LABEL_PASSES
-#                 Durchläufe, solange Labels fehlen; danach Vollständigkeit (label_build_checks.py
+#                 Durchläufe, solange Labels fehlen; danach Vollständigkeit (stages.py
 #                 labels: Zeilen == n_total, Majority-Fallback <= 2 %), sonst Exit != 0.
 #   Dataset:      experiments/prepare_lf_dataset.py <run_id> (Gate).
 #   Meta:         experiments/run_meta.py, stage label_build.
@@ -70,12 +70,12 @@ echo "Labels:     $LABEL_TSV ($LABEL_MODEL, $LABEL_MAX_CONCURRENT parallel)"
 echo "Dataset:    $LF_DATASET_JSON"
 echo ""
 
-if python experiments/prepare_lf_dataset.py "$RUN_ID" --check; then
+if python experiments/stages.py label-build-done "$RUN_ID"; then
     echo "[SKIP] label_build: Dataset vorhanden, Gate grün."
     exit 0
 fi
 
-python experiments/label_build_checks.py gen-done "$RUN_ID" \
+python experiments/stages.py gen-done "$RUN_ID" \
     || die "Generierung von $RUN_ID nicht abgeschlossen (siehe oben) - kein Labeling."
 
 started_at="$(date -Iseconds)"; t0=$SECONDS
@@ -85,7 +85,7 @@ mkdir -p "$RUN_DIR"
 # run_labeling.py überspringt bereits gelabelte Texte; ein weiterer Durchlauf holt nur nach, was
 # fehlt (z.B. nach einem Abbruch, die TSV wird erst am Ende eines Durchlaufs geschrieben).
 for (( pass = 1; pass <= MAX_LABEL_PASSES; pass++ )); do
-    if python experiments/label_build_checks.py labels "$RUN_ID" >/dev/null; then
+    if python experiments/stages.py labels "$RUN_ID" >/dev/null; then
         break
     fi
     echo "[INFO] Labeling-Durchlauf $pass/$MAX_LABEL_PASSES ..."
@@ -98,7 +98,7 @@ for (( pass = 1; pass <= MAX_LABEL_PASSES; pass++ )); do
         --env-file "$REPO/.env" \
         || echo "WARNUNG: run_labeling.py (Durchlauf $pass) mit Exit $? beendet."
 done
-python experiments/label_build_checks.py labels "$RUN_ID" \
+python experiments/stages.py labels "$RUN_ID" \
     || die "Labels von $RUN_ID unvollständig nach $MAX_LABEL_PASSES Durchläufen (siehe oben; Fehler: $LABEL_FAILED_JSON)."
 
 # ---- LLaMA-Factory-Dataset (Gate) ---------------------------------------------------------
@@ -106,7 +106,7 @@ python experiments/prepare_lf_dataset.py "$RUN_ID"
 
 wall=$(( SECONDS - t0 ))
 echo "[TIME] label_build: $(( wall / 60 )) min $(( wall % 60 )) s"
-n_fallback="$(python experiments/label_build_checks.py fallbacks "$RUN_ID")"
+n_fallback="$(python experiments/stages.py fallbacks "$RUN_ID")"
 python experiments/run_meta.py "$RUN_ID" --stage label_build \
     --started-at "$started_at" --finished-at "$(date -Iseconds)" --wall-seconds "$wall" \
     --extra-json "{\"n_majority_fallback\": $n_fallback}"

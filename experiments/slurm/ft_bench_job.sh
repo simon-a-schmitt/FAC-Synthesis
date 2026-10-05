@@ -19,7 +19,8 @@
 #   sbatch --time=01:00:00 --partition=<GPU_PARTITION> experiments/slurm/ft_bench_job.sh <run_id>
 #   sbatch --export=ALL,CLUSTER_ENV=experiments/config/cluster_<name>.env experiments/slurm/ft_bench_job.sh <run_id>
 #
-# Phasen (jede in eigener Subshell mit eigener Umgebung; jede wird übersprungen, wenn erledigt):
+# Phasen (jede in eigener Subshell mit eigener Umgebung; jede wird übersprungen, wenn erledigt;
+# Done-Prüfungen: experiments/stages.py, dieselben wie experiments/status.py):
 #   FT     nur wenn "ft_bench" in STAGES. Erledigt: LORA_DIR/adapter_model.safetensors UND
 #          FT_LOG_JSON existieren (FT_LOG_JSON wird als LETZTES geschrieben = Done-Marker) UND
 #          dessen ft_fingerprint == FT_FINGERPRINT (runs.py); sonst [STALE] -> neu trainieren.
@@ -69,8 +70,6 @@ mkdir -p "$RUN_DIR"
 has_stage() { [[ " ${STAGES[*]} " == *" $1 "* ]]; }
 GIT_COMMIT="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
 GIT_DIRTY="$([[ -n "$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null)" ]] && echo 1 || echo 0)"
-BENCH_DONE="$RUN_DIR/bench.done"
-BENCH_STARTED="$RUN_DIR/bench.started"   # Fingerprint der Config, unter der BENCH_JSONL begonnen wurde
 
 echo "====== JOB ======"
 echo "Job ID:     ${SLURM_JOB_ID:-<kein SLURM>}"
@@ -108,15 +107,9 @@ run_phase() {
     echo ""
 }
 
-# Fingerprint, den ein Done-Marker (JSON) gespeichert hat; leer, wenn keiner/kein Marker.
-# Args: <marker.json> <key>
-marker_fingerprint() {
-    python3 -c 'import json, sys
-try:
-    print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")
-except (OSError, ValueError):
-    print("")' "$1" "$2"
-}
+# Stage-Zustand (done|stale|missing) aus experiments/stages.py - dieselbe Prüfung wie status.py.
+# Args: ft-state|bench-state
+stage_state() { python experiments/stages.py "$1" "$RUN_ID" || true; }
 
 # Verschiebt vorhandene Dateien nach <datei>.stale.<timestamp> (nie löschen).
 move_stale() {
@@ -130,10 +123,6 @@ move_stale() {
 }
 
 # ======================= PHASE FT ==========================================
-ft_done() {
-    [[ -f "$LORA_DIR/adapter_model.safetensors" && -f "$FT_LOG_JSON" ]] \
-        && [[ "$(marker_fingerprint "$FT_LOG_JSON" ft_fingerprint)" == "$FT_FINGERPRINT" ]]
-}
 
 # Läuft in der Orchestrierungs-Umgebung (vor der Trainings-Subshell).
 ft_prepare() {
@@ -362,13 +351,11 @@ phase_benchmark() {
 # ============================== ABLAUF =====================================
 # Schlägt eine Phase fehl, bricht set -e den Job ab (keine Marker, kein Meta-Eintrag).
 if has_stage ft_bench; then
-    if ft_done; then
+    ft_state="$(stage_state ft-state)"
+    if [[ "$ft_state" == "done" ]]; then
         echo "[SKIP] FT: Adapter + $FT_LOG_JSON vorhanden (Fingerprint aktuell)."
     else
-        if [[ -f "$FT_LOG_JSON" ]]; then
-            echo "[STALE] FT: Config geändert (ft_fingerprint in $FT_LOG_JSON:" \
-                 "'$(marker_fingerprint "$FT_LOG_JSON" ft_fingerprint)', aktuell: '$FT_FINGERPRINT') -> neu trainieren."
-        fi
+        [[ "$ft_state" == "stale" ]] && echo "[STALE] FT: Config geändert (siehe oben) -> neu trainieren."
         ft_prepare
         run_phase ft phase_train
     fi
@@ -376,16 +363,16 @@ elif ! has_stage bench; then
     die "Run $RUN_ID hat weder Stage 'bench' noch 'ft_bench' (stages: ${STAGES[*]})."
 fi
 
-if [[ -f "$BENCH_DONE" && "$(marker_fingerprint "$BENCH_DONE" bench_fingerprint)" == "$BENCH_FINGERPRINT" ]]; then
+bench_state="$(stage_state bench-state)"
+if [[ "$bench_state" == "done" ]]; then
     echo "[SKIP] Bench: $BENCH_DONE vorhanden (Fingerprint aktuell)."
 else
-    if [[ -f "$BENCH_DONE" ]]; then
-        echo "[STALE] Bench: Config geändert (bench_fingerprint in $BENCH_DONE:" \
-             "'$(marker_fingerprint "$BENCH_DONE" bench_fingerprint)', aktuell: '$BENCH_FINGERPRINT') -> neu rechnen."
+    if [[ "$bench_state" == "stale" ]]; then
+        echo "[STALE] Bench: Config geändert (siehe oben) -> neu rechnen."
         move_stale "$BENCH_DONE" "$BENCH_JSONL"
     fi
     # Abgebrochener Lauf unter anderer (oder unbekannter) Config: nicht per --resume fortsetzen.
-    if [[ -f "$BENCH_JSONL" && "$(marker_fingerprint "$BENCH_STARTED" bench_fingerprint)" != "$BENCH_FINGERPRINT" ]]; then
+    if ! python experiments/stages.py bench-resumable "$RUN_ID"; then
         echo "[STALE] Bench: $BENCH_JSONL wurde unter anderer/unbekannter Config begonnen -> neu rechnen."
         move_stale "$BENCH_JSONL"
     fi

@@ -53,10 +53,13 @@ from shared.openrouter import summarize_sampling_verification  # noqa: E402
 from shared.run_io import (  # noqa: E402
     append_run_log,
     format_wall_clock_slurm,
+    ignore_sigterm_until_exit,
+    install_sigterm_handler,
     load_checkpoint,
     load_json_list,
     save_checkpoint,
     save_json,
+    sigterm_deferred,
     utc_now,
 )
 
@@ -78,6 +81,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    install_sigterm_handler()
     if args.n_blackbox < 0 or args.n_feature_guided < 0:
         raise SystemExit("--n-blackbox and --n-feature-guided must be >= 0.")
     fgd.validate_feature_args(args)
@@ -122,17 +126,18 @@ def main() -> None:
                      rejected[name], discarded[name], failed[name], tag=PHASE_TAGS[name])
 
     def persist() -> None:
-        pool.save(setup.output_path("accepted"))
-        for name, tag in PHASE_TAGS.items():
-            pool.save(setup.output_path(f"{tag}_accepted"), phase=name)
-            save_json(setup.output_path(f"{tag}_rejected"), rejected[name])
-            save_json(setup.output_path(f"{tag}_discarded"), discarded[name])
-            save_json(setup.output_path(f"{tag}_failed"), failed[name])
-        save_checkpoint(checkpoint_path, {
-            "run_id": run_id, "started_at": started_at, "phase": current,
-            "blackbox": states[PHASE_BLACKBOX], "feature_guided": states[PHASE_FEATURE_GUIDED],
-            "resolved_args": resolved_args,
-        })
+        with sigterm_deferred():
+            pool.save(setup.output_path("accepted"))
+            for name, tag in PHASE_TAGS.items():
+                pool.save(setup.output_path(f"{tag}_accepted"), phase=name)
+                save_json(setup.output_path(f"{tag}_rejected"), rejected[name])
+                save_json(setup.output_path(f"{tag}_discarded"), discarded[name])
+                save_json(setup.output_path(f"{tag}_failed"), failed[name])
+            save_checkpoint(checkpoint_path, {
+                "run_id": run_id, "started_at": started_at, "phase": current,
+                "blackbox": states[PHASE_BLACKBOX], "feature_guided": states[PHASE_FEATURE_GUIDED],
+                "resolved_args": resolved_args,
+            })
 
     def phase_log_entry(phase: Phase, run, extra: dict) -> dict:
         state, tag = phase.state, phase.tag
@@ -180,6 +185,7 @@ def main() -> None:
             print(f"=== Phase 2: feature-guided ({fg.counters['n_accepted_this_run']}/{fg.target_n} accepted so far) ===")
             stop_reason = run_phase(run, fg, guidance)
 
+    ignore_sigterm_until_exit()
     persist()
     if stop_reason is not None:
         print(f"[warn] {current} phase stopped without reaching its target ({stop_reason}); checkpoint retained at "

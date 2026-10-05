@@ -260,3 +260,5 @@ experiments/runs/*
 # for sbatch --output, hence .gitkeep.
 experiments/logs/*
 !experiments/logs/.gitkeep
+# Submission log of experiments/submit.py (local cluster state)
+experiments/state/

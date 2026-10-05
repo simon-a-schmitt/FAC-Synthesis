@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,9 +17,62 @@ def utc_now() -> str:
 
 
 def save_json(path: Path, data) -> None:
+    """Atomic: written to <path>.tmp and renamed, so an interrupted write never leaves a truncated file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# SIGTERM (SLURM time limit / requeue of experiments/slurm/gen_job.sh)
+# ---------------------------------------------------------------------------
+# The on-disk state of a generation run is consistent only between two persist() calls: persist()
+# writes accepted / rejected / discarded / failed and the checkpoint one after another, so a run
+# killed in the middle of it could leave e.g. the accepted pool one wave ahead of its checkpoint.
+# A SIGTERM outside persist() exits at once (in-flight calls of the current wave are lost, the files
+# hold the last completed wave, --resume redoes that wave with the same slot seeds); inside persist()
+# it is deferred until the files are complete.
+_SIGTERM = {"defer": 0, "pending": False}
+
+
+def _exit_on_sigterm() -> None:
+    print("[signal] SIGTERM: exiting; outputs + checkpoint hold the last completed wave (continue with --resume).",
+          flush=True)
+    sys.stderr.flush()
+    os._exit(128 + signal.SIGTERM)  # no interpreter shutdown: it would wait for the in-flight API calls
+
+
+def _on_sigterm(signum, frame) -> None:
+    if _SIGTERM["defer"]:
+        if not _SIGTERM["pending"]:
+            print("[signal] SIGTERM while writing outputs - exiting once they are complete.", flush=True)
+        _SIGTERM["pending"] = True
+        return
+    _exit_on_sigterm()
+
+
+def install_sigterm_handler() -> None:
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+
+@contextmanager
+def sigterm_deferred():
+    """Defers a SIGTERM until the block (writing a consistent set of output files) is done."""
+    _SIGTERM["defer"] += 1
+    try:
+        yield
+    finally:
+        _SIGTERM["defer"] -= 1
+        if not _SIGTERM["defer"] and _SIGTERM["pending"]:
+            _exit_on_sigterm()
+
+
+def ignore_sigterm_until_exit() -> None:
+    """For the final section of a run (last persist, run log, checkpoint removal): it takes seconds
+    and completes the run, so a SIGTERM arriving now is only noted and the run finishes normally."""
+    _SIGTERM["defer"] += 1
 
 
 def load_json_list(path: Path) -> list:

@@ -63,10 +63,13 @@ from shared.run_io import (
     append_run_log,
     collect_hardware,
     format_wall_clock_slurm,
+    ignore_sigterm_until_exit,
+    install_sigterm_handler,
     load_checkpoint,
     load_json_list,
     save_checkpoint,
     save_json,
+    sigterm_deferred,
     utc_now,
 )
 from shared.summary import DISCARD_REASON
@@ -664,6 +667,7 @@ def run_standalone_arm(args: argparse.Namespace, arm: str, arm_dir: Path, featur
     """The complete run of the blackbox arm, or of the feature-guided arm. Output:
     <arm>/<domain>/output/<prefix>_accepted.json (seeds + every accepted sample of every run with
     this prefix) / _rejected.json / _failed.json and log/<prefix>_log.json (one entry per completed run)."""
+    install_sigterm_handler()
     if feature_guided:
         from shared import feature_guidance as fgd
 
@@ -694,17 +698,19 @@ def run_standalone_arm(args: argparse.Namespace, arm: str, arm_dir: Path, featur
     )
 
     def persist() -> None:
-        pool.save(setup.output_path("accepted"))
-        save_json(setup.output_path("rejected"), phase.rejected)
-        save_json(setup.output_path("discarded"), phase.discarded)
-        save_json(setup.output_path("failed"), phase.failed)
-        save_checkpoint(checkpoint_path, {"run_id": run_id, **state, "resolved_args": resolved_args})
+        with sigterm_deferred():
+            pool.save(setup.output_path("accepted"))
+            save_json(setup.output_path("rejected"), phase.rejected)
+            save_json(setup.output_path("discarded"), phase.discarded)
+            save_json(setup.output_path("failed"), phase.failed)
+            save_checkpoint(checkpoint_path, {"run_id": run_id, **state, "resolved_args": resolved_args})
 
     guidance = fgd.start_feature_guidance(args, state, setup.seed_file) if feature_guided else None
     with ThreadPoolExecutor(max_workers=args.max_concurrent_requests) as executor:
         run = start_run(setup, run_id, pool, executor, persist)
         stop_reason = run_phase(run, phase, guidance)
 
+    ignore_sigterm_until_exit()
     persist()
     if stop_reason is not None:
         print(f"[warn] Stopped without reaching the target ({stop_reason}; {phase.counters['n_accepted_this_run']}/"

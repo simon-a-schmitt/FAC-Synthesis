@@ -1,12 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=gen                       # Generierung eines Packs von bb/fg/hybrid-Runs
-#SBATCH --partition=gpu_a100_il              # = GPU_LONG_PARTITION in cluster.env (#SBATCH kann keine Variablen lesen)
+#SBATCH --partition=gpu_a100_short           # = GEN_PARTITION in cluster.env (#SBATCH kann keine Variablen lesen)
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=120gb
-#SBATCH --time=08:00:00
+#SBATCH --time=00:30:00                      # = GEN_TIME; längere Runs laufen per Selbst-Requeue weiter
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@120                  # 120 s vor dem Zeitlimit: Runs sauber beenden + requeue
+#SBATCH --open-mode=append                   # Logs eines requeueten Jobs werden fortgeschrieben
 #SBATCH --output=experiments/logs/%x_%j.out  # relativ zum Submit-Verzeichnis (= Repo-Root)
 #SBATCH --error=experiments/logs/%x_%j.err
 
@@ -15,18 +18,22 @@
 # Pfade/Parameter kommen aus `experiments/runs.py show <run_id> --format shell`, alles
 # Clusterspezifische aus experiments/config/cluster.env (Override: $CLUSTER_ENV).
 #
-# Aufruf (aus dem Repo-Root FAC-Synthesis/); alle run_ids eines Aufrufs brauchen dieselbe
-# GEN_RESOURCE (bb: cpu, fg/hybrid: gpu):
-#   gpu (Header-Default, GPU_LONG_PARTITION; höchstens GEN_PACK_SIZE Runs pro Job):
+# Aufruf (aus dem Repo-Root FAC-Synthesis/; normalerweise über experiments/submit.py); alle run_ids
+# eines Aufrufs brauchen dieselbe GEN_RESOURCE (bb: cpu, fg/hybrid: gpu):
+#   gpu (Header-Default = GEN_PARTITION/GEN_TIME; höchstens GEN_PACK_SIZE Runs pro Job):
 #     sbatch experiments/slurm/gen_job.sh <fg/hybrid run_id> [<run_id> ...]
-#   gpu, kurze Runs (< 30 min, z.B. toxicity-fg) auf GPU_PARTITION (A100 40GB -> höchstens 2 Runs):
-#     sbatch --partition=gpu_a100_short --time=00:30:00 experiments/slurm/gen_job.sh <run_id> [<run_id>]
-#   cpu (CPU_PARTITION, ohne GPU):
-#     sbatch --partition=cpu --gres=none experiments/slurm/gen_job.sh <bb run_id> [<run_id> ...]
-#   sbatch --time=... überschreibt das Zeitlimit; ein Timeout ist unkritisch (s.u. resume).
+#     (Option: --partition=$GPU_LONG_PARTITION --time=... für lange Läufe ohne Requeue)
+#   cpu (GEN_CPU_PARTITION, ohne GPU; höchstens GEN_PACK_SIZE_CPU Runs):
+#     sbatch --partition=cpu --gres=none --time=$GEN_CPU_TIME experiments/slurm/gen_job.sh <bb run_id> [...]
+#
+# Selbst-Requeue: SLURM schickt 120 s vor dem Zeitlimit SIGUSR1 an dieses Skript. Es beendet die
+# laufenden run_generation.py-Prozesse mit SIGTERM (sie schreiben keine halbe Wave: shared/run_io.py
+# verzögert SIGTERM bis die Outputs einer Wave komplett sind) und ruft `scontrol requeue` auf,
+# solange SLURM_RESTART_COUNT < GEN_MAX_REQUEUES; sonst Exit != 0. Der requeuete Job (gleiche
+# Job-ID, abhängige Jobs warten weiter) setzt per --resume fort, fertige Runs werden übersprungen.
 #
 # Pro run_id (jeweils eigener Hintergrundprozess, Log experiments/logs/gen/<run_id>_<jobid>.log):
-#   done     Generierung abgeschlossen (label_build_checks.py gen-done)    -> [SKIP]
+#   done     Generierung abgeschlossen (stages.py gen-done)    -> [SKIP]
 #   resume   GEN_CHECKPOINT_JSON existiert                                 -> mit --resume fortsetzen
 #   fresh    noch keine Outputs                                            -> neu starten
 #   partial  Outputs ohne Checkpoint, nicht abgeschlossen                  -> Fehler für diesen Run
@@ -74,19 +81,19 @@ for run_id in "${RUN_IDS[@]}"; do
     RESOURCE="$res"
 done
 
-# gpu: GPU_LONG_PARTITION, für kurze Runs (< 30 min) auch GPU_PARTITION.
 case "$RESOURCE" in
-    cpu) ALLOWED_PARTITIONS=("$CPU_PARTITION") ;;
-    gpu) ALLOWED_PARTITIONS=("$GPU_LONG_PARTITION" "$GPU_PARTITION") ;;
+    cpu) ALLOWED_PARTITIONS=("$GEN_CPU_PARTITION"); PACK_LIMIT="$GEN_PACK_SIZE_CPU" ;;
+    gpu) ALLOWED_PARTITIONS=("$GEN_PARTITION" "$GPU_LONG_PARTITION"); PACK_LIMIT="$GEN_PACK_SIZE" ;;
     *)   die "Unbekannte GEN_RESOURCE '$RESOURCE'." ;;
 esac
 if [[ -n "${SLURM_JOB_PARTITION:-}" && " ${ALLOWED_PARTITIONS[*]} " != *" $SLURM_JOB_PARTITION "* ]]; then
     die "GEN_RESOURCE=$RESOURCE gehört auf Partition ${ALLOWED_PARTITIONS[*]}, Job läuft auf $SLURM_JOB_PARTITION" \
-        "(cpu: sbatch --partition=$CPU_PARTITION --gres=none ...)."
+        "(cpu: sbatch --partition=$GEN_CPU_PARTITION --gres=none ...)."
 fi
-if [[ "$RESOURCE" == "gpu" ]] && (( ${#RUN_IDS[@]} > GEN_PACK_SIZE )); then
-    echo "WARNUNG: ${#RUN_IDS[@]} Runs > GEN_PACK_SIZE=$GEN_PACK_SIZE - GPU-Speicher könnte nicht reichen."
+if (( ${#RUN_IDS[@]} > PACK_LIMIT )); then
+    echo "WARNUNG: ${#RUN_IDS[@]} Runs > Pack-Limit $PACK_LIMIT für $RESOURCE (cluster.env)."
 fi
+RESTART_COUNT="${SLURM_RESTART_COUNT:-0}"
 PACK_JSON="[$(printf '"%s",' "${RUN_IDS[@]}" | sed 's/,$//')]"
 
 echo "====== JOB ======"
@@ -96,6 +103,8 @@ echo "Node:       $(hostname)"
 echo "Cluster:    $CLUSTER_ENV"
 echo "Ressource:  $RESOURCE"
 echo "Pack:       ${RUN_IDS[*]}"
+echo "Requeues:   $RESTART_COUNT/$GEN_MAX_REQUEUES"
+echo "Start:      $(date -Iseconds)"
 echo ""
 
 GPU_MONITOR_PID=""
@@ -115,7 +124,7 @@ run_one() {
     log="$LOG_DIR/${run_id}_${JOB_ID}.log"
     status() { echo "$1" > "$LOG_DIR/.status_${JOB_ID}_${run_id}"; }
 
-    state="$(python experiments/label_build_checks.py gen-state "$run_id" 2>>"$log")" || true
+    state="$(python experiments/stages.py gen-state "$run_id" 2>>"$log")" || true
     case "$state" in
         done)    echo "[SKIP] $run_id: Generierung abgeschlossen."; status "skip"; return 0 ;;
         resume)  local resume=(--resume) ;;
@@ -154,7 +163,7 @@ run_one() {
         echo "FEHLER: $run_id: run_generation.py Exit $rc nach ${wall}s (siehe $log)." >&2
         status "failed:$rc:$wall"; return 1
     fi
-    if ! python experiments/label_build_checks.py gen-done "$run_id" >> "$log" 2>&1; then
+    if ! python experiments/stages.py gen-done "$run_id" >> "$log" 2>&1; then
         echo "FEHLER: $run_id: Exit 0, aber Generierung nicht abgeschlossen (Call-Limit? siehe $log)." >&2
         status "incomplete:0:$wall"; return 1
     fi
@@ -165,6 +174,18 @@ run_one() {
 }
 
 declare -A PIDS
+REQUEUE_REQUESTED=0
+# SIGUSR1 (Zeitlimit naht): run_generation.py-Prozesse (Kinder der run_one-Subshells) beenden.
+on_usr1() {
+    echo "[SIGNAL] $(date -Iseconds) USR1: Zeitlimit naht -> laufende Runs mit SIGTERM beenden, dann Requeue."
+    REQUEUE_REQUESTED=1
+    local pid
+    for pid in "${PIDS[@]}"; do
+        pkill -TERM -P "$pid" 2>/dev/null || true
+    done
+}
+trap on_usr1 USR1
+
 for run_id in "${RUN_IDS[@]}"; do
     run_one "$run_id" &
     PIDS[$run_id]=$!
@@ -172,7 +193,12 @@ done
 
 FAILED=()
 for run_id in "${RUN_IDS[@]}"; do
-    wait "${PIDS[$run_id]}" || FAILED+=("$run_id")
+    # Ein Signal mit Trap unterbricht `wait`; weiterwarten, solange der Prozess lebt.
+    while true; do
+        rc=0; wait "${PIDS[$run_id]}" || rc=$?
+        kill -0 "${PIDS[$run_id]}" 2>/dev/null || break
+    done
+    (( rc == 0 )) || FAILED+=("$run_id")
 done
 
 # ---- Übersicht -------------------------------------------------------------------------------
@@ -192,6 +218,16 @@ if [[ -n "$GPU_MONITOR_PID" ]]; then
     echo "GPU-Speicher peak (60-s-Samples): ${peak} MiB  ($LOG_DIR/gpu_${JOB_ID}.csv)"
 fi
 
+if (( REQUEUE_REQUESTED && ${#FAILED[@]} )); then
+    [[ -n "${SLURM_JOB_ID:-}" ]] || die "USR1 ohne SLURM-Job - kein Requeue möglich."
+    if (( RESTART_COUNT < GEN_MAX_REQUEUES )); then
+        echo "[REQUEUE] $(date -Iseconds) Unfertig: ${FAILED[*]} -> scontrol requeue $SLURM_JOB_ID" \
+             "($(( RESTART_COUNT + 1 ))/$GEN_MAX_REQUEUES)."
+        scontrol requeue "$SLURM_JOB_ID"
+        exit 0
+    fi
+    die "Requeue-Limit GEN_MAX_REQUEUES=$GEN_MAX_REQUEUES erreicht, unfertig: ${FAILED[*]}"
+fi
 if (( ${#FAILED[@]} )); then
     die "Fehlgeschlagene Runs (${#FAILED[@]}): ${FAILED[*]}"
 fi

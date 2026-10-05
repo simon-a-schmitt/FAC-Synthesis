@@ -265,6 +265,8 @@ def resolve(spec: RunSpec, config: dict) -> dict:
         "max_prompts": b["max_prompts"],
         "bench_extra_args": list(b["bench_extra_args"]),
         "bench_jsonl": run_dir / "bench.jsonl",
+        "bench_done": run_dir / "bench.done",        # done marker (with bench_fingerprint)
+        "bench_started": run_dir / "bench.started",  # fingerprint under which bench_jsonl was begun
     }
     if spec.seed_set is not None:
         seed_file = find_seed_file(spec.bench, spec.seed_set, spec.group)

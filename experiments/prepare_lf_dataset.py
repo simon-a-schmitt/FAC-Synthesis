@@ -109,15 +109,16 @@ def gate(dataset_path: Path, r: dict, n_total: int) -> list[str]:
     return errors
 
 
-def is_prepared(r: dict, n_total: int) -> bool:
+def is_prepared(r: dict, n_total: int, verbose: bool = True) -> bool:
     dataset_path, info_path = Path(r["lf_dataset_json"]), Path(r["lf_dataset_info_json"])
     if not (dataset_path.is_file() and info_path.is_file()):
         return False
     if json.loads(info_path.read_text(encoding="utf-8")) != dataset_info(r):
-        print(f"[prepare] {info_path} does not match the expected entry.")
+        if verbose:
+            print(f"[prepare] {info_path} does not match the expected entry.")
         return False
     errors = gate(dataset_path, r, n_total)
-    for e in errors:
+    for e in errors if verbose else ():
         print(f"[prepare] existing dataset fails the gate: {e}")
     return not errors
 
