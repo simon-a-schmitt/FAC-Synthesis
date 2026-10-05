@@ -527,9 +527,16 @@ def generate_batch(
     input_ids = padded["input_ids"].to(device)
     attention_mask = padded["attention_mask"].to(device)
 
+    slot_results = None
     try:
         slot_results = score_slots(hf_model, input_ids, attention_mask, plan, device=device)
     except torch.cuda.OutOfMemoryError:
+        if len(texts) <= 1:
+            raise
+    # The retry must run outside the except block: while the exception is being handled,
+    # its traceback keeps score_slots()' frames - and with them the full-sequence logits of
+    # the failed attempt - alive, so every halved retry would start on an already full GPU.
+    if slot_results is None:
         # Each forward call in score_slots() only processes a handful of new tokens
         # (one chosen value token + one short fragment) rather than the full padded
         # sequence, so the per-step vocab-logits peak is already much smaller than a
@@ -540,8 +547,6 @@ def generate_batch(
         # is the standard fallback for that.
         if device == "cuda":
             torch.cuda.empty_cache()
-        if len(texts) <= 1:
-            raise
         mid = len(texts) // 2
         print(f"CUDA OOM at batch size {len(texts)}. Splitting into sub-batches of {mid} and {len(texts) - mid}...")
         first_pred, first_vectors, first_scores, first_ties = generate_batch(
