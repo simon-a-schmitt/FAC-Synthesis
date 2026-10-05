@@ -16,6 +16,10 @@ data_synthesis/{blackbox,feature_guided,hybrid}/run_generation.py (shared/genera
 data_synthesis/labeling/run_labeling.py, with --prefix = run_id. New per-run artifacts live under
 experiments/runs/<run_id>/.
 
+Done markers carry a config fingerprint (ft_fingerprint: FT hyperparameters, base model, ft_seed,
+n_total; bench_fingerprint: bench script, test TSV, mode, icl_k, max_prompts, extra args and - for
+fine_tuned - ft_fingerprint), so a marker written under another config is detected as stale.
+
 Usage:
     python experiments/runs.py list [--bench B] [--arm A] [--setup S] [--seed-set K] [--group G]
     python experiments/runs.py show <run_id> [--format json|shell]
@@ -25,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -301,7 +306,23 @@ def resolve(spec: RunSpec, config: dict) -> dict:
             ft_log_json=run_dir / "ft_log.json",
         )
         r.update({f"ft_{k}": v for k, v in g["fine_tuning"].items()})
+        r["ft_fingerprint"] = fingerprint({
+            "fine_tuning": g["fine_tuning"], "base_model": g["base_model"], "ft_seed": r["ft_seed"],
+            "n_total": g["n_total"],
+        })
+    r["bench_fingerprint"] = fingerprint({
+        "bench_script": b["bench_script"], "test_tsv": b["test_tsv"], "mode": r["bench_mode"],
+        "icl_k": r.get("icl_k"), "max_prompts": b["max_prompts"], "bench_extra_args": list(b["bench_extra_args"]),
+        "ft_fingerprint": r.get("ft_fingerprint"),
+    })
     return {k: str(v) if isinstance(v, Path) else v for k, v in r.items()}
+
+
+def fingerprint(fields: dict) -> str:
+    """sha256 over the config values a done marker depends on (ft_log.json, bench.done). Paths are
+    the config's relative ones, so the fingerprint does not depend on where the workspace lives.
+    A marker whose stored fingerprint differs from the current one is stale."""
+    return hashlib.sha256(json.dumps(fields, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ Requests run concurrently via a thread pool (shared/openrouter.py's RateLimiter 
 API's tps limit). Unlike the generation calls, labeling calls
 don't build on each other (no shared mutable pool, no dedup against prior results), so
 there is no need for its wave/barrier scheme: every synthetic entry's call is simply
-submitted up front and results are collected as they complete, then written out in the
+submitted up front and results are processed as they complete, then written out in the
 original entry order.
 
 Resumable like run_generation.py: if <prefix>.tsv already exists, it is loaded first and
@@ -33,7 +33,9 @@ its non-empty labels (keyed by text) are reused as-is - only texts that are new 
 unlabeled (empty label, e.g. from a prior failed/unparsed call) are sent to the API this
 run. The full seed + synthetic set is then rewritten to the same file, so a run never loses
 labels obtained by an earlier one and can simply be re-invoked to fill in the rest after a
-partial failure.
+partial failure. The TSV is also rewritten atomically every FLUSH_EVERY newly obtained labels
+(still-unlabeled entries with a blank label), so a run that is killed mid-way only loses the
+labels since its last flush.
 
 Once every sample has had an initial attempt, whatever is still unresolved (a response that
 didn't parse, or a call that failed outright) is retried up to MAX_UNPARSED_RETRIES more
@@ -69,7 +71,8 @@ import re
 import sys
 import uuid
 from collections import Counter
-from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 
@@ -115,6 +118,7 @@ MODEL_PRESETS = {
 }
 
 MAX_UNPARSED_RETRIES = 3
+FLUSH_EVERY = 25  # rewrite the output TSV after this many newly obtained labels
 
 LABELING_MODEL_PARAMS = {
     "temperature": 0.0,
@@ -301,14 +305,14 @@ def fetch_one(ctx: WorkerContext, index: int, text: str) -> CallResult:
     )
 
 
-def run_batch(ctx: WorkerContext, indices_and_texts: list[tuple[int, str]], max_workers: int) -> list[CallResult]:
-    """Dispatches one round of independent labeling calls across a thread pool and waits
-    for all of them (success, failure, or unparsed all count as "done") before returning.
-    """
+def run_batch(ctx: WorkerContext, indices_and_texts: list[tuple[int, str]], max_workers: int) -> Iterator[CallResult]:
+    """Dispatches one round of independent labeling calls across a thread pool and yields each
+    result as soon as its call is done (success, failure, or unparsed), in completion order -
+    the caller keys them by index and writes the output in entry order."""
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(fetch_one, ctx, idx, text) for idx, text in indices_and_texts]
-        wait(futures, return_when=ALL_COMPLETED)
-        return [future.result() for future in futures]
+        for future in as_completed(futures):
+            yield future.result()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -450,6 +454,29 @@ def main() -> None:
     if existing_labels:
         print(f"Resuming from {out_path}: {len(results_by_index)} already labeled, {len(to_label)} left to label")
 
+    n_since_flush = 0
+
+    def write_output() -> None:
+        """Seed + synthetic rows in entry order, written atomically; an entry without a label yet
+        gets a blank one, which a resumed run re-requests."""
+        tmp_path = out_path.with_name(out_path.name + ".tmp")
+        with tmp_path.open("w", encoding="utf-8", newline="") as out_fh:
+            writer = csv.writer(out_fh, delimiter="\t", lineterminator="\n")
+            for text, label in seed_rows:
+                writer.writerow([text, label])
+            for idx, entry in enumerate(synthetic_entries):
+                writer.writerow([entry["text"], results_by_index.get(idx, "")])
+        os.replace(tmp_path, out_path)
+        save_json(failed_path, failed_entries)
+
+    def labeled(idx: int, label: str) -> None:
+        nonlocal n_since_flush
+        results_by_index[idx] = label
+        n_since_flush += 1
+        if n_since_flush >= FLUSH_EVERY:
+            write_output()
+            n_since_flush = 0
+
     if to_label:
         print("=== Full request messages (first labeling call) ===")
         print(f"--- system ---\n{system_prompt}")
@@ -464,19 +491,19 @@ def main() -> None:
     for n_done, result in enumerate(results, start=1):
         record_call("initial", result)
         if not result.ok:
-            print(f"  [error] [{n_done}/{len(results)}] {result.error}", file=sys.stderr)
+            print(f"  [error] [{n_done}/{len(to_label)}] {result.error}", file=sys.stderr)
             record_failure("initial", result)
             n_failed += 1
             unresolved_indices.append(result.index)
         elif result.unparsed:
-            print(f"  [warn] [{n_done}/{len(results)}] Could not parse a label for: {result.text[:80]!r}", file=sys.stderr)
+            print(f"  [warn] [{n_done}/{len(to_label)}] Could not parse a label for: {result.text[:80]!r}", file=sys.stderr)
             print(f"    raw model output: {result.raw_response!r}", file=sys.stderr)
             record_failure("initial", result)
             n_unparsed += 1
             unresolved_indices.append(result.index)
         else:
-            print(f"  [ok] [{n_done}/{len(results)}] {result.label_line}: {result.text[:80]!r}")
-            results_by_index[result.index] = result.label_line
+            print(f"  [ok] [{n_done}/{len(to_label)}] {result.label_line}: {result.text[:80]!r}")
+            labeled(result.index, result.label_line)
 
     for attempt in range(1, MAX_UNPARSED_RETRIES + 1):
         if not unresolved_indices:
@@ -485,21 +512,22 @@ def main() -> None:
         retry_results = run_batch(
             ctx, [(idx, synthetic_entries[idx]["text"]) for idx in unresolved_indices], args.max_concurrent_requests
         )
+        n_retry = len(unresolved_indices)
         still_unresolved: list[int] = []
         for n_done, result in enumerate(retry_results, start=1):
             record_call(f"retry_{attempt}", result)
             if not result.ok:
-                print(f"  [error] [retry {attempt}, {n_done}/{len(retry_results)}] {result.error}", file=sys.stderr)
+                print(f"  [error] [retry {attempt}, {n_done}/{n_retry}] {result.error}", file=sys.stderr)
                 record_failure(f"retry_{attempt}", result)
                 still_unresolved.append(result.index)
             elif result.unparsed:
-                print(f"  [warn] [retry {attempt}, {n_done}/{len(retry_results)}] Could not parse a label for: {result.text[:80]!r}", file=sys.stderr)
+                print(f"  [warn] [retry {attempt}, {n_done}/{n_retry}] Could not parse a label for: {result.text[:80]!r}", file=sys.stderr)
                 print(f"    raw model output: {result.raw_response!r}", file=sys.stderr)
                 record_failure(f"retry_{attempt}", result)
                 still_unresolved.append(result.index)
             else:
-                print(f"  [ok] [retry {attempt}, {n_done}/{len(retry_results)}] {result.label_line}: {result.text[:80]!r}")
-                results_by_index[result.index] = result.label_line
+                print(f"  [ok] [retry {attempt}, {n_done}/{n_retry}] {result.label_line}: {result.text[:80]!r}")
+                labeled(result.index, result.label_line)
         unresolved_indices = still_unresolved
 
     n_majority_fallback = len(unresolved_indices)
@@ -523,12 +551,7 @@ def main() -> None:
 
     synthetic_rows = [(entry["text"], results_by_index[idx]) for idx, entry in enumerate(synthetic_entries)]
 
-    with out_path.open("w", encoding="utf-8", newline="") as out_fh:
-        writer = csv.writer(out_fh, delimiter="\t", lineterminator="\n")
-        for text, label in seed_rows + synthetic_rows:
-            writer.writerow([text, label])
-
-    save_json(failed_path, failed_entries)
+    write_output()
     print(f"Wrote {len(seed_rows)} seed + {len(synthetic_rows)} synthetic labeled example(s) to {out_path}")
     if failed_entries:
         print(f"Wrote {len(failed_entries)} failed/unparsed attempt record(s) to {failed_path}")

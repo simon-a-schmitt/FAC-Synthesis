@@ -21,12 +21,16 @@
 #
 # Phasen (jede in eigener Subshell mit eigener Umgebung; jede wird übersprungen, wenn erledigt):
 #   FT     nur wenn "ft_bench" in STAGES. Erledigt: LORA_DIR/adapter_model.safetensors UND
-#          FT_LOG_JSON existieren (FT_LOG_JSON wird als LETZTES geschrieben = Done-Marker).
+#          FT_LOG_JSON existieren (FT_LOG_JSON wird als LETZTES geschrieben = Done-Marker) UND
+#          dessen ft_fingerprint == FT_FINGERPRINT (runs.py); sonst [STALE] -> neu trainieren.
 #          gold: Dataset via experiments/prepare_lf_dataset.py; bb/fg/hybrid: LF_DATASET_JSON
 #          muss bereits existieren (Schritt label_build).
 #          Vor dem Training werden BENCH_JSONL und bench.done nach *.stale.<timestamp> verschoben,
 #          damit --resume nie Vorhersagen eines alten Adapters übernimmt.
-#   Bench  Erledigt: RUN_DIR/bench.done existiert. Läuft mit --resume.
+#   Bench  Erledigt: RUN_DIR/bench.done existiert mit bench_fingerprint == BENCH_FINGERPRINT;
+#          sonst [STALE]: bench.done + BENCH_JSONL nach *.stale.<timestamp>, neu rechnen.
+#          Läuft mit --resume; ein unfertiges BENCH_JSONL wird nur fortgesetzt, wenn bench.started
+#          denselben Fingerprint trägt. Marker ohne Fingerprint (ältere Läufe) gelten als stale.
 #   Danach wird RUN_META_JSON gemergt (pro Phase Job-ID, Node, GPU, Zeiten, git commit;
 #   einmalig sha256 von TEST_TSV und SEED_FILE).
 #
@@ -66,6 +70,7 @@ has_stage() { [[ " ${STAGES[*]} " == *" $1 "* ]]; }
 GIT_COMMIT="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
 GIT_DIRTY="$([[ -n "$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null)" ]] && echo 1 || echo 0)"
 BENCH_DONE="$RUN_DIR/bench.done"
+BENCH_STARTED="$RUN_DIR/bench.started"   # Fingerprint der Config, unter der BENCH_JSONL begonnen wurde
 
 echo "====== JOB ======"
 echo "Job ID:     ${SLURM_JOB_ID:-<kein SLURM>}"
@@ -103,8 +108,32 @@ run_phase() {
     echo ""
 }
 
+# Fingerprint, den ein Done-Marker (JSON) gespeichert hat; leer, wenn keiner/kein Marker.
+# Args: <marker.json> <key>
+marker_fingerprint() {
+    python3 -c 'import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")
+except (OSError, ValueError):
+    print("")' "$1" "$2"
+}
+
+# Verschiebt vorhandene Dateien nach <datei>.stale.<timestamp> (nie löschen).
+move_stale() {
+    local ts f; ts="$(date +%Y%m%d-%H%M%S)"
+    for f in "$@"; do
+        if [[ -e "$f" ]]; then
+            mv "$f" "$f.stale.$ts"
+            echo "[INFO] Veraltet, verschoben: $f -> $f.stale.$ts"
+        fi
+    done
+}
+
 # ======================= PHASE FT ==========================================
-ft_done() { [[ -f "$LORA_DIR/adapter_model.safetensors" && -f "$FT_LOG_JSON" ]]; }
+ft_done() {
+    [[ -f "$LORA_DIR/adapter_model.safetensors" && -f "$FT_LOG_JSON" ]] \
+        && [[ "$(marker_fingerprint "$FT_LOG_JSON" ft_fingerprint)" == "$FT_FINGERPRINT" ]]
+}
 
 # Läuft in der Orchestrierungs-Umgebung (vor der Trainings-Subshell).
 ft_prepare() {
@@ -116,13 +145,7 @@ ft_prepare() {
     fi
 
     # Neuer Adapter -> alte Vorhersagen/Marker beiseitelegen (nicht löschen).
-    local ts f; ts="$(date +%Y%m%d-%H%M%S)"
-    for f in "$BENCH_JSONL" "$BENCH_DONE" "$FT_LOG_JSON"; do
-        if [[ -e "$f" ]]; then
-            mv "$f" "$f.stale.$ts"
-            echo "[INFO] Veraltet, verschoben: $f -> $f.stale.$ts"
-        fi
-    done
+    move_stale "$BENCH_JSONL" "$BENCH_DONE" "$FT_LOG_JSON"
 }
 
 phase_train() {
@@ -186,7 +209,7 @@ phase_train() {
 write_ft_log() {
     RUN_ID="$RUN_ID" LF_DATASET_NAME="$LF_DATASET_NAME" LF_DATASET_JSON="$LF_DATASET_JSON" \
     LORA_DIR="$LORA_DIR" FT_LOG_JSON="$FT_LOG_JSON" BASE_MODEL="$BASE_MODEL" FT_SEED="$FT_SEED" \
-    GIT_COMMIT="$GIT_COMMIT" GIT_DIRTY="$GIT_DIRTY" \
+    GIT_COMMIT="$GIT_COMMIT" GIT_DIRTY="$GIT_DIRTY" FT_FINGERPRINT="$FT_FINGERPRINT" \
     FT_TEMPLATE="$FT_TEMPLATE" FT_EPOCHS="$FT_EPOCHS" FT_LORA_RANK="$FT_LORA_RANK" \
     FT_LORA_ALPHA="$FT_LORA_ALPHA" FT_LORA_DROPOUT="$FT_LORA_DROPOUT" FT_LORA_TARGET="$FT_LORA_TARGET" \
     FT_LEARNING_RATE="$FT_LEARNING_RATE" FT_LR_SCHEDULER_TYPE="$FT_LR_SCHEDULER_TYPE" \
@@ -264,6 +287,7 @@ log = {
     "git_commit": e["GIT_COMMIT"],
     "git_dirty": e["GIT_DIRTY"] == "1",
     "ft_seed": int(e["FT_SEED"]),
+    "ft_fingerprint": e["FT_FINGERPRINT"],
     "hardware": hardware,
     "model": e["BASE_MODEL"],
     "lora_dir": e["LORA_DIR"],
@@ -330,8 +354,8 @@ phase_benchmark() {
     echo "[INFO] Starting benchmark: $BENCH_SCRIPT ${args[*]}"
     python "$BENCH_SCRIPT" "${args[@]}"
 
-    printf '{"run_id": "%s", "slurm_job_id": "%s", "finished_at": "%s"}\n' \
-        "$RUN_ID" "${SLURM_JOB_ID:-}" "$(date -Iseconds)" > "$BENCH_DONE"
+    printf '{"run_id": "%s", "slurm_job_id": "%s", "finished_at": "%s", "bench_fingerprint": "%s"}\n' \
+        "$RUN_ID" "${SLURM_JOB_ID:-}" "$(date -Iseconds)" "$BENCH_FINGERPRINT" > "$BENCH_DONE"
     echo "[INFO] Benchmark done: $BENCH_DONE"
 }
 
@@ -339,8 +363,12 @@ phase_benchmark() {
 # Schlägt eine Phase fehl, bricht set -e den Job ab (keine Marker, kein Meta-Eintrag).
 if has_stage ft_bench; then
     if ft_done; then
-        echo "[SKIP] FT: Adapter + $FT_LOG_JSON vorhanden."
+        echo "[SKIP] FT: Adapter + $FT_LOG_JSON vorhanden (Fingerprint aktuell)."
     else
+        if [[ -f "$FT_LOG_JSON" ]]; then
+            echo "[STALE] FT: Config geändert (ft_fingerprint in $FT_LOG_JSON:" \
+                 "'$(marker_fingerprint "$FT_LOG_JSON" ft_fingerprint)', aktuell: '$FT_FINGERPRINT') -> neu trainieren."
+        fi
         ft_prepare
         run_phase ft phase_train
     fi
@@ -348,9 +376,20 @@ elif ! has_stage bench; then
     die "Run $RUN_ID hat weder Stage 'bench' noch 'ft_bench' (stages: ${STAGES[*]})."
 fi
 
-if [[ -f "$BENCH_DONE" ]]; then
-    echo "[SKIP] Bench: $BENCH_DONE vorhanden."
+if [[ -f "$BENCH_DONE" && "$(marker_fingerprint "$BENCH_DONE" bench_fingerprint)" == "$BENCH_FINGERPRINT" ]]; then
+    echo "[SKIP] Bench: $BENCH_DONE vorhanden (Fingerprint aktuell)."
 else
+    if [[ -f "$BENCH_DONE" ]]; then
+        echo "[STALE] Bench: Config geändert (bench_fingerprint in $BENCH_DONE:" \
+             "'$(marker_fingerprint "$BENCH_DONE" bench_fingerprint)', aktuell: '$BENCH_FINGERPRINT') -> neu rechnen."
+        move_stale "$BENCH_DONE" "$BENCH_JSONL"
+    fi
+    # Abgebrochener Lauf unter anderer (oder unbekannter) Config: nicht per --resume fortsetzen.
+    if [[ -f "$BENCH_JSONL" && "$(marker_fingerprint "$BENCH_STARTED" bench_fingerprint)" != "$BENCH_FINGERPRINT" ]]; then
+        echo "[STALE] Bench: $BENCH_JSONL wurde unter anderer/unbekannter Config begonnen -> neu rechnen."
+        move_stale "$BENCH_JSONL"
+    fi
+    printf '{"bench_fingerprint": "%s"}\n' "$BENCH_FINGERPRINT" > "$BENCH_STARTED"
     run_phase bench phase_benchmark
 fi
 

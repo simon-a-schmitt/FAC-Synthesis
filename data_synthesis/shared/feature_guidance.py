@@ -71,7 +71,8 @@ def add_feature_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--sae-ckpt-path", type=str, required=True)
     group.add_argument("--layer", type=int, default=16)
     group.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
-    group.add_argument("--device-id", type=str, default="0")
+    group.add_argument("--device-id", type=str, default="0",
+                       help="CUDA_VISIBLE_DEVICES to use if it is not already set (e.g. by SLURM).")
     group.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"])
     group.add_argument("--hf-cache-dir", type=str, default=os.environ.get("TRANSFORMERS_CACHE", ""))
 
@@ -173,7 +174,13 @@ def load_sae_context(args: argparse.Namespace) -> SaeContext:
         os.makedirs(args.hf_cache_dir, exist_ok=True)
     if args.device == "cuda":
         os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
+        # Never override an existing assignment (SLURM sets CUDA_VISIBLE_DEVICES to the job's GPUs);
+        # --device-id only applies outside such an environment.
+        if "CUDA_VISIBLE_DEVICES" in os.environ:
+            print(f"Using CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']} from the environment "
+                  f"(--device-id {args.device_id} ignored).")
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
     if str(FAC_TEST_PIPELINE_DIR) not in sys.path:
         sys.path.insert(0, str(FAC_TEST_PIPELINE_DIR))
     import run_fac_test_pipeline_feature_stats as fs  # noqa: E402

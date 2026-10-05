@@ -5,17 +5,23 @@ Exit 0 = check passed, 1 = failed (reason on stdout).
                       GEN_LOG_JSON has prefix == run_id and at least one completed run, and the
                       accepted pool holds exactly n_synthetic synthetic entries (hybrid: n_blackbox +
                       n_feature_guided, and per phase n_blackbox / n_feature_guided) after its seeds.
+  gen-state <run_id>  prints the generation state of the run (for experiments/slurm/gen_job.sh):
+                      done (gen-done passes), resume (GEN_CHECKPOINT_JSON exists), fresh (no output
+                      at all) or partial (outputs but neither done nor a checkpoint - exit 1).
   labels <run_id>     LABEL_TSV is complete: every seed + synthetic text of the accepted pool has a
                       non-empty label and the TSV has n_total rows. Missing ones are listed by their
                       synthetic index (position among the synthetic entries of the accepted pool).
 
-labels also reports how many labels run_labeling.py set by majority fallback (summed over all
-runs in LABEL_LOG_JSON): those rows are complete, and a rerun keeps them - run_labeling.py only
-re-requests blank labels.
+labels also fails if more than MAX_MAJORITY_FALLBACK_RATE of the synthetic examples got their
+label by run_labeling.py's majority fallback (summed over all runs in LABEL_LOG_JSON): those rows
+look complete, and a rerun keeps them - run_labeling.py only re-requests blank labels.
+  fallbacks <run_id>  prints only that count (for run_meta.json).
 
 Usage:
     python experiments/label_build_checks.py gen-done <run_id>
+    python experiments/label_build_checks.py gen-state <run_id>
     python experiments/label_build_checks.py labels <run_id>
+    python experiments/label_build_checks.py fallbacks <run_id>
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ from pathlib import Path
 
 from runs import GEN_ARMS, load_config, parse_run_id, resolve
 
+MAX_MAJORITY_FALLBACK_RATE = 0.02
 PHASES = {"blackbox": "n_blackbox", "feature_guided": "n_feature_guided"}  # hybrid entry "phase" -> resolve key
 
 
@@ -71,6 +78,18 @@ def check_gen_done(r: dict) -> list[str]:
     return errors
 
 
+def gen_state(r: dict) -> tuple[str, list[str]]:
+    if Path(r["gen_checkpoint_json"]).exists():
+        return "resume", []
+    outputs = [r[k] for k in r if k.startswith("gen_") and k.endswith("_json") and Path(r[k]).exists()]
+    if not outputs:
+        return "fresh", []
+    errors = check_gen_done(r)
+    if not errors:
+        return "done", []
+    return "partial", errors + [f"existing outputs without checkpoint: {', '.join(Path(o).name for o in outputs)}"]
+
+
 def majority_fallbacks(r: dict) -> int:
     log = Path(r["label_log_json"])
     if not log.is_file():
@@ -97,12 +116,16 @@ def check_labels(r: dict, n_total: int) -> list[str]:
         errors.append(f"{len(missing)} synthetic example(s) without label (synthetic index {shown})")
     if len(rows) != n_total:
         errors.append(f"{len(rows)} rows in {tsv.name}, expected n_total={n_total}")
+    n_fallback = majority_fallbacks(r)
+    if synthetic and n_fallback / len(synthetic) > MAX_MAJORITY_FALLBACK_RATE:
+        errors.append(f"{n_fallback}/{len(synthetic)} synthetic labels set by majority fallback "
+                      f"({n_fallback / len(synthetic):.1%} > {MAX_MAJORITY_FALLBACK_RATE:.0%}; see {r['label_log_json']})")
     return errors
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("check", choices=("gen-done", "labels"))
+    parser.add_argument("check", choices=("gen-done", "gen-state", "labels", "fallbacks"))
     parser.add_argument("run_id")
     args = parser.parse_args()
 
@@ -114,6 +137,15 @@ def main() -> None:
     if r["arm"] not in GEN_ARMS:
         raise SystemExit(f"error: {args.run_id} is not a generation run (arm {r['arm']!r}).")
 
+    if args.check == "gen-state":
+        state, errors = gen_state(r)
+        for e in errors:
+            print(f"[gen-state] {args.run_id}: {e}", file=sys.stderr)
+        print(state)
+        sys.exit(1 if state == "partial" else 0)
+    if args.check == "fallbacks":
+        print(majority_fallbacks(r))
+        return
     if args.check == "gen-done":
         errors = check_gen_done(r)
         ok_msg = f"generation complete ({r['gen_accepted_json']})"

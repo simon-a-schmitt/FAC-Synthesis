@@ -25,7 +25,7 @@
 #                 Abbruch ohne Labeling.
 #   Labeling:     data_synthesis/labeling/run_labeling.py (fortsetzbar), bis zu $MAX_LABEL_PASSES
 #                 Durchläufe, solange Labels fehlen; danach Vollständigkeit (label_build_checks.py
-#                 labels: Zeilen == n_total), sonst Exit != 0 mit fehlenden Indizes.
+#                 labels: Zeilen == n_total, Majority-Fallback <= 2 %), sonst Exit != 0.
 #   Dataset:      experiments/prepare_lf_dataset.py <run_id> (Gate).
 #   Meta:         experiments/run_meta.py, stage label_build.
 # ---------------------------------------------------------------------------
@@ -106,7 +106,9 @@ python experiments/prepare_lf_dataset.py "$RUN_ID"
 
 wall=$(( SECONDS - t0 ))
 echo "[TIME] label_build: $(( wall / 60 )) min $(( wall % 60 )) s"
+n_fallback="$(python experiments/label_build_checks.py fallbacks "$RUN_ID")"
 python experiments/run_meta.py "$RUN_ID" --stage label_build \
-    --started-at "$started_at" --finished-at "$(date -Iseconds)" --wall-seconds "$wall"
+    --started-at "$started_at" --finished-at "$(date -Iseconds)" --wall-seconds "$wall" \
+    --extra-json "{\"n_majority_fallback\": $n_fallback}"
 
 echo "[INFO] Job finished successfully. Total: $(( SECONDS / 60 )) min $(( SECONDS % 60 )) s"

@@ -3,6 +3,7 @@ other stages): {slurm_job_id, node, gpu, started_at, finished_at, wall_seconds, 
 git_dirty} under "stages"/<stage>, plus - once - the sha256 of TEST_TSV and SEED_FILE under
 "inputs". A later, different hash of an input keeps the recorded one (it belongs to the results
 already there) and prints a warning. "gpu" is left out when no GPU is visible (CPU jobs).
+--extra-json adds stage-specific fields (e.g. n_majority_fallback for label_build, pack for gen).
 
 Usage (from the job scripts, after a stage has finished successfully):
     python experiments/run_meta.py <run_id> --stage ft --started-at 2026-10-05T09:44:04+02:00 \
@@ -48,7 +49,8 @@ def gpu_name() -> str | None:
     return out.splitlines()[0] if out else None
 
 
-def merge_stage(r: dict, stage: str, started_at: str, finished_at: str, wall_seconds: int) -> Path:
+def merge_stage(r: dict, stage: str, started_at: str, finished_at: str, wall_seconds: int,
+                extra: dict | None = None) -> Path:
     path = Path(r["run_meta_json"])
     meta = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     meta["run_id"] = r["run_id"]
@@ -74,6 +76,7 @@ def merge_stage(r: dict, stage: str, started_at: str, finished_at: str, wall_sec
     }
     if record["gpu"] is None:
         del record["gpu"]
+    record.update(extra or {})
     meta.setdefault("stages", {})[stage] = record
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -90,13 +93,15 @@ def main() -> None:
     parser.add_argument("--started-at", required=True)
     parser.add_argument("--finished-at", required=True)
     parser.add_argument("--wall-seconds", type=int, required=True)
+    parser.add_argument("--extra-json", type=json.loads, default=None,
+                        help='Additional fields of the stage record, e.g. \'{"n_majority_fallback": 0}\'.')
     args = parser.parse_args()
 
     try:
         r = resolve(parse_run_id(args.run_id), load_config())
     except ValueError as exc:
         raise SystemExit(f"error: {exc}")
-    path = merge_stage(r, args.stage, args.started_at, args.finished_at, args.wall_seconds)
+    path = merge_stage(r, args.stage, args.started_at, args.finished_at, args.wall_seconds, args.extra_json)
     print(f"[INFO] run_meta.json aktualisiert (stage {args.stage}): {path}")
 
 
