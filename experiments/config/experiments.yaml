@@ -9,8 +9,8 @@
 #       ~/ft_bench_{claudette,toxicity,cti_vsp}.sh (identical FT hyperparameters in all three;
 #       claudette defines them as variables, toxicity/cti_vsp hard-code the same values).
 #       The FT seed is deliberately NOT here: it is derived per run (PURPOSE_FINE_TUNING).
-#   sae_ckpt
-#       data_synthesis/{feature_guided,hybrid}/*_generation_job.sh
+#   sae_ckpt, api.*.max_concurrent_requests
+#       data_synthesis/{blackbox,feature_guided,hybrid,labeling}/*_job.sh
 #   rouge_threshold / activation_threshold
 #       claudette_tos: job scripts (0.5 / 0.0). toxicity_detection / cti_vsp: not in any job
 #       script; taken from the logs of the latest fg/hybrid runs
@@ -45,7 +45,13 @@ global:
     warmup_ratio: 0.0
     batch_size: 4      # per_device_train_batch_size
     grad_accum: 4      # gradient_accumulation_steps
-    cutoff_len: 1024
+    cutoff_len: 4096   # >= longest FT example (cti_vsp gold pool max 1653; generation max_tokens 2048 + prompt/label); checked by the gate in prepare_lf_dataset.py
+
+# OpenRouter request concurrency (--max-concurrent-requests); as in
+# data_synthesis/{blackbox,feature_guided,hybrid}/*_generation_job.sh and labeling/labeling_job.sh.
+api:
+  generation: {max_concurrent_requests: 2}
+  labeling: {max_concurrent_requests: 2}
 
 # gen_model: preset of data_synthesis/shared/openrouter.py GENERATION_MODEL_PRESETS
 # label_model: preset of data_synthesis/labeling/run_labeling.py MODEL_PRESETS
@@ -64,7 +70,7 @@ benchmarks:
     bench_script: benchmark_play_ground/run_toxicity_benchmark.py
     test_tsv: benchmarks/toxicity_detection/tsv_files/toxicity_test_set.tsv
     max_prompts: 3000
-    bench_extra_args: ["--max-input-tokens", "1024", "--batch-size", "8"]
+    bench_extra_args: ["--batch-size", "8"]
     gold_pool_tsv: benchmarks/toxicity_detection/tsv_files/toxicity_holdout_set.tsv
 
   claudette_tos:

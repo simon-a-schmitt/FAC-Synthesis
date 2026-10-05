@@ -15,6 +15,10 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from benchmark_play_ground.data_loader import load_claudette_tsv
 from benchmark_play_ground.model_wrapper import LocalModel
+from benchmark_play_ground.truncation import (
+    format_truncation_summary, prompt_token_counts, require_no_truncation, truncation_fields,
+    truncation_summary,
+)
 from benchmark_play_ground.slot_scoring import (
     SlotPlan,
     SlotPlanError,
@@ -716,8 +720,9 @@ def main():
             print(final_model_input)
             print("=== End final model input ===")
 
+        batch_scored = None
         try:
-            batch_predicted_metrics, batch_vectors, batch_slot_log_odds, batch_slot_ties = generate_batch(
+            batch_scored = generate_batch(
                 hf_model,
                 tokenizer,
                 batch_texts,
@@ -731,27 +736,27 @@ def main():
             if "CUDA error" not in msg and not is_oom:
                 raise
 
-            # Retry once with a tighter context window to avoid transient GPU kernel failures
-            # (or, for OOM, after generate_batch() has already halved the batch down to a
-            # single prompt and still couldn't fit it).
+            print(
+                f"CUDA generation failed for batch starting at index {idx} ({type(e).__name__}). "
+                f"Retrying once (prompts are never truncated)..."
+            )
+        # Retry once after a transient GPU kernel failure (an OOM was already split down to a
+        # single prompt inside generate_batch()). It runs outside the except block (see
+        # generate_batch) and never shortens a prompt: one that does not fit fails the run.
+        if batch_scored is None:
             if args.device == "cuda" and torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-            fallback_max_input = args.max_input_tokens if args.max_input_tokens else 2048
-            fallback_max_input = min(fallback_max_input, 2048)
-            print(
-                f"CUDA generation failed for batch starting at index {idx}. Retrying with max_input_tokens={fallback_max_input}..."
-            )
-
-            batch_predicted_metrics, batch_vectors, batch_slot_log_odds, batch_slot_ties = generate_batch(
+            batch_scored = generate_batch(
                 hf_model,
                 tokenizer,
                 batch_texts,
-                max_input_tokens=fallback_max_input,
+                max_input_tokens=args.max_input_tokens,
                 device=args.device,
                 plan=plan,
             )
+        batch_predicted_metrics, batch_vectors, batch_slot_log_odds, batch_slot_ties = batch_scored
 
+        batch_n_tokens = prompt_token_counts(tokenizer, batch_texts)
         for offset, (rec, query_prompt, pred_metrics, vector, slot_log_odds, slot_ties) in enumerate(
             zip(batch_records, batch_query_prompts, batch_predicted_metrics, batch_vectors, batch_slot_log_odds, batch_slot_ties)
         ):
@@ -776,6 +781,7 @@ def main():
                 "correct": metrics_match(predicted_metrics, gt_metrics),
                 "slot_log_odds": slot_log_odds,
                 "ties": slot_ties,
+                **truncation_fields(batch_n_tokens[offset], args.max_input_tokens),
             }
             fh.write(json.dumps(result, ensure_ascii=False) + "\n")
             fh.flush()
@@ -852,10 +858,14 @@ def main():
             f"recall={c['recall_trivial_all_N']:.4f}  f1={c['f1_trivial_all_N']:.4f}"
         )
 
+    summary["truncation"] = truncation_summary(results, args.max_input_tokens)
+    print(format_truncation_summary(summary["truncation"]))
+
     summary_path = out_path.with_suffix(".summary.json")
     with summary_path.open("w", encoding="utf-8") as sfh:
         json.dump(summary, sfh, indent=2)
     print(f"Summary written to {summary_path}")
+    require_no_truncation(summary["truncation"])
 
 
 if __name__ == "__main__":

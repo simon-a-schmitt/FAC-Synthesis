@@ -86,60 +86,10 @@ gpu_diagnostics() {
     echo ""
 }
 
-# ---- d) RUN_META_JSON mergen (nach jeder ausgeführten Phase) ----------------------
+# ---- d) RUN_META_JSON mergen (nach jeder ausgeführten Phase), siehe experiments/run_meta.py ----
 # Args: <stage> <started_at> <finished_at> <wall_seconds>
 merge_run_meta() {
-    STAGE="$1" STARTED_AT="$2" FINISHED_AT="$3" WALL_SECONDS="$4" \
-    RUN_META_JSON="$RUN_META_JSON" RUN_ID="$RUN_ID" GIT_COMMIT="$GIT_COMMIT" GIT_DIRTY="$GIT_DIRTY" \
-    TEST_TSV="$TEST_TSV" SEED_FILE="${SEED_FILE:-}" \
-    python3 - <<'PYEOF'
-import hashlib, json, os, subprocess
-from pathlib import Path
-
-e = os.environ
-path = Path(e["RUN_META_JSON"])
-meta = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-meta["run_id"] = e["RUN_ID"]
-
-def sha256(p):
-    h = hashlib.sha256()
-    with open(p, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-# Einmalig: Hash der Testdaten / Seed-Datei. Weicht ein späterer Hash ab, bleibt der alte stehen
-# (er gehört zu den bereits vorhandenen Ergebnissen) und es wird laut gewarnt.
-for key, p in (("test_tsv", e["TEST_TSV"]), ("seed_file", e["SEED_FILE"])):
-    if not p:
-        continue
-    entry = {"path": p, "sha256": sha256(p)}
-    old = meta.setdefault("inputs", {}).setdefault(key, entry)
-    if old["sha256"] != entry["sha256"]:
-        print(f"WARNUNG: sha256 von {p} weicht von run_meta.json ab ({old['sha256']} -> {entry['sha256']}).")
-
-gpu = None
-try:
-    gpu = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-                         capture_output=True, text=True, check=True).stdout.strip().splitlines()[0]
-except Exception:
-    pass
-
-meta.setdefault("stages", {})[e["STAGE"]] = {
-    "slurm_job_id": e.get("SLURM_JOB_ID"),
-    "node": os.uname().nodename,
-    "gpu": gpu,
-    "started_at": e["STARTED_AT"],
-    "finished_at": e["FINISHED_AT"],
-    "wall_seconds": int(e["WALL_SECONDS"]),
-    "git_commit": e["GIT_COMMIT"],
-    "git_dirty": e["GIT_DIRTY"] == "1",
-}
-tmp = path.with_name(path.name + ".tmp")
-tmp.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-os.replace(tmp, path)
-print(f"[INFO] run_meta.json aktualisiert (stage {e['STAGE']}): {path}")
-PYEOF
+    python experiments/run_meta.py "$RUN_ID" --stage "$1" --started-at "$2" --finished-at "$3" --wall-seconds "$4"
 }
 
 # Args: <stage> <function>

@@ -54,6 +54,10 @@ sys.path.insert(0, str(ROOT_DIR))
 from benchmark_play_ground.data_loader import load_toxicity_tsv
 from benchmark_play_ground.evaluator import format_confusion_matrix
 from benchmark_play_ground.model_wrapper import LocalModel
+from benchmark_play_ground.truncation import (
+    format_truncation_summary, prompt_token_counts, require_no_truncation, truncation_fields,
+    truncation_summary,
+)
 from benchmark_play_ground.slot_scoring import (
     SlotPlan,
     SlotPlanError,
@@ -213,9 +217,16 @@ def generate_batch(
     input_ids = padded["input_ids"].to(device)
     attention_mask = padded["attention_mask"].to(device)
 
+    slot_results = None
     try:
         slot_results = score_slots(hf_model, input_ids, attention_mask, plan, device=device)
     except torch.cuda.OutOfMemoryError:
+        if len(texts) <= 1:
+            raise
+    # The retry must run outside the except block: while the exception is being handled,
+    # its traceback keeps score_slots()' frames - and with them the full-sequence logits of
+    # the failed attempt - alive, so every halved retry would start on an already full GPU.
+    if slot_results is None:
         # The first score_slots() forward runs the whole prompt through the LM head
         # and casts the FULL-sequence logits to fp32 (HF Llama < 4.44 has no
         # num_logits_to_keep), so its transient peak is
@@ -228,8 +239,6 @@ def generate_batch(
         gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
-        if len(texts) <= 1:
-            raise
         mid = len(texts) // 2
         print(
             f"CUDA OOM at batch size {len(texts)}. Splitting into sub-batches of "
@@ -629,26 +638,29 @@ def main():
             is_oom = isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in msg.lower()
             if "CUDA error" not in msg and not is_oom:
                 raise
+            print(
+                f"CUDA scoring failed for batch starting at index {idx} ({type(e).__name__}). "
+                f"Retrying once, one prompt at a time (prompts are never truncated)...",
+                flush=True,
+            )
+            batch_out = None
+        # generate_batch() already halves the batch internally on a pure OOM and only re-raises
+        # once it is down to a single prompt, so getting here means even one prompt did not fit
+        # (or a transient CUDA-kernel error). The retry runs outside the except block (see
+        # generate_batch) and only splits the batch: a prompt that does not fit fails the run
+        # instead of being silently shortened.
+        if batch_out is None:
             gc.collect()
             if args.device == "cuda" and torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            # generate_batch() already halves the batch internally on a pure OOM and
-            # only re-raises once it is down to a single prompt, so getting here means
-            # even one prompt did not fit (or a transient CUDA-kernel error). Retry
-            # once with a hard token cap AND one prompt at a time.
-            fallback_max_input = min(args.max_input_tokens or 1024, 1024)
-            print(
-                f"CUDA scoring failed for batch starting at index {idx}. Retrying "
-                f"one prompt at a time with max_input_tokens={fallback_max_input}...",
-                flush=True,
-            )
             batch_out = []
             for one_text in batch_texts:
                 batch_out.extend(generate_batch(
                     hf_model, tokenizer, [one_text],
-                    max_input_tokens=fallback_max_input, device=args.device, plan=plan,
+                    max_input_tokens=args.max_input_tokens, device=args.device, plan=plan,
                 ))
 
+        batch_n_tokens = prompt_token_counts(tokenizer, batch_texts)
         for offset, (rec, query_prompt, pred) in enumerate(zip(batch_records, batch_query_prompts, batch_out)):
             gt = rec.get("gt", "")
             gt_label = extract_toxicity_label_from_text(gt)
@@ -666,6 +678,7 @@ def main():
                 # None (not False) when gt_label failed to parse -- see
                 # evaluate_toxicity_predictions()'s n_unparsable_gt handling.
                 "correct": (pred["predicted"] == gt_label) if gt_label is not None else None,
+                **truncation_fields(batch_n_tokens[offset], args.max_input_tokens),
             }
             fh.write(json.dumps(result, ensure_ascii=False) + "\n")
             fh.flush()
@@ -690,10 +703,14 @@ def main():
     summary = evaluate_toxicity_predictions(results)
     _print_summary(summary)
 
+    summary["truncation"] = truncation_summary(results, args.max_input_tokens)
+    print(format_truncation_summary(summary["truncation"]))
+
     summary_path = out_path.with_suffix(".summary.json")
     with summary_path.open("w", encoding="utf-8") as sfh:
         json.dump(summary, sfh, indent=2)
     print(f"Summary written to {summary_path}")
+    require_no_truncation(summary["truncation"])
 
 
 if __name__ == "__main__":

@@ -62,6 +62,10 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from benchmark_play_ground.data_loader import load_cti_vsp_tsv
 from benchmark_play_ground.model_wrapper import LocalModel
+from benchmark_play_ground.truncation import (
+    format_truncation_summary, prompt_token_counts, require_no_truncation, truncation_fields,
+    truncation_summary,
+)
 
 
 CVSS_METRICS = ["AV", "AC", "PR", "UI", "S", "C", "I", "A"]
@@ -414,6 +418,7 @@ def generate_batch(hf_model, tokenizer, texts: list[str], *, max_new_tokens: int
     input_ids = padded["input_ids"].to(device)
     attention_mask = padded["attention_mask"].to(device)
 
+    outputs = None
     try:
         outputs = hf_model.generate(
             input_ids=input_ids,
@@ -426,6 +431,12 @@ def generate_batch(hf_model, tokenizer, texts: list[str], *, max_new_tokens: int
             pad_token_id=tokenizer.pad_token_id,
         )
     except torch.cuda.OutOfMemoryError:
+        if len(texts) <= 1:
+            raise
+    # The retry must run outside the except block: while the exception is being handled,
+    # its traceback keeps generate()'s frames - and with them the full-sequence logits of the
+    # failed attempt - alive, so every halved retry would start on an already full GPU.
+    if outputs is None:
         # This transformers version computes logits over the *full* padded sequence
         # (no logits_to_keep slicing), so peak memory scales with batch_size * seq_len *
         # vocab_size. Long CTI-VSP prompts can blow this up well before the requested
@@ -433,8 +444,6 @@ def generate_batch(hf_model, tokenizer, texts: list[str], *, max_new_tokens: int
         # the batch in half and retrying is the standard fallback for that.
         if device == "cuda":
             torch.cuda.empty_cache()
-        if len(texts) <= 1:
-            raise
         mid = len(texts) // 2
         print(f"CUDA OOM at batch size {len(texts)}. Splitting into sub-batches of {mid} and {len(texts) - mid}...")
         first = generate_batch(hf_model, tokenizer, texts[:mid], max_new_tokens=max_new_tokens, max_input_tokens=max_input_tokens, device=device)
@@ -564,27 +573,27 @@ def main():
             if "CUDA error" not in msg and not is_oom:
                 raise
 
-            # Retry once with a tighter context window to avoid transient GPU kernel failures
-            # (or, for OOM, after generate_batch() has already halved the batch down to a
-            # single prompt and still couldn't fit it).
+            print(
+                f"CUDA generation failed for batch starting at index {idx} ({type(e).__name__}). "
+                f"Retrying once (prompts are never truncated)..."
+            )
+            batch_raw = None
+        # Retry once after a transient GPU kernel failure (an OOM was already split down to a
+        # single prompt inside generate_batch()). It runs outside the except block (see
+        # generate_batch) and never shortens a prompt: one that does not fit fails the run.
+        if batch_raw is None:
             if args.device == "cuda" and torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-            fallback_max_input = args.max_input_tokens if args.max_input_tokens else 2048
-            fallback_max_input = min(fallback_max_input, 2048)
-            print(
-                f"CUDA generation failed for batch starting at index {idx}. Retrying with max_input_tokens={fallback_max_input}..."
-            )
-
             batch_raw = generate_batch(
                 hf_model,
                 tokenizer,
                 batch_texts,
                 max_new_tokens=args.max_new_tokens,
-                max_input_tokens=fallback_max_input,
+                max_input_tokens=args.max_input_tokens,
                 device=args.device,
             )
 
+        batch_n_tokens = prompt_token_counts(tokenizer, batch_texts)
         for offset, (rec, query_prompt, raw) in enumerate(zip(batch_records, batch_query_prompts, batch_raw)):
             gt = rec.get("gt", "")
             pred_vector = extract_cvss_vector_from_text(raw)
@@ -602,6 +611,7 @@ def main():
                 "gt_metrics": gt_metrics,
                 "gt_score": cvss3_base_score(gt_metrics),
                 "correct": metrics_match(predicted_metrics, gt_metrics),
+                **truncation_fields(batch_n_tokens[offset], args.max_input_tokens),
             }
             fh.write(json.dumps(result, ensure_ascii=False) + "\n")
             fh.flush()
@@ -660,10 +670,14 @@ def main():
                 f"recall={stats['recall_trivial']:.4f}  f1={stats['f1_trivial']:.4f}"
             )
 
+    summary["truncation"] = truncation_summary(results, args.max_input_tokens)
+    print(format_truncation_summary(summary["truncation"]))
+
     summary_path = out_path.with_suffix(".summary.json")
     with summary_path.open("w", encoding="utf-8") as sfh:
         json.dump(summary, sfh, indent=2)
     print(f"Summary written to {summary_path}")
+    require_no_truncation(summary["truncation"])
 
 
 if __name__ == "__main__":

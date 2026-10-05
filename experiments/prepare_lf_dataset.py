@@ -12,11 +12,17 @@ Gate (any violation is an error, nothing is moved into place):
     order (seeds come first in both gold sets and labeled TSVs). Compared after
     shared.text_cleaning.clean_seed_text, since generation arms store the cleaned seed text;
     the "CVE Description: " prefix of cti_vsp is stripped first.
+  - no example is longer than FT_CUTOFF_LEN tokens (LLaMA-Factory would silently cut it):
+    counted like LLaMA-Factory's llama3 template encodes an SFT example - BOS + system slot +
+    user slot as source, assistant slot as target, every element tokenized on its own with the
+    base model's tokenizer (src/llamafactory/data/template.py; truncation happens when
+    len(source) + len(target) > cutoff_len, data/processor/supervised.py).
 
 Idempotent: if dataset + dataset_info.json exist and pass the gate, nothing is done.
+--check only reports that state (exit 0 = prepared, 1 = not prepared) and changes nothing.
 
 Usage:
-    python experiments/prepare_lf_dataset.py <run_id>
+    python experiments/prepare_lf_dataset.py <run_id> [--check]
 """
 
 from __future__ import annotations
@@ -43,6 +49,37 @@ def dataset_info(r: dict) -> dict:
     return {r["lf_dataset_name"]: {"file_name": Path(r["lf_dataset_json"]).name, "columns": COLUMNS}}
 
 
+# LLaMA-Factory template "llama3" (format_prefix = BOS, format_system, format_user, format_assistant).
+LLAMA3_SLOTS = {
+    "system": "<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>",
+    "user": "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+    "assistant": "{}<|eot_id|>",
+}
+_TOKENIZERS: dict = {}
+
+
+def ft_token_lengths(data: list[dict], r: dict) -> list[int]:
+    """Token length of every example as LLaMA-Factory builds it for SFT (source + target)."""
+    if r["ft_template"] != "llama3":
+        raise SystemExit(f"error: token-length gate only implements the llama3 template, got {r['ft_template']!r}.")
+    if r["base_model"] not in _TOKENIZERS:
+        from transformers import AutoTokenizer
+        _TOKENIZERS[r["base_model"]] = AutoTokenizer.from_pretrained(r["base_model"])
+    tok = _TOKENIZERS[r["base_model"]]
+
+    def enc(text: str) -> int:
+        return len(tok.encode(text, add_special_tokens=False)) if text else 0
+
+    lengths = []
+    for ex in data:
+        # LLaMA-Factory's alpaca converter joins instruction and input with "\n".
+        prompt = "\n".join(part for part in (ex.get("instruction", ""), ex.get("input", "")) if part)
+        n = 1 + (enc(LLAMA3_SLOTS["system"].format(ex["system"])) if ex.get("system") else 0)  # 1 = BOS
+        n += enc(LLAMA3_SLOTS["user"].format(prompt)) + enc(LLAMA3_SLOTS["assistant"].format(ex["output"]))
+        lengths.append(n)
+    return lengths
+
+
 def normalize_seed(text: str, bench: str) -> str:
     if bench == "cti_vsp" and text.startswith(CTI_VSP_PREFIX):
         text = text[len(CTI_VSP_PREFIX):]
@@ -64,6 +101,11 @@ def gate(dataset_path: Path, r: dict, n_total: int) -> list[str]:
     if mismatch:
         errors.append(f"first {len(seeds)} instructions do not match the seed texts of {r['seed_file']} "
                       f"(mismatch at seed index {mismatch})")
+    lengths = ft_token_lengths(data, r)
+    too_long = [i for i, n in enumerate(lengths) if n > r["ft_cutoff_len"]]
+    if too_long:
+        errors.append(f"{len(too_long)} example(s) longer than ft_cutoff_len={r['ft_cutoff_len']} tokens "
+                      f"(indices {too_long[:20]}{', ...' if len(too_long) > 20 else ''}; max {max(lengths)})")
     return errors
 
 
@@ -72,17 +114,19 @@ def is_prepared(r: dict, n_total: int) -> bool:
     if not (dataset_path.is_file() and info_path.is_file()):
         return False
     if json.loads(info_path.read_text(encoding="utf-8")) != dataset_info(r):
-        print(f"[prepare] {info_path} does not match the expected entry; rebuilding.")
+        print(f"[prepare] {info_path} does not match the expected entry.")
         return False
     errors = gate(dataset_path, r, n_total)
     for e in errors:
-        print(f"[prepare] existing dataset fails the gate: {e}; rebuilding.")
+        print(f"[prepare] existing dataset fails the gate: {e}")
     return not errors
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("run_id")
+    parser.add_argument("--check", action="store_true",
+                        help="Only check: exit 0 if the dataset is prepared and passes the gate, else 1.")
     args = parser.parse_args()
 
     config = load_config()
@@ -102,6 +146,9 @@ def main() -> None:
     if is_prepared(r, n_total):
         print(f"[prepare] {args.run_id}: dataset present and gate passed, nothing to do ({dataset_path}).")
         return
+    if args.check:
+        print(f"[prepare] {args.run_id}: not prepared ({dataset_path}).")
+        sys.exit(1)
     if not source.is_file():
         raise SystemExit(f"error: source TSV {source} does not exist.")
 

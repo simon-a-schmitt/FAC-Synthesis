@@ -285,7 +285,9 @@ def resolve(spec: RunSpec, config: dict) -> dict:
         if spec.arm in ("fg", "hybrid"):
             r.update(activation_threshold=b["activation_threshold"], sae_ckpt=WS_PATH / g["sae_ckpt"])
         r.update(generation_paths(arm_dir, spec.bench, run_id))
-        r.update(label_source=arm_dir, label_model=setup["label_model"])
+        r.update(label_source=arm_dir, label_model=setup["label_model"],
+                 gen_max_concurrent=config["api"]["generation"]["max_concurrent_requests"],
+                 label_max_concurrent=config["api"]["labeling"]["max_concurrent_requests"])
         r.update(labeling_paths(spec.bench, run_id))
     if is_ft:
         r.update(
