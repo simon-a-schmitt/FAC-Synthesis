@@ -43,6 +43,12 @@ stable reference independent of this run's parse rate), but scored over that
 same evaluated-examples subset as the real predictions, so the two arms stay
 directly comparable. Per-slot support / precision / recall / F1 (and their
 trivial-baseline counterparts) are reported under "per_metric".
+
+--mode api (--api-model llama|deepseek|gpt) sends the plain-mode messages to an
+OpenRouter model (benchmark_play_ground/api_prediction.py) at temperature 0
+with max_tokens = --max-new-tokens. The stop strings are applied to the
+returned text afterwards (cut at the first one), so the parsed output matches
+what the local generate() with stop_strings would have produced.
 """
 from __future__ import annotations
 
@@ -60,6 +66,9 @@ from cvss.exceptions import CVSSError
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
+from benchmark_play_ground.api_prediction import (
+    ApiPredictor, add_api_cli_args, check_resume_api_model, first_messages_dump, validate_api_args,
+)
 from benchmark_play_ground.data_loader import load_cti_vsp_tsv
 from benchmark_play_ground.model_wrapper import LocalModel
 from benchmark_play_ground.truncation import (
@@ -355,20 +364,22 @@ def evaluate_cti_vsp_predictions(
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model-path", required=True, help="Local model directory for Llama-3.1-8b-Instruct")
+    p.add_argument("--model-path", default=None, help="Local model directory for Llama-3.1-8b-Instruct; not used with --mode api")
     p.add_argument("--data-tsv", required=True, help="CTI-VSP TSV file (cti_vsp_benchmark_test_500.tsv)")
     p.add_argument("--few-shot-tsv", default=None, help="Optional TSV with few-shot examples")
-    p.add_argument("--mode", choices=("plain", "icl", "fine_tuned"), default="plain")
+    p.add_argument("--mode", choices=("plain", "icl", "fine_tuned", "api"), default="plain",
+                   help="api: plain-mode prompt sent to the OpenRouter model --api-model")
     p.add_argument("--icl-k", type=int, default=5, help="Number of few-shot examples to include")
     p.add_argument("--lora-path", default=None, help="Path to LoRA adapter weights (required for --mode fine_tuned); merged onto the base model from --model-path")
     p.add_argument("--device", default="cuda", help="Device to run model on (cuda or cpu)")
     p.add_argument("--dtype", default="bfloat16", help="Dtype for model init (bfloat16 or float16)")
     p.add_argument("--max-input-tokens", type=int, default=None, help="Optional cap for prompt tokens before generation; omit to keep the full prompt")
-    p.add_argument("--max-new-tokens", type=int, default=256, help="Max new tokens to generate per prompt")
+    p.add_argument("--max-new-tokens", type=int, default=256, help="Max new tokens to generate per prompt (--mode api: max_tokens)")
     p.add_argument("--max-prompts", type=int, default=0, help="Limit number of prompts (0 = all)")
-    p.add_argument("--batch-size", type=int, default=32, help="Number of prompts to generate in a single batched forward pass")
+    p.add_argument("--batch-size", type=int, default=32, help="Number of prompts to generate in a single batched forward pass (--mode api: per chunk of parallel requests written together)")
     p.add_argument("--output-jsonl", default="cti_vsp_benchmark_results.jsonl", help="Per-example JSONL output")
     p.add_argument("--resume", action="store_true", help="Resume from existing output JSONL if present")
+    add_api_cli_args(p)
     return p.parse_args()
 
 
@@ -454,8 +465,68 @@ def generate_batch(hf_model, tokenizer, texts: list[str], *, max_new_tokens: int
     return tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
 
 
+def generate_local_batch(args, hf_model, tokenizer, batch_texts: list[str], idx: int) -> list[str]:
+    """generate_batch() plus one retry after a transient CUDA failure."""
+    try:
+        return generate_batch(
+            hf_model,
+            tokenizer,
+            batch_texts,
+            max_new_tokens=args.max_new_tokens,
+            max_input_tokens=args.max_input_tokens,
+            device=args.device,
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        is_oom = isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in msg.lower()
+        if "CUDA error" not in msg and not is_oom:
+            raise
+
+        print(
+            f"CUDA generation failed for batch starting at index {idx} ({type(e).__name__}). "
+            f"Retrying once (prompts are never truncated)..."
+        )
+    # Retry once after a transient GPU kernel failure (an OOM was already split down to a
+    # single prompt inside generate_batch()). It runs outside the except block (see
+    # generate_batch) and never shortens a prompt: one that does not fit fails the run.
+    if args.device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return generate_batch(
+        hf_model,
+        tokenizer,
+        batch_texts,
+        max_new_tokens=args.max_new_tokens,
+        max_input_tokens=args.max_input_tokens,
+        device=args.device,
+    )
+
+
+def cut_at_stop_strings(text: str) -> str:
+    """The returned text up to the first CTI_VSP_STOP_STRINGS match (leading whitespace
+    stripped first, so a leading blank line does not cut away the whole answer)."""
+    text = text.lstrip()
+    cut = min((i for i in (text.find(stop) for stop in CTI_VSP_STOP_STRINGS) if i >= 0), default=len(text))
+    return text[:cut]
+
+
+def api_generate_batch(predictor: ApiPredictor, batch_chat_messages: list[list[dict]]):
+    """--mode api counterpart of generate_batch(): the raw outputs, the prompt token
+    counts reported by the API and the API-only result fields."""
+    raws, n_tokens, api_fields = [], [], []
+    for resp in predictor.predict_many(batch_chat_messages):
+        raws.append(cut_at_stop_strings(resp["text"]))
+        n_tokens.append(resp["openrouter"]["usage"].get("prompt_tokens") or 0)
+        api_fields.append({
+            "api_model": predictor.api_model,
+            "raw_output_full": resp["text"],
+            "openrouter": resp["openrouter"],
+        })
+    return raws, n_tokens, api_fields
+
+
 def main():
     args = parse_args()
+    validate_api_args(args)
     if args.mode == "fine_tuned" and not args.lora_path:
         raise SystemExit("--lora-path is required when --mode fine_tuned")
 
@@ -492,6 +563,11 @@ def main():
     if args.few_shot_tsv and args.mode == "icl":
         few_shots = load_cti_vsp_tsv(args.few_shot_tsv)
 
+    if args.mode == "api":
+        predictor = ApiPredictor(args, max_tokens=args.max_new_tokens, logprobs=False)
+        run_benchmark(args, records, few_shots, metric_classes, majority_classes, predictor=predictor)
+        return
+
     lora_path = args.lora_path if args.mode == "fine_tuned" else None
     model = LocalModel(args.model_path, device=args.device, dtype=args.dtype, lora_path=lora_path)
     model.load()
@@ -501,6 +577,13 @@ def main():
     # other benchmark scripts.
     hf_model = model._gen._model
 
+    run_benchmark(args, records, few_shots, metric_classes, majority_classes, hf_model=hf_model, tokenizer=tokenizer)
+
+
+def run_benchmark(args, records, few_shots, metric_classes, majority_classes, *,
+                  hf_model=None, tokenizer=None, predictor=None):
+    """Generate for all records (resumable), then write the per-example JSONL and the summary.
+    Local model: hf_model/tokenizer; --mode api: predictor."""
     out_path = Path(args.output_jsonl)
     results = []
 
@@ -522,6 +605,8 @@ def main():
             print(f"Resuming: found {start_idx} existing results, will continue from index {start_idx}.")
         except Exception as e:
             print("Warning: failed to read existing output to resume:", e)
+    if predictor is not None:
+        check_resume_api_model(results, predictor.api_model)
 
     batch_size = max(1, args.batch_size)
 
@@ -551,49 +636,22 @@ def main():
         batch_records = records[idx: idx + batch_size]
         batch_query_prompts = [rec["prompt"] for rec in batch_records]
         batch_chat_messages = [build_chat_messages(args, qp, few_shots) for qp in batch_query_prompts]
-        batch_texts = [render_chat_text(tokenizer, cm) for cm in batch_chat_messages]
+        if predictor is not None:
+            if idx == start_idx:
+                first_messages_dump(batch_chat_messages[0])
+            batch_raw, batch_n_tokens, batch_api_fields = api_generate_batch(predictor, batch_chat_messages)
+        else:
+            batch_texts = [render_chat_text(tokenizer, cm) for cm in batch_chat_messages]
 
-        for final_model_input in batch_texts:
-            print("=== Final model input (incl. special tokens) ===")
-            print(final_model_input)
-            print("=== End final model input ===")
+            for final_model_input in batch_texts:
+                print("=== Final model input (incl. special tokens) ===")
+                print(final_model_input)
+                print("=== End final model input ===")
 
-        try:
-            batch_raw = generate_batch(
-                hf_model,
-                tokenizer,
-                batch_texts,
-                max_new_tokens=args.max_new_tokens,
-                max_input_tokens=args.max_input_tokens,
-                device=args.device,
-            )
-        except RuntimeError as e:
-            msg = str(e)
-            is_oom = isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in msg.lower()
-            if "CUDA error" not in msg and not is_oom:
-                raise
+            batch_raw = generate_local_batch(args, hf_model, tokenizer, batch_texts, idx)
+            batch_n_tokens = prompt_token_counts(tokenizer, batch_texts)
+            batch_api_fields = [{} for _ in batch_records]
 
-            print(
-                f"CUDA generation failed for batch starting at index {idx} ({type(e).__name__}). "
-                f"Retrying once (prompts are never truncated)..."
-            )
-            batch_raw = None
-        # Retry once after a transient GPU kernel failure (an OOM was already split down to a
-        # single prompt inside generate_batch()). It runs outside the except block (see
-        # generate_batch) and never shortens a prompt: one that does not fit fails the run.
-        if batch_raw is None:
-            if args.device == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            batch_raw = generate_batch(
-                hf_model,
-                tokenizer,
-                batch_texts,
-                max_new_tokens=args.max_new_tokens,
-                max_input_tokens=args.max_input_tokens,
-                device=args.device,
-            )
-
-        batch_n_tokens = prompt_token_counts(tokenizer, batch_texts)
         for offset, (rec, query_prompt, raw) in enumerate(zip(batch_records, batch_query_prompts, batch_raw)):
             gt = rec.get("gt", "")
             pred_vector = extract_cvss_vector_from_text(raw)
@@ -612,6 +670,7 @@ def main():
                 "gt_score": cvss3_base_score(gt_metrics),
                 "correct": metrics_match(predicted_metrics, gt_metrics),
                 **truncation_fields(batch_n_tokens[offset], args.max_input_tokens),
+                **batch_api_fields[offset],
             }
             fh.write(json.dumps(result, ensure_ascii=False) + "\n")
             fh.flush()
@@ -622,6 +681,8 @@ def main():
     fh.close()
 
     summary = evaluate_cti_vsp_predictions(results, metric_classes, majority_classes)
+    if predictor is not None:
+        summary["api"] = predictor.describe()
     print("Summary:")
     print(
         f"  n_generated: {summary['n_generated']}  "

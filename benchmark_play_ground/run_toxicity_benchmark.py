@@ -36,12 +36,23 @@ p(toxic) >= 0.5, NOT from SlotResult.values. The two agree in every case except
 an exact log-prob tie (p(toxic) == 0.5 exactly): there the plan's tie policy
 ("last" -> "safe") would pick "safe", while the >= 0.5 threshold picks "toxic".
 "n_threshold_vs_argmax_diff" in the summary counts those cases.
+
+--mode api (--api-model llama|deepseek|gpt)
+-------------------------------------------
+Queries an OpenRouter model (benchmark_play_ground/api_prediction.py) with the
+plain-mode messages at temperature 0. The answer is free-generated and parsed
+with TOXICITY_ANSWER_RE; an unparsable answer counts as "safe" and is reported
+as n_unparsable_pred. The AUPRC score log p(toxic) - log p(safe) is read from
+the returned token logprobs at the answer token (api_prediction.slot_logprobs);
+where a provider returned no usable logprobs, the hard label is used as score
+(+/-HARD_LABEL_LOG_ODDS, counted as n_hard_label_scores).
 """
 from __future__ import annotations
 
 import argparse
 import gc
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -51,6 +62,10 @@ import torch
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
+from benchmark_play_ground.api_prediction import (
+    ApiPredictor, add_api_cli_args, check_resume_api_model, first_messages_dump, slot_logprobs,
+    validate_api_args,
+)
 from benchmark_play_ground.data_loader import load_toxicity_tsv
 from benchmark_play_ground.evaluator import format_confusion_matrix
 from benchmark_play_ground.model_wrapper import LocalModel
@@ -92,6 +107,10 @@ TOXICITY_CANDIDATES = [[TOXICITY_POSITIVE_CLASS, TOXICITY_NEGATIVE_CLASS]]
 
 # p(toxic) >= this -> predict "toxic". Fixed, per the benchmark spec.
 TOXICITY_DECISION_THRESHOLD = 0.5
+
+# --mode api only: AUPRC score of an example without usable logprobs (its hard
+# label, ranked above / below every real log-odds score).
+HARD_LABEL_LOG_ODDS = 1e4
 
 
 TOXICITY_SYSTEM_PROMPT = (
@@ -270,6 +289,76 @@ def generate_batch(
     return out
 
 
+def score_local_batch(args, hf_model, tokenizer, plan: SlotPlan, batch_texts: list[str], idx: int) -> list[dict]:
+    """generate_batch() plus the one-prompt-at-a-time retry after a CUDA failure."""
+    try:
+        return generate_batch(
+            hf_model, tokenizer, batch_texts,
+            max_input_tokens=args.max_input_tokens, device=args.device, plan=plan,
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        is_oom = isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in msg.lower()
+        if "CUDA error" not in msg and not is_oom:
+            raise
+        print(
+            f"CUDA scoring failed for batch starting at index {idx} ({type(e).__name__}). "
+            f"Retrying once, one prompt at a time (prompts are never truncated)...",
+            flush=True,
+        )
+    # generate_batch() already halves the batch internally on a pure OOM and only re-raises
+    # once it is down to a single prompt, so getting here means even one prompt did not fit
+    # (or a transient CUDA-kernel error). The retry runs outside the except block (see
+    # generate_batch) and only splits the batch: a prompt that does not fit fails the run
+    # instead of being silently shortened.
+    gc.collect()
+    if args.device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    batch_out = []
+    for one_text in batch_texts:
+        batch_out.extend(generate_batch(
+            hf_model, tokenizer, [one_text],
+            max_input_tokens=args.max_input_tokens, device=args.device, plan=plan,
+        ))
+    return batch_out
+
+
+def _sigmoid(x: float) -> float:
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def api_predict_batch(predictor: ApiPredictor, batch_chat_messages: list[list[dict]]) -> list[dict]:
+    """--mode api counterpart of generate_batch(): same keys, plus the API-only result
+    fields (under "api_fields") and the prompt token count reported by the API."""
+    out = []
+    for resp in predictor.predict_many(batch_chat_messages):
+        text = resp["text"]
+        match = TOXICITY_ANSWER_RE.search(text)
+        predicted = match.group(1).lower() if match else TOXICITY_NEGATIVE_CLASS
+        lps = None
+        if match:
+            lps = slot_logprobs(resp["logprobs"], text, match.start(1), TOXICITY_CANDIDATES[0], ignore_case=True)
+        log_odds = lps[TOXICITY_POSITIVE_CLASS] - lps[TOXICITY_NEGATIVE_CLASS] if lps else None
+        out.append({
+            "p_toxic": _sigmoid(log_odds) if log_odds is not None else None,
+            "predicted": predicted,
+            "slot_value": predicted,
+            "log_odds": log_odds,
+            "tie": log_odds == 0.0,
+            "prompt_tokens": resp["openrouter"]["usage"].get("prompt_tokens") or 0,
+            "api_fields": {
+                "api_model": predictor.api_model,
+                "pred_unparsable": match is None,
+                "raw_output": text,
+                "openrouter": resp["openrouter"],
+            },
+        })
+    return out
+
+
 # --------------------------------------------------------------------------
 # Evaluation
 # --------------------------------------------------------------------------
@@ -353,7 +442,12 @@ def evaluate_toxicity_predictions(results: list[dict]) -> dict:
 
     y_true = [r["gt_label"] for r in scored]
     y_pred = [r["predicted"] for r in scored]
-    y_score = [r["log_odds"] for r in scored]   # statt r["p_toxic"]
+    # log_odds is None only in --mode api, for an example without usable logprobs.
+    y_score = [
+        r["log_odds"] if r["log_odds"] is not None
+        else (HARD_LABEL_LOG_ODDS if r["predicted"] == TOXICITY_POSITIVE_CLASS else -HARD_LABEL_LOG_ODDS)
+        for r in scored
+    ]   # statt r["p_toxic"]
     y_true_bin = [1 if t == TOXICITY_POSITIVE_CLASS else 0 for t in y_true]
 
     total = len(scored)  # every metric below is over the scored subset only
@@ -407,8 +501,11 @@ def evaluate_toxicity_predictions(results: list[dict]) -> dict:
     # ---- calibration / sanity diagnostics ----
     n_ties = sum(1 for r in scored if r["tie"])
     n_thr_vs_argmax = sum(1 for r in scored if r["predicted"] != r["slot_value"])
-    pos_scores = [s for s, t in zip(y_score, y_true_bin) if t == 1]
-    neg_scores = [s for s, t in zip(y_score, y_true_bin) if t == 0]
+    # --mode api diagnostics (always 0 for a local model).
+    out["n_unparsable_pred"] = sum(1 for r in scored if r.get("pred_unparsable"))
+    out["n_hard_label_scores"] = sum(1 for r in scored if r["log_odds"] is None)
+    pos_scores = [r["log_odds"] for r, t in zip(scored, y_true_bin) if t == 1 and r["log_odds"] is not None]
+    neg_scores = [r["log_odds"] for r, t in zip(scored, y_true_bin) if t == 0 and r["log_odds"] is not None]
     out["predicted_positive_rate"] = sum(1 for p in y_pred if p == TOXICITY_POSITIVE_CLASS) / total
     out["tie_rate"] = n_ties / total
     out["n_ties"] = n_ties
@@ -425,19 +522,21 @@ def evaluate_toxicity_predictions(results: list[dict]) -> dict:
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model-path", required=True, help="Local model directory (e.g. Llama-3.1-8B-Instruct)")
+    p.add_argument("--model-path", default=None, help="Local model directory (e.g. Llama-3.1-8B-Instruct); not used with --mode api")
     p.add_argument("--data-tsv", required=True, help="Toxicity test-set TSV (toxicity_test_set.tsv)")
     p.add_argument("--few-shot-tsv", default=None, help="Optional TSV with few-shot examples (e.g. toxicity_anchor_set.tsv)")
-    p.add_argument("--mode", choices=("plain", "icl", "fine_tuned"), default="plain")
+    p.add_argument("--mode", choices=("plain", "icl", "fine_tuned", "api"), default="plain",
+                   help="api: plain-mode prompt sent to the OpenRouter model --api-model")
     p.add_argument("--icl-k", type=int, default=3, help="Number of few-shot examples to include")
     p.add_argument("--lora-path", default=None, help="LoRA adapter weights (required for --mode fine_tuned); merged onto --model-path")
     p.add_argument("--device", default="cuda", help="Device to run model on (cuda or cpu)")
     p.add_argument("--dtype", default="bfloat16", help="Dtype for model init (bfloat16 or float16)")
     p.add_argument("--max-input-tokens", type=int, default=None, help="Optional cap for prompt tokens before scoring; omit to keep the full prompt")
     p.add_argument("--max-prompts", type=int, default=0, help="Limit number of prompts (0 = all)")
-    p.add_argument("--batch-size", type=int, default=32, help="Prompts per batched forward pass")
+    p.add_argument("--batch-size", type=int, default=32, help="Prompts per batched forward pass (--mode api: per chunk of parallel requests written together)")
     p.add_argument("--output-jsonl", default="toxicity_benchmark_results.jsonl", help="Per-example JSONL output")
     p.add_argument("--resume", action="store_true", help="Resume from existing output JSONL if present")
+    add_api_cli_args(p)
     return p.parse_args()
 
 
@@ -450,8 +549,8 @@ def build_chat_messages(args, query_prompt: str, few_shots: list[dict]) -> list[
             messages.append({"role": "assistant", "content": ex.get("gt", "")})
         messages.append({"role": "user", "content": query_prompt})
         return messages
-    # "plain" and "fine_tuned" both query the model directly with the same system
-    # prompt, no few-shot examples.
+    # "plain", "fine_tuned" and "api" all query the model directly with the same
+    # system prompt, no few-shot examples.
     return [
         {"role": "system", "content": TOXICITY_SYSTEM_PROMPT},
         {"role": "user", "content": query_prompt},
@@ -476,6 +575,9 @@ def _print_summary(summary: dict) -> None:
         f"(n_toxic={summary['n_positive']}, n_safe={summary['n_negative']})"
     )
     print(f"  tie_rate: {summary['tie_rate']:.4f}  (n_ties={summary['n_ties']})")
+    if "api" in summary:
+        print(f"  n_unparsable_pred (counted as 'safe'): {summary['n_unparsable_pred']}")
+        print(f"  n_hard_label_scores (no usable logprobs): {summary['n_hard_label_scores']}")
     print(f"  n_threshold_vs_argmax_diff: {summary['n_threshold_vs_argmax_diff']}")
     print(f"  mean p(toxic) | gt=toxic: {summary['mean_p_toxic_gt_toxic']:.4f}")
     print(f"  mean p(toxic) | gt=safe : {summary['mean_p_toxic_gt_safe']:.4f}")
@@ -510,6 +612,7 @@ def _print_summary(summary: dict) -> None:
 
 def main():
     args = parse_args()
+    validate_api_args(args)
     if args.mode == "fine_tuned" and not args.lora_path:
         raise SystemExit("--lora-path is required when --mode fine_tuned")
 
@@ -522,6 +625,16 @@ def main():
     few_shots = []
     if args.few_shot_tsv and args.mode == "icl":
         few_shots = load_toxicity_tsv(args.few_shot_tsv)
+
+    sample_gt = records[0]["gt"]
+    sample_label = extract_toxicity_label_from_text(sample_gt)
+    if sample_label is None:
+        raise SystemExit(f"Could not parse a toxic/safe label from the first record's gt: {sample_gt!r}")
+
+    if args.mode == "api":
+        predictor = ApiPredictor(args, max_tokens=16, logprobs=True)
+        run_benchmark(args, records, few_shots, predictor=predictor)
+        return
 
     lora_path = args.lora_path if args.mode == "fine_tuned" else None
     model = LocalModel(args.model_path, device=args.device, dtype=args.dtype, lora_path=lora_path)
@@ -547,10 +660,6 @@ def main():
 
     # Fail fast, once: the ground-truth answer string the rest of this script
     # assumes must match what the plan can actually score.
-    sample_gt = records[0]["gt"]
-    sample_label = extract_toxicity_label_from_text(sample_gt)
-    if sample_label is None:
-        raise SystemExit(f"Could not parse a toxic/safe label from the first record's gt: {sample_gt!r}")
     assert_target_matches_plan(plan, sample_gt, [sample_label])
 
     # In --mode icl the few-shot assistant turns are injected verbatim as the
@@ -578,6 +687,12 @@ def main():
                     f"the scoring plan's answer format:\n{e}"
                 )
 
+    run_benchmark(args, records, few_shots, hf_model=hf_model, tokenizer=tokenizer, plan=plan)
+
+
+def run_benchmark(args, records, few_shots, *, hf_model=None, tokenizer=None, plan=None, predictor=None):
+    """Score all records (resumable), then write the per-example JSONL and the summary.
+    Local model: hf_model/tokenizer/plan; --mode api: predictor."""
     out_path = Path(args.output_jsonl)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     results: list[dict] = []
@@ -598,6 +713,8 @@ def main():
             print(f"Resuming: found {start_idx} existing results, will continue from index {start_idx}.")
         except Exception as e:
             print("Warning: failed to read existing output to resume:", e)
+    if predictor is not None:
+        check_resume_api_model(results, predictor.api_model)
 
     batch_size = max(1, args.batch_size)
 
@@ -623,44 +740,18 @@ def main():
         batch_records = records[idx: idx + batch_size]
         batch_query_prompts = [rec["prompt"] for rec in batch_records]
         batch_chat_messages = [build_chat_messages(args, qp, few_shots) for qp in batch_query_prompts]
-        batch_texts = [render_chat_text(tokenizer, cm) for cm in batch_chat_messages]
+        if predictor is not None:
+            if idx == start_idx:
+                first_messages_dump(batch_chat_messages[0])
+            batch_out = api_predict_batch(predictor, batch_chat_messages)
+            batch_n_tokens = [pred["prompt_tokens"] for pred in batch_out]
+        else:
+            batch_texts = [render_chat_text(tokenizer, cm) for cm in batch_chat_messages]
+            # The complete raw model input for the first scored example is printed once,
+            # from inside generate_batch() at the first model call (see _dump_raw_model_input).
+            batch_out = score_local_batch(args, hf_model, tokenizer, plan, batch_texts, idx)
+            batch_n_tokens = prompt_token_counts(tokenizer, batch_texts)
 
-        # The complete raw model input for the first scored example is printed once,
-        # from inside generate_batch() at the first model call (see _dump_raw_model_input).
-
-        try:
-            batch_out = generate_batch(
-                hf_model, tokenizer, batch_texts,
-                max_input_tokens=args.max_input_tokens, device=args.device, plan=plan,
-            )
-        except RuntimeError as e:
-            msg = str(e)
-            is_oom = isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in msg.lower()
-            if "CUDA error" not in msg and not is_oom:
-                raise
-            print(
-                f"CUDA scoring failed for batch starting at index {idx} ({type(e).__name__}). "
-                f"Retrying once, one prompt at a time (prompts are never truncated)...",
-                flush=True,
-            )
-            batch_out = None
-        # generate_batch() already halves the batch internally on a pure OOM and only re-raises
-        # once it is down to a single prompt, so getting here means even one prompt did not fit
-        # (or a transient CUDA-kernel error). The retry runs outside the except block (see
-        # generate_batch) and only splits the batch: a prompt that does not fit fails the run
-        # instead of being silently shortened.
-        if batch_out is None:
-            gc.collect()
-            if args.device == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            batch_out = []
-            for one_text in batch_texts:
-                batch_out.extend(generate_batch(
-                    hf_model, tokenizer, [one_text],
-                    max_input_tokens=args.max_input_tokens, device=args.device, plan=plan,
-                ))
-
-        batch_n_tokens = prompt_token_counts(tokenizer, batch_texts)
         for offset, (rec, query_prompt, pred) in enumerate(zip(batch_records, batch_query_prompts, batch_out)):
             gt = rec.get("gt", "")
             gt_label = extract_toxicity_label_from_text(gt)
@@ -679,6 +770,7 @@ def main():
                 # evaluate_toxicity_predictions()'s n_unparsable_gt handling.
                 "correct": (pred["predicted"] == gt_label) if gt_label is not None else None,
                 **truncation_fields(batch_n_tokens[offset], args.max_input_tokens),
+                **pred.get("api_fields", {}),
             }
             fh.write(json.dumps(result, ensure_ascii=False) + "\n")
             fh.flush()
@@ -701,6 +793,8 @@ def main():
     fh.close()
 
     summary = evaluate_toxicity_predictions(results)
+    if predictor is not None:
+        summary["api"] = predictor.describe()
     _print_summary(summary)
 
     summary["truncation"] = truncation_summary(results, args.max_input_tokens)

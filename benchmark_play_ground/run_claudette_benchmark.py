@@ -13,6 +13,10 @@ import torch
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
+from benchmark_play_ground.api_prediction import (
+    ApiPredictor, add_api_cli_args, check_resume_api_model, first_messages_dump, slot_logprobs,
+    validate_api_args,
+)
 from benchmark_play_ground.data_loader import load_claudette_tsv
 from benchmark_play_ground.model_wrapper import LocalModel
 from benchmark_play_ground.truncation import (
@@ -53,6 +57,11 @@ CLAUDETTE_VECTOR_RE = re.compile(
     r"LTD:\s*[YN]\|TER:\s*[YN]\|CH:\s*[YN]\|CR:\s*[YN]\|"
     r"USE:\s*[YN]\|LAW:\s*[YN]\|J:\s*[YN]\|ARB:\s*[YN]\|?"
 )
+
+# --mode api only: the free-generated answer is parsed slot by slot, so one
+# malformed slot does not discard the other seven (\b keeps e.g. "J:" from
+# matching inside another key). A slot that cannot be parsed counts as "N".
+CLAUDETTE_SLOT_RE = {m: re.compile(rf"\b{m}:\s*([YN])\b") for m in CLAUDETTE_METRICS}
 
 
 CLAUDETTE_SYSTEM_PROMPT = (
@@ -213,7 +222,19 @@ def _slot_label_matrices(results: list[dict]) -> tuple[list[list[int]], list[lis
 
 
 def _sigmoid(x: float) -> float:
-    return 1.0 / (1.0 + math.exp(-x))
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def _slot_score(r: dict, m: str) -> float:
+    """p(Y|slot) from the slot's log-odds; in --mode api, a slot without usable
+    logprobs (log-odds None) falls back to its hard label (1.0 / 0.0)."""
+    lo = r["slot_log_odds"][m]
+    if lo is None:
+        return 1.0 if r["predicted_metrics"].get(m) == "Y" else 0.0
+    return _sigmoid(lo)
 
 
 def _slot_probability_matrix(results: list[dict]) -> tuple[list[list[int]], list[list[float]]]:
@@ -230,8 +251,7 @@ def _slot_probability_matrix(results: list[dict]) -> tuple[list[list[int]], list
     y_score = []
     for r in results:
         y_true.append([1 if r["gt_metrics"].get(m) == "Y" else 0 for m in CLAUDETTE_METRICS])
-        slot_log_odds = r["slot_log_odds"]
-        y_score.append([_sigmoid(slot_log_odds[m]) for m in CLAUDETTE_METRICS])
+        y_score.append([_slot_score(r, m) for m in CLAUDETTE_METRICS])
     return y_true, y_score
 
 
@@ -321,11 +341,12 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
     positive count, so it generally differs from the micro/macro baseline whenever the
     slots' positive counts differ.
 
-    "parse_failures" is always 0: every slot's Y/N answer token is forced by
-    construction (see slot_scoring.score_slots), so there is no longer a code path
-    that can fail to produce a usable answer for a slot. The field is kept, constant,
-    purely for schema compatibility with existing downstream evaluation scripts that
-    read it.
+    "parse_failures" is always 0 for a local model: every slot's Y/N answer token is
+    forced by construction (see slot_scoring.score_slots), so there is no code path
+    that can fail to produce a usable answer for a slot. In --mode api it counts the
+    examples with at least one unparsable slot (scored as "N"); "n_unparsable_slots"
+    and "n_hard_label_slot_scores" (slots without usable logprobs, see _slot_score)
+    are the per-slot counts.
 
     "positive_rate_by_slot" / "tie_rate_by_slot" / "tie_rate_overall" are calibration
     diagnostics, not accuracy metrics -- see _slot_positive_rate, _slot_tie_rate and
@@ -341,9 +362,12 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
     stats = {cls: _class_stats(true_labels, pred_labels, cls) for cls in CLAUDETTE_ALL_CLASSES}
     trivial_stats = {cls: _class_stats(true_labels, trivial_pred_labels, cls) for cls in CLAUDETTE_ALL_CLASSES}
 
-    # Structurally impossible now (see docstring), kept at a constant 0 for schema
-    # compatibility with existing downstream evaluation scripts.
-    n_parse_failures = 0
+    # Structurally impossible for a local model (see docstring); --mode api only.
+    n_parse_failures = sum(1 for r in results if r.get("unparsable_slots"))
+    n_unparsable_slots = sum(len(r.get("unparsable_slots", [])) for r in results)
+    n_hard_label_slot_scores = sum(
+        1 for r in results for m in CLAUDETTE_METRICS if r["slot_log_odds"][m] is None
+    )
 
     if results:
         y_true, y_score = _slot_probability_matrix(results)
@@ -418,6 +442,8 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
         "total": total,
         "total_slot_instances": len(true_labels),
         "parse_failures": n_parse_failures,
+        "n_unparsable_slots": n_unparsable_slots,
+        "n_hard_label_slot_scores": n_hard_label_slot_scores,
         "micro_f1_8": _micro_f1(stats, CLAUDETTE_METRICS),
         "macro_f1_8": _macro_f1(stats, CLAUDETTE_METRICS),
         "micro_f1_8_trivial_all_N": _micro_f1(trivial_stats, CLAUDETTE_METRICS),
@@ -445,19 +471,21 @@ def evaluate_claudette_predictions(results: list[dict]) -> dict:
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model-path", required=True, help="Local model directory for Llama-3.1-8b-Instruct")
+    p.add_argument("--model-path", default=None, help="Local model directory for Llama-3.1-8b-Instruct; not used with --mode api")
     p.add_argument("--data-tsv", required=True, help="CLAUDETTE-TOS TSV file (claudette_tos_test.tsv)")
     p.add_argument("--few-shot-tsv", default=None, help="Optional TSV with few-shot examples")
-    p.add_argument("--mode", choices=("plain", "icl", "fine_tuned"), default="plain")
+    p.add_argument("--mode", choices=("plain", "icl", "fine_tuned", "api"), default="plain",
+                   help="api: plain-mode prompt sent to the OpenRouter model --api-model")
     p.add_argument("--icl-k", type=int, default=3, help="Number of few-shot examples to include")
     p.add_argument("--lora-path", default=None, help="Path to LoRA adapter weights (required for --mode fine_tuned); merged onto the base model from --model-path")
     p.add_argument("--device", default="cuda", help="Device to run model on (cuda or cpu)")
     p.add_argument("--dtype", default="bfloat16", help="Dtype for model init (bfloat16 or float16)")
     p.add_argument("--max-input-tokens", type=int, default=None, help="Optional cap for prompt tokens before generation; omit to keep the full prompt")
     p.add_argument("--max-prompts", type=int, default=0, help="Limit number of prompts (0 = all)")
-    p.add_argument("--batch-size", type=int, default=32, help="Number of prompts to generate in a single batched forward pass")
+    p.add_argument("--batch-size", type=int, default=32, help="Number of prompts to generate in a single batched forward pass (--mode api: per chunk of parallel requests written together)")
     p.add_argument("--output-jsonl", default="claudette_benchmark_results.jsonl", help="Per-example JSONL output")
     p.add_argument("--resume", action="store_true", help="Resume from existing output JSONL if present")
+    add_api_cli_args(p)
     return p.parse_args()
 
 
@@ -478,8 +506,8 @@ def build_chat_messages(args, query_prompt: str, few_shots: list[dict]) -> list[
             messages.append({"role": "assistant", "content": ex_vector})
         messages.append({"role": "user", "content": query_prompt})
         return messages
-    # "fine_tuned" queries the model directly, without few-shot examples, but still
-    # with the same system prompt as the other arms.
+    # "fine_tuned" and "api" query the model directly, without few-shot examples,
+    # but still with the same system prompt as the other arms.
     return [
         {"role": "system", "content": CLAUDETTE_SYSTEM_PROMPT},
         {"role": "user", "content": query_prompt},
@@ -583,8 +611,82 @@ def generate_batch(
     return predicted_metrics_batch, vectors, slot_log_odds_batch, slot_ties_batch
 
 
+def score_local_batch(args, hf_model, tokenizer, plan: SlotPlan, batch_texts: list[str], idx: int):
+    """generate_batch() plus one retry after a transient CUDA failure."""
+    try:
+        return generate_batch(
+            hf_model,
+            tokenizer,
+            batch_texts,
+            max_input_tokens=args.max_input_tokens,
+            device=args.device,
+            plan=plan,
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        is_oom = isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in msg.lower()
+        if "CUDA error" not in msg and not is_oom:
+            raise
+
+        print(
+            f"CUDA generation failed for batch starting at index {idx} ({type(e).__name__}). "
+            f"Retrying once (prompts are never truncated)..."
+        )
+    # Retry once after a transient GPU kernel failure (an OOM was already split down to a
+    # single prompt inside generate_batch()). It runs outside the except block (see
+    # generate_batch) and never shortens a prompt: one that does not fit fails the run.
+    if args.device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return generate_batch(
+        hf_model,
+        tokenizer,
+        batch_texts,
+        max_input_tokens=args.max_input_tokens,
+        device=args.device,
+        plan=plan,
+    )
+
+
+def api_predict_batch(predictor: ApiPredictor, batch_chat_messages: list[list[dict]]):
+    """--mode api counterpart of generate_batch(): the same four per-example lists,
+    plus the prompt token counts reported by the API and the API-only result fields.
+
+    Each slot is parsed from the free-generated text (CLAUDETTE_SLOT_RE); its log-odds
+    log p(Y) - log p(N) is read from the returned logprobs at the slot's value token,
+    or None if the provider returned no usable logprobs for it (see _slot_score).
+    """
+    predicted_metrics_batch, vectors, slot_log_odds_batch, slot_ties_batch = [], [], [], []
+    n_tokens, api_fields = [], []
+    for resp in predictor.predict_many(batch_chat_messages):
+        text = resp["text"]
+        pred, log_odds, ties, unparsable = {}, {}, {}, []
+        for m in CLAUDETTE_METRICS:
+            match = CLAUDETTE_SLOT_RE[m].search(text)
+            if match is None:
+                unparsable.append(m)
+                pred[m], log_odds[m], ties[m] = "N", None, False
+                continue
+            pred[m] = match.group(1)
+            lps = slot_logprobs(resp["logprobs"], text, match.start(1), ["Y", "N"])
+            log_odds[m] = lps["Y"] - lps["N"] if lps else None
+            ties[m] = log_odds[m] == 0.0
+        predicted_metrics_batch.append(pred)
+        vectors.append("|".join(f"{m}: {pred[m]}" for m in CLAUDETTE_METRICS))
+        slot_log_odds_batch.append(log_odds)
+        slot_ties_batch.append(ties)
+        n_tokens.append(resp["openrouter"]["usage"].get("prompt_tokens") or 0)
+        api_fields.append({
+            "api_model": predictor.api_model,
+            "raw_output": text,
+            "unparsable_slots": unparsable,
+            "openrouter": resp["openrouter"],
+        })
+    return (predicted_metrics_batch, vectors, slot_log_odds_batch, slot_ties_batch), n_tokens, api_fields
+
+
 def main():
     args = parse_args()
+    validate_api_args(args)
     if args.mode == "fine_tuned" and not args.lora_path:
         raise SystemExit("--lora-path is required when --mode fine_tuned")
 
@@ -598,6 +700,14 @@ def main():
     few_shots = []
     if args.few_shot_tsv and args.mode == "icl":
         few_shots = load_claudette_tsv(args.few_shot_tsv)
+
+    if args.mode == "api":
+        sample_gt_metrics = extract_claudette_metrics_from_text(records[0]["gt"])
+        if any(sample_gt_metrics[m] is None for m in CLAUDETTE_METRICS):
+            raise SystemExit(f"Could not parse a full Y/N vector from the first record's gt: {records[0]['gt']!r}")
+        predictor = ApiPredictor(args, max_tokens=64, logprobs=True)
+        run_benchmark(args, records, few_shots, predictor=predictor)
+        return
 
     lora_path = args.lora_path if args.mode == "fine_tuned" else None
     model = LocalModel(args.model_path, device=args.device, dtype=args.dtype, lora_path=lora_path)
@@ -663,6 +773,12 @@ def main():
                     f"the scoring plan's answer format:\n{e}"
                 )
 
+    run_benchmark(args, records, few_shots, hf_model=hf_model, tokenizer=tokenizer, plan=plan)
+
+
+def run_benchmark(args, records, few_shots, *, hf_model=None, tokenizer=None, plan=None, predictor=None):
+    """Score all records (resumable), then write the per-example JSONL and the summary.
+    Local model: hf_model/tokenizer/plan; --mode api: predictor."""
     out_path = Path(args.output_jsonl)
     results = []
 
@@ -684,6 +800,8 @@ def main():
             print(f"Resuming: found {start_idx} existing results, will continue from index {start_idx}.")
         except Exception as e:
             print("Warning: failed to read existing output to resume:", e)
+    if predictor is not None:
+        check_resume_api_model(results, predictor.api_model)
 
     batch_size = max(1, args.batch_size)
 
@@ -713,50 +831,23 @@ def main():
         batch_records = records[idx: idx + batch_size]
         batch_query_prompts = [rec["prompt"] for rec in batch_records]
         batch_chat_messages = [build_chat_messages(args, qp, few_shots) for qp in batch_query_prompts]
-        batch_texts = [render_chat_text(tokenizer, cm) for cm in batch_chat_messages]
+        if predictor is not None:
+            if idx == start_idx:
+                first_messages_dump(batch_chat_messages[0])
+            batch_scored, batch_n_tokens, batch_api_fields = api_predict_batch(predictor, batch_chat_messages)
+        else:
+            batch_texts = [render_chat_text(tokenizer, cm) for cm in batch_chat_messages]
 
-        for final_model_input in batch_texts:
-            print("=== Final model input (incl. special tokens) ===")
-            print(final_model_input)
-            print("=== End final model input ===")
+            for final_model_input in batch_texts:
+                print("=== Final model input (incl. special tokens) ===")
+                print(final_model_input)
+                print("=== End final model input ===")
 
-        batch_scored = None
-        try:
-            batch_scored = generate_batch(
-                hf_model,
-                tokenizer,
-                batch_texts,
-                max_input_tokens=args.max_input_tokens,
-                device=args.device,
-                plan=plan,
-            )
-        except RuntimeError as e:
-            msg = str(e)
-            is_oom = isinstance(e, torch.cuda.OutOfMemoryError) or "out of memory" in msg.lower()
-            if "CUDA error" not in msg and not is_oom:
-                raise
-
-            print(
-                f"CUDA generation failed for batch starting at index {idx} ({type(e).__name__}). "
-                f"Retrying once (prompts are never truncated)..."
-            )
-        # Retry once after a transient GPU kernel failure (an OOM was already split down to a
-        # single prompt inside generate_batch()). It runs outside the except block (see
-        # generate_batch) and never shortens a prompt: one that does not fit fails the run.
-        if batch_scored is None:
-            if args.device == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            batch_scored = generate_batch(
-                hf_model,
-                tokenizer,
-                batch_texts,
-                max_input_tokens=args.max_input_tokens,
-                device=args.device,
-                plan=plan,
-            )
+            batch_scored = score_local_batch(args, hf_model, tokenizer, plan, batch_texts, idx)
+            batch_n_tokens = prompt_token_counts(tokenizer, batch_texts)
+            batch_api_fields = [{} for _ in batch_records]
         batch_predicted_metrics, batch_vectors, batch_slot_log_odds, batch_slot_ties = batch_scored
 
-        batch_n_tokens = prompt_token_counts(tokenizer, batch_texts)
         for offset, (rec, query_prompt, pred_metrics, vector, slot_log_odds, slot_ties) in enumerate(
             zip(batch_records, batch_query_prompts, batch_predicted_metrics, batch_vectors, batch_slot_log_odds, batch_slot_ties)
         ):
@@ -773,7 +864,7 @@ def main():
             result = {
                 "index": idx + offset,
                 "prompt": query_prompt,
-                "raw_output": vector,
+                "raw_output": vector,  # --mode api: overwritten by the model's text (batch_api_fields)
                 "predicted_vector": vector,
                 "predicted_metrics": predicted_metrics,
                 "gt": gt,
@@ -782,6 +873,7 @@ def main():
                 "slot_log_odds": slot_log_odds,
                 "ties": slot_ties,
                 **truncation_fields(batch_n_tokens[offset], args.max_input_tokens),
+                **batch_api_fields[offset],
             }
             fh.write(json.dumps(result, ensure_ascii=False) + "\n")
             fh.flush()
@@ -792,13 +884,22 @@ def main():
     fh.close()
 
     summary = evaluate_claudette_predictions(results)
+    if predictor is not None:
+        summary["api"] = predictor.describe()
     print("Summary:")
     print(f"  total: {summary['total']}")
     print(f"  total_slot_instances: {summary['total_slot_instances']}")
-    print(
-        f"  parse_failures: {summary['parse_failures']}  "
-        f"(always 0: every slot's answer is forced by construction, kept for schema compatibility)"
-    )
+    if predictor is not None:
+        print(
+            f"  parse_failures: {summary['parse_failures']} examples with an unparsable slot "
+            f"(n_unparsable_slots={summary['n_unparsable_slots']}, scored as 'N')"
+        )
+        print(f"  n_hard_label_slot_scores (no usable logprobs): {summary['n_hard_label_slot_scores']}")
+    else:
+        print(
+            f"  parse_failures: {summary['parse_failures']}  "
+            f"(always 0: every slot's answer is forced by construction, kept for schema compatibility)"
+        )
     print(f"  tie_rate_overall: {summary['tie_rate_overall']:.4f}")
     print()
     print("  8-class scenario (LTD, TER, CH, CR, USE, LAW, J, ARB):")
