@@ -75,9 +75,11 @@ from shared.run_io import (
 from shared.summary import DISCARD_REASON
 from shared.text_cleaning import assert_clean, load_seed_examples
 
+# Same values as experiments/config/experiments.yaml "generation" (passed explicitly by
+# experiments/slurm/gen_job.sh); kept here for manual calls.
 BASE_GENERATION_PARAMS = {
-    "temperature": 1.0,
-    "top_p": 0.95,
+    "temperature": 0.8,
+    "top_p": 0.9,
     "max_tokens": 2048,
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
@@ -94,7 +96,7 @@ PHASE_BLACKBOX = "blackbox"
 PHASE_FEATURE_GUIDED = "feature_guided"
 
 # Args whose change on --resume would mix models or change the context universe.
-STRICT_RESUME_ARGS = ("model", "domain", "seed_set", "seed_group", "generation_seed")
+STRICT_RESUME_ARGS = ("model", "domain", "seed_set", "seed_group", "generation_seed", "gen_fingerprint")
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +117,9 @@ def add_generation_args(parser: argparse.ArgumentParser) -> None:
                         help="Reject a candidate whose best ROUGE-L F-measure against seeds + accepted pool exceeds this.")
     parser.add_argument("--resume", action="store_true",
                         help="Continue an interrupted run from <prefix>_checkpoint.json.")
+    parser.add_argument("--gen-fingerprint", type=str, default=None,
+                        help="Config fingerprint of the run (experiments/runs.py gen_fingerprint); stored in the "
+                             "checkpoint and the run log, which experiments/stages.py compares to decide done/stale.")
     add_api_args(parser)
 
 
@@ -149,6 +154,7 @@ class GenerationSetup:
             "seed_set": args.seed_set,
             "seed_group": args.seed_group,
             "generation_seed": self.generation_seed,
+            "gen_fingerprint": args.gen_fingerprint,
             "rouge_threshold": args.rouge_threshold,
             "max_concurrent_requests": args.max_concurrent_requests,
             "requests_per_second": args.requests_per_second,
@@ -171,6 +177,7 @@ class GenerationSetup:
             "seed_group": args.seed_group,
             "seed_file": str(self.seed_file),
             "generation_seed": self.generation_seed,
+            "gen_fingerprint": args.gen_fingerprint,
             "n_seeds": len(self.seed_examples),
             "rouge_threshold": args.rouge_threshold,
             "model_params": self.model_params,

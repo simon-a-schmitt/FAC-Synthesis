@@ -47,11 +47,26 @@ global:
     grad_accum: 4      # gradient_accumulation_steps
     cutoff_len: 4096   # >= longest FT example (cti_vsp gold pool max 1653; generation max_tokens 2048 + prompt/label); checked by the gate in prepare_lf_dataset.py
 
-# OpenRouter request concurrency (--max-concurrent-requests); as in
-# data_synthesis/{blackbox,feature_guided,hybrid}/*_generation_job.sh and labeling/labeling_job.sh.
+# OpenRouter request concurrency (--max-concurrent-requests). generation: also sets the wave size
+# (2 x concurrency prompts per frozen pool snapshot, shared/generation.py) - a methodological
+# parameter, part of gen_fingerprint; keep it fixed across all runs. benchmark: --mode api runs.
 api:
   generation: {max_concurrent_requests: 2}
   labeling: {max_concurrent_requests: 2}
+  benchmark: {max_concurrent_requests: 8}
+
+# Sampling of the generation calls (all generation arms incl. both hybrid phases, both setups);
+# passed explicitly by experiments/slurm/gen_job.sh. shared/generation.py BASE_GENERATION_PARAMS
+# carries the same values for manual calls.
+generation: {temperature: 0.8, top_p: 0.9, max_tokens: 2048}
+
+# Labeling sampling (documentation only - the value lives in data_synthesis/labeling/run_labeling.py
+# LABELING_MODEL_PARAMS and applies to every label_model preset, gpt and deepseek).
+labeling: {temperature: 0.0}
+
+# API evaluation arm: {bench}__api__{model}, plain-mode prompt sent to the OpenRouter model
+# (benchmark_play_ground/api_prediction.py API_MODEL_PRESETS, temperature 0).
+api_models: [deepseek, llama, gpt]
 
 # gen_model: preset of data_synthesis/shared/openrouter.py GENERATION_MODEL_PRESETS
 # label_model: preset of data_synthesis/labeling/run_labeling.py MODEL_PRESETS

@@ -4,9 +4,10 @@ experiments/status.py / experiments/submit.py.
 
   stage        applies to          done when
   gen          bb / fg / hybrid    GEN_ACCEPTED_JSON exists, GEN_CHECKPOINT_JSON does not,
-                                   GEN_LOG_JSON has prefix == run_id and a completed run, and the
-                                   accepted pool holds the run's seeds + exactly n_synthetic synthetic
-                                   entries (hybrid: n_blackbox + n_feature_guided, also per phase)
+                                   GEN_LOG_JSON has prefix == run_id and a completed run whose
+                                   gen_fingerprint == GEN_FINGERPRINT (runs.py), and the accepted pool
+                                   holds the run's seeds + exactly n_synthetic synthetic entries
+                                   (hybrid: n_blackbox + n_feature_guided, also per phase)
   label_build  bb / fg / hybrid    LLaMA-Factory dataset prepared and passes the gate
                                    (experiments/prepare_lf_dataset.py is_prepared)
   ft           gold / bb/fg/hybrid LORA_DIR/adapter_model.safetensors + FT_LOG_JSON whose
@@ -14,7 +15,8 @@ experiments/status.py / experiments/submit.py.
   bench        all                 BENCH_DONE whose bench_fingerprint == BENCH_FINGERPRINT
 
 stage_state(): "done", "stale" (marker written under another config), "missing", or "-" if the
-stage does not apply to the arm.
+stage does not apply to the arm. run_states() additionally marks a done stage as stale if a stage
+it is built from (gen -> label_build -> ft -> bench) is not done.
 
 The label checks also fail if more than MAX_MAJORITY_FALLBACK_RATE of the synthetic examples got
 their label by run_labeling.py's majority fallback (summed over all runs in LABEL_LOG_JSON): those
@@ -22,8 +24,11 @@ rows look complete, and a rerun keeps them - run_labeling.py only re-requests bl
 
 CLI (exit 0 = check passed; reasons on stdout, the state word for *-state on stdout):
   gen-done <run_id>          generation complete
-  gen-state <run_id>         done | resume (checkpoint exists) | fresh (no output) | partial
-                             (outputs but neither done nor a checkpoint; exit 1)
+  gen-state <run_id>         done | resume (checkpoint of the current config) | fresh (no output) |
+                             stale (complete outputs or a checkpoint of another gen_fingerprint) |
+                             partial (outputs but neither done nor a checkpoint; exit 1)
+  gen-move-stale <run_id>    moves the generation outputs, labeling files and lf_data of the run to
+                             <name>.stale.<timestamp> (nothing is deleted)
   labels <run_id>            LABEL_TSV complete (n_total rows, every text labeled, fallback rate)
   fallbacks <run_id>         number of majority-fallback labels
   label-build-done <run_id>  dataset prepared and gate passed
@@ -40,6 +45,7 @@ import csv
 import json
 import sys
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 from runs import GEN_ARMS, load_config, parse_run_id, resolve
@@ -58,7 +64,16 @@ def load_accepted(r: dict) -> tuple[list[dict], list[dict]]:
     return [e for e in entries if e.get("type") == "seed"], [e for e in entries if e.get("type") != "seed"]
 
 
-def check_gen_done(r: dict) -> list[str]:
+def logged_gen_fingerprint(r: dict) -> str | None:
+    """gen_fingerprint of the latest completed run in GEN_LOG_JSON ("" if it has none)."""
+    log = Path(r["gen_log_json"])
+    if not log.is_file():
+        return None
+    runs = json.loads(log.read_text(encoding="utf-8")).get("runs") or []
+    return (runs[-1].get("gen_fingerprint") or "") if runs else None
+
+
+def check_gen_done(r: dict, check_fingerprint: bool = True) -> list[str]:
     accepted, checkpoint, log = (Path(r[k]) for k in ("gen_accepted_json", "gen_checkpoint_json", "gen_log_json"))
     if not accepted.is_file():
         return [f"generation output {accepted} does not exist (generation not run yet)"]
@@ -72,6 +87,9 @@ def check_gen_done(r: dict) -> list[str]:
         if data.get("prefix") != r["run_id"] or not data.get("runs"):
             errors.append(f"generation log {log} has no completed run for prefix {r['run_id']!r} "
                           f"(prefix={data.get('prefix')!r}, runs={len(data.get('runs', []))})")
+        elif check_fingerprint and logged_gen_fingerprint(r) != r["gen_fingerprint"]:
+            errors.append(f"generation log {log}: gen_fingerprint {logged_gen_fingerprint(r)!r} != current "
+                          f"{r['gen_fingerprint']!r} (config changed -> stale)")
 
     seeds, synthetic = load_accepted(r)
     if len(seeds) != r["seed_n_examples"]:
@@ -92,16 +110,40 @@ def check_gen_done(r: dict) -> list[str]:
     return errors
 
 
+def gen_outputs(r: dict) -> list[Path]:
+    return [Path(r[k]) for k in r if k.startswith("gen_") and k.endswith("_json") and Path(r[k]).exists()]
+
+
 def gen_state(r: dict) -> tuple[str, list[str]]:
-    if Path(r["gen_checkpoint_json"]).exists():
+    checkpoint = Path(r["gen_checkpoint_json"])
+    if checkpoint.exists():
+        stored = (json.loads(checkpoint.read_text(encoding="utf-8")).get("resolved_args") or {}).get("gen_fingerprint")
+        if stored != r["gen_fingerprint"]:
+            return "stale", [f"checkpoint gen_fingerprint {stored!r} != current {r['gen_fingerprint']!r}"]
         return "resume", []
-    outputs = [r[k] for k in r if k.startswith("gen_") and k.endswith("_json") and Path(r[k]).exists()]
+    outputs = gen_outputs(r)
     if not outputs:
         return "fresh", []
-    errors = check_gen_done(r)
+    errors = check_gen_done(r, check_fingerprint=False)
     if not errors:
-        return "done", []
-    return "partial", errors + [f"existing outputs without checkpoint: {', '.join(Path(o).name for o in outputs)}"]
+        if logged_gen_fingerprint(r) == r["gen_fingerprint"]:
+            return "done", []
+        return "stale", [f"gen_fingerprint {logged_gen_fingerprint(r)!r} in {r['gen_log_json']} != current "
+                         f"{r['gen_fingerprint']!r}"]
+    return "partial", errors + [f"existing outputs without checkpoint: {', '.join(o.name for o in outputs)}"]
+
+
+def move_stale_gen(r: dict) -> list[str]:
+    """Moves the run's generation outputs, labeling files and LF data to <name>.stale.<timestamp>."""
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    paths = gen_outputs(r) + [Path(r[k]) for k in ("label_tsv", "label_failed_json", "label_log_json", "lf_data_dir")]
+    moved = []
+    for path in paths:
+        if path.exists():
+            target = path.with_name(f"{path.name}.stale.{ts}")
+            path.rename(target)
+            moved.append(f"{path} -> {target}")
+    return moved
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +238,8 @@ def stage_state(r: dict, stage: str, n_total: int) -> str:
     if not applies(r, stage):
         return "-"
     if stage == "gen":
-        return "done" if gen_state(r)[0] == "done" else "missing"
+        state = gen_state(r)[0]
+        return state if state in ("done", "stale") else "missing"
     if stage == "label_build":
         return "done" if label_build_done(r, n_total) else "missing"
     if stage == "ft":
@@ -205,14 +248,22 @@ def stage_state(r: dict, stage: str, n_total: int) -> str:
 
 
 def run_states(r: dict, n_total: int) -> dict[str, str]:
-    return {stage: stage_state(r, stage, n_total) for stage in STAGE_NAMES}
+    states, upstream_done = {}, True
+    for stage in STAGE_NAMES:  # in build order: gen -> label_build -> ft -> bench
+        state = stage_state(r, stage, n_total)
+        if state == "done" and not upstream_done:
+            state = "stale"
+        if state != "-":
+            upstream_done = upstream_done and state == "done"
+        states[stage] = state
+    return states
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-CHECKS = ("gen-done", "gen-state", "labels", "fallbacks", "label-build-done", "ft-state", "bench-state",
+CHECKS = ("gen-done", "gen-state", "gen-move-stale", "labels", "fallbacks", "label-build-done", "ft-state", "bench-state",
           "bench-resumable")
 
 
@@ -228,7 +279,7 @@ def main() -> None:
         r = resolve(parse_run_id(args.run_id), config)
     except ValueError as exc:
         raise SystemExit(f"error: {exc}")
-    needs = {"gen-done": "gen", "gen-state": "gen", "labels": "label_build", "fallbacks": "label_build",
+    needs = {"gen-done": "gen", "gen-state": "gen", "gen-move-stale": "gen", "labels": "label_build", "fallbacks": "label_build",
              "label-build-done": "label_build", "ft-state": "ft"}.get(args.check)
     if needs and not applies(r, needs):
         raise SystemExit(f"error: stage {needs!r} does not apply to {args.run_id} (arm {r['arm']!r}).")
@@ -251,6 +302,10 @@ def main() -> None:
         sys.exit(1 if state == "partial" else 0)
     if args.check == "fallbacks":
         print(majority_fallbacks(r))
+        return
+    if args.check == "gen-move-stale":
+        for line in move_stale_gen(r):
+            print(f"[STALE] {args.run_id}: verschoben {line}")
         return
     if args.check == "gen-done":
         errors = check_gen_done(r)

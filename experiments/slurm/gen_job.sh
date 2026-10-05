@@ -36,6 +36,8 @@
 #   done     Generierung abgeschlossen (stages.py gen-done)    -> [SKIP]
 #   resume   GEN_CHECKPOINT_JSON existiert                                 -> mit --resume fortsetzen
 #   fresh    noch keine Outputs                                            -> neu starten
+#   stale    Outputs/Checkpoint unter anderem gen_fingerprint              -> Gen-Outputs, Labeling-
+#            TSV/-Logs und lf_data nach *.stale.<ts> verschieben (stages.py gen-move-stale), neu starten
 #   partial  Outputs ohne Checkpoint, nicht abgeschlossen                  -> Fehler für diesen Run
 #            (die übrigen Runs laufen weiter)
 #   Nach Exit 0 muss gen-done bestehen (ein Lauf, der am Call-Limit stoppt, endet mit Exit 0 und
@@ -129,6 +131,9 @@ run_one() {
         done)    echo "[SKIP] $run_id: Generierung abgeschlossen."; status "skip"; return 0 ;;
         resume)  local resume=(--resume) ;;
         fresh)   local resume=() ;;
+        stale)   echo "[STALE] $run_id: Config geändert (gen_fingerprint, siehe $log) -> Artefakte beiseite, neu generieren."
+                 python experiments/stages.py gen-move-stale "$run_id" | tee -a "$log"
+                 local resume=() ;;
         partial) echo "FEHLER: $run_id: Teil-Outputs ohne Checkpoint, kein Fortsetzen möglich (siehe $log)." >&2
                  status "partial"; return 1 ;;
         *)       echo "FEHLER: $run_id: Generierungs-Zustand unbekannt ('$state', siehe $log)." >&2
@@ -138,7 +143,9 @@ run_one() {
     local args=(
         --domain "$BENCH" --seed-set "$SEED_SET" --seed-group "$SEED_GROUP"
         --rouge-threshold "$ROUGE_THRESHOLD" --model "$GEN_MODEL" --prefix "$GEN_PREFIX"
-        --max-concurrent-requests "$GEN_MAX_CONCURRENT" --env-file "$REPO/.env"
+        --temperature "$GEN_TEMPERATURE" --top-p "$GEN_TOP_P" --max-tokens "$GEN_MAX_TOKENS"
+        --max-concurrent-requests "$GEN_MAX_CONCURRENT" --gen-fingerprint "$GEN_FINGERPRINT"
+        --env-file "$REPO/.env"
     )
     case "$ARM" in
         bb)     args+=(--n "$N_SYNTHETIC") ;;

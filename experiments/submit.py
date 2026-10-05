@@ -5,6 +5,7 @@ pending/running. Calling it again is the "reconcile" step (no daemon).
 Chains (sbatch --parsable, --dependency=afterok:<id> --kill-on-invalid-dep=yes):
     bb / fg / hybrid:   gen (packed) -> label_build (per run) -> ft_bench (per run)
     plain / icl / gold: ft_bench (per run), no dependency
+    api:                api_bench_job.sh (per run, CPU), no dependency; recorded as job stage ft_bench
 A downstream stage depends on its upstream job if that is submitted now or still pending/running;
 on nothing if the upstream stage is done. A failed / timed-out stage counts as missing.
 
@@ -36,7 +37,7 @@ from status import (ACTIVE, add_filter_args, append_submission, collect, filters
 CLUSTER_ENV = os.environ.get("CLUSTER_ENV", str(PROJECT_DIR / "experiments" / "config" / "cluster.env"))
 CLUSTER_KEYS = ("GEN_PARTITION", "GEN_TIME", "GEN_GRES", "GEN_PACK_SIZE", "GEN_CPU_PARTITION", "GEN_CPU_TIME",
                 "GEN_PACK_SIZE_CPU", "GEN_MAX_LANES", "LABEL_BUILD_PARTITION", "LABEL_BUILD_TIME",
-                "FT_BENCH_PARTITION", "FT_BENCH_TIME")
+                "FT_BENCH_PARTITION", "FT_BENCH_TIME", "API_BENCH_PARTITION", "API_BENCH_TIME")
 SLURM_DIR = "experiments/slurm"
 
 
@@ -113,6 +114,7 @@ def plan_and_submit(config: dict, rows: list[dict], cs: dict[str, str], sub: Sub
     # 2) label_build and ft_bench per run.
     lb_opts = [f"--partition={cs['LABEL_BUILD_PARTITION']}", f"--time={cs['LABEL_BUILD_TIME']}"]
     fb_opts = [f"--partition={cs['FT_BENCH_PARTITION']}", f"--time={cs['FT_BENCH_TIME']}"]
+    api_opts = [f"--partition={cs['API_BENCH_PARTITION']}", f"--time={cs['API_BENCH_TIME']}"]
     for row in rows:
         run_id, st = row["r"]["run_id"], row["status"]
         upstream = None
@@ -123,7 +125,10 @@ def plan_and_submit(config: dict, rows: list[dict], cs: dict[str, str], sub: Sub
             else:
                 upstream = active_job(row, "label_build", "label_build")
         if needs(row, "ft", "bench"):
-            sub.sbatch("ft_bench", [run_id], fb_opts, "ft_bench_job.sh", upstream)
+            if row["spec"].arm == "api":
+                sub.sbatch("ft_bench", [run_id], api_opts, "api_bench_job.sh")
+            else:
+                sub.sbatch("ft_bench", [run_id], fb_opts, "ft_bench_job.sh", upstream)
 
 
 def main() -> None:

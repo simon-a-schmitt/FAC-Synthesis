@@ -321,15 +321,14 @@ PYEOF
 phase_benchmark() {
     echo "Loading environment from start_llama.sh..."
     set +u; source "$START_LLAMA_SH"; set -u
-    gpu_diagnostics
 
-    local args=(
-        --model-path "$BASE_MODEL"
-        --data-tsv "$TEST_TSV"
-        --mode "$BENCH_MODE"
-        --max-prompts "$MAX_PROMPTS"
-        --device cuda
-    )
+    local args=(--data-tsv "$TEST_TSV" --mode "$BENCH_MODE" --max-prompts "$MAX_PROMPTS")
+    if [[ "$BENCH_MODE" == "api" ]]; then
+        echo "[INFO] API-Modell: $API_MODEL ($API_MODEL_ID); --api-model steht in BENCH_EXTRA_ARGS."
+    else
+        gpu_diagnostics
+        args+=(--model-path "$BASE_MODEL" --device cuda)
+    fi
     case "$BENCH_MODE" in
         fine_tuned)
             [[ -f "$LORA_DIR/adapter_model.safetensors" ]] || die "Kein Adapter unter $LORA_DIR."
@@ -357,6 +356,11 @@ if has_stage ft_bench; then
     else
         [[ "$ft_state" == "stale" ]] && echo "[STALE] FT: Config geändert (siehe oben) -> neu trainieren."
         ft_prepare
+        # Das LF-Dataset kann eben erst entstanden sein (gold) -> ft/bench_fingerprint (enthalten
+        # dessen sha256) neu auflösen, bevor sie in ft_log.json / bench.done geschrieben werden.
+        RUN_SHELL="$(python experiments/runs.py show "$RUN_ID" --format shell)" \
+            || die "runs.py konnte run_id '$RUN_ID' nicht auflösen."
+        eval "$RUN_SHELL"
         run_phase ft phase_train
     fi
 elif ! has_stage bench; then

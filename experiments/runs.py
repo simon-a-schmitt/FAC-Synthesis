@@ -4,6 +4,7 @@ job scripts). Nothing here stores state: whether a run is done is read off the f
 
 run_id schema (separator "__", characters [a-z0-9_-] only):
     {bench}__plain
+    {bench}__api__{model}          model: config api_models (benchmark_play_ground/api_prediction.py presets)
     {bench}__icl__{seedset}-{gg}
     {bench}__gold__{seedset}-{gg}
     {bench}__bb__{setup}__{seedset}-{gg}
@@ -16,9 +17,16 @@ data_synthesis/{blackbox,feature_guided,hybrid}/run_generation.py (shared/genera
 data_synthesis/labeling/run_labeling.py, with --prefix = run_id. New per-run artifacts live under
 experiments/runs/<run_id>/.
 
-Done markers carry a config fingerprint (ft_fingerprint: FT hyperparameters, base model, ft_seed,
-n_total; bench_fingerprint: bench script, test TSV, mode, icl_k, max_prompts, extra args and - for
-fine_tuned - ft_fingerprint), so a marker written under another config is detected as stale.
+Done markers carry a config fingerprint, so a marker written under another config is detected as
+stale (experiments/stages.py):
+    gen_fingerprint    generation model slug, temperature, top_p, max_tokens, rouge_threshold,
+                       activation_threshold, n / n_bb / n_fg, max_concurrent_requests (= wave size),
+                       generation_seed, sha256 of prompts/<bench>/generation.py and (fg/hybrid) of
+                       the feature score file; stored in the generation log of each run
+    ft_fingerprint     FT hyperparameters, base model, ft_seed, n_total, sha256 of the LF dataset JSON
+                       (new training data invalidates FT + bench)
+    bench_fingerprint  bench script, test TSV, mode, icl_k, max_prompts, extra args, API model id
+                       and - for fine_tuned - ft_fingerprint
 
 Usage:
     python experiments/runs.py list [--bench B] [--arm A] [--setup S] [--seed-set K] [--group G]
@@ -53,16 +61,20 @@ else:
 
 sys.path.insert(0, str(PROJECT_DIR / "data_synthesis"))
 sys.path.insert(0, str(PROJECT_DIR / "benchmarks"))
+sys.path.insert(0, str(PROJECT_DIR))
 from shared import seed_derivation  # noqa: E402
-from shared.benchmarks import SEED_SETS, find_seed_file  # noqa: E402
+from shared.benchmarks import SEED_SETS, feature_scores_path, find_seed_file  # noqa: E402
+from shared.openrouter import GENERATION_MODEL_PRESETS  # noqa: E402
+from benchmark_play_ground.api_prediction import API_MODEL_PRESETS  # noqa: E402
 from sample_gold_ft_sets import SEED_GROUP_PATTERN  # noqa: E402
 
-ARMS = ("plain", "icl", "gold", "bb", "fg", "hybrid")
+ARMS = ("plain", "api", "icl", "gold", "bb", "fg", "hybrid")
 GEN_ARMS = ("bb", "fg", "hybrid")
 # run_id arm -> directory under data_synthesis/ (= run_labeling.py --source)
 GEN_ARM_DIRS = {"bb": "blackbox", "fg": "feature_guided", "hybrid": "hybrid"}
 STAGES = {
     "plain": ["bench"],
+    "api": ["bench"],
     "icl": ["bench"],
     "gold": ["ft_bench"],
     "bb": ["gen", "label_build", "ft_bench"],
@@ -76,6 +88,7 @@ _NAME = r"[a-z0-9]+(?:_[a-z0-9]+)*"  # no "__" inside a field
 _SEED = r"(?P<seed_set>k\d+)-(?P<group>\d{2})"
 RUN_ID_PATTERNS = {
     "plain": re.compile(rf"^(?P<bench>{_NAME})__plain$"),
+    "api": re.compile(rf"^(?P<bench>{_NAME})__api__(?P<api_model>{_NAME})$"),
     "icl": re.compile(rf"^(?P<bench>{_NAME})__icl__{_SEED}$"),
     "gold": re.compile(rf"^(?P<bench>{_NAME})__gold__{_SEED}$"),
     "bb": re.compile(rf"^(?P<bench>{_NAME})__bb__(?P<setup>{_NAME})__{_SEED}$"),
@@ -93,16 +106,17 @@ class RunSpec:
     group: str | None = None
     n_bb: int | None = None  # hybrid only
     n_fg: int | None = None  # hybrid only
+    api_model: str | None = None  # api only
 
     def __post_init__(self):
         if self.arm not in ARMS:
             raise ValueError(f"Unknown arm {self.arm!r}; expected one of {ARMS}.")
-        needs_seed = self.arm != "plain"
+        needs_seed = self.arm not in ("plain", "api")
         needs_setup = self.arm in GEN_ARMS
         needs_ratio = self.arm == "hybrid"
         for name, value, needed in (("seed_set", self.seed_set, needs_seed), ("group", self.group, needs_seed),
                                     ("setup", self.setup, needs_setup), ("n_bb", self.n_bb, needs_ratio),
-                                    ("n_fg", self.n_fg, needs_ratio)):
+                                    ("n_fg", self.n_fg, needs_ratio), ("api_model", self.api_model, self.arm == "api")):
             if (value is not None) != needed:
                 raise ValueError(f"Arm {self.arm!r}: {name} must be {'set' if needed else 'None'}, got {value!r}.")
 
@@ -115,6 +129,8 @@ def format_run_id(spec: RunSpec) -> str:
     parts = [spec.bench, spec.arm]
     if spec.setup is not None:
         parts.append(spec.setup)
+    if spec.api_model is not None:
+        parts.append(spec.api_model)
     if spec.seed_set is not None:
         parts.append(f"{spec.seed_set}-{spec.group}")
     if spec.arm == "hybrid":
@@ -134,7 +150,7 @@ def parse_run_id(run_id: str) -> RunSpec:
     g = match.groupdict()
     return RunSpec(bench=g["bench"], arm=arm, setup=g.get("setup"), seed_set=g.get("seed_set"),
                    group=g.get("group"), n_bb=int(g["n_bb"]) if "n_bb" in g else None,
-                   n_fg=int(g["n_fg"]) if "n_fg" in g else None)
+                   n_fg=int(g["n_fg"]) if "n_fg" in g else None, api_model=g.get("api_model"))
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +168,9 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict:
         for n_bb, n_fg in hybrid_splits(config, seed_set):
             if n_bb <= 0 or n_fg <= 0:
                 raise ValueError(f"Seed set {seed_set!r}: hybrid split {n_bb}/{n_fg} must be > 0 on both sides.")
+    unknown = [m for m in config["api_models"] if m not in API_MODEL_PRESETS]
+    if unknown:
+        raise ValueError(f"api_models {unknown} unknown to api_prediction.API_MODEL_PRESETS.")
     return config
 
 
@@ -174,6 +193,7 @@ def expand(config: dict) -> list[RunSpec]:
     specs = []
     for bench in config["benchmarks"]:
         specs.append(RunSpec(bench, "plain"))
+        specs += [RunSpec(bench, "api", api_model=m) for m in config["api_models"]]
         specs += [RunSpec(bench, "icl", seed_set=s, group=g) for s, g in seeds]
         specs += [RunSpec(bench, "gold", seed_set=s, group=g) for s, g in seeds]
         for arm in ("bb", "fg"):
@@ -275,6 +295,10 @@ def resolve(spec: RunSpec, config: dict) -> dict:
         if n_found != n_examples:
             raise ValueError(f"{seed_file} has {n_found} seed examples, seed set {spec.seed_set} expects {n_examples}.")
         r.update(seed_set=spec.seed_set, seed_group=spec.group, seed_file=seed_file, seed_n_examples=n_examples)
+    if spec.arm == "api":
+        r.update(api_model=spec.api_model, api_model_id=API_MODEL_PRESETS[spec.api_model][0])
+        r["bench_extra_args"] += ["--api-model", spec.api_model, "--max-concurrent-requests",
+                                  str(config["api"]["benchmark"]["max_concurrent_requests"])]
     if spec.arm == "icl":
         r.update(icl_k=r["seed_n_examples"], few_shot_tsv=r["seed_file"])
     if spec.arm == "gold":
@@ -296,6 +320,22 @@ def resolve(spec: RunSpec, config: dict) -> dict:
                  gen_max_concurrent=config["api"]["generation"]["max_concurrent_requests"],
                  label_max_concurrent=config["api"]["labeling"]["max_concurrent_requests"])
         r.update(labeling_paths(spec.bench, run_id))
+        gen = config["generation"]
+        r.update(gen_temperature=gen["temperature"], gen_top_p=gen["top_p"], gen_max_tokens=gen["max_tokens"],
+                 generation_seed=seed_derivation.derive_seed_from_file(spec.bench, r["seed_file"],
+                                                                        seed_derivation.PURPOSE_GENERATION))
+        is_fg = spec.arm in ("fg", "hybrid")
+        r["gen_fingerprint"] = fingerprint({
+            "model_id": GENERATION_MODEL_PRESETS[setup["gen_model"]][0],
+            "temperature": gen["temperature"], "top_p": gen["top_p"], "max_tokens": gen["max_tokens"],
+            "rouge_threshold": b["rouge_threshold"],
+            "activation_threshold": b["activation_threshold"] if is_fg else None,
+            "n": r.get("n_synthetic"), "n_bb": spec.n_bb, "n_fg": spec.n_fg,
+            "max_concurrent_requests": r["gen_max_concurrent"],
+            "generation_seed": r["generation_seed"],
+            "prompt_sha256": file_sha256(PROJECT_DIR / "data_synthesis" / "prompts" / spec.bench / "generation.py"),
+            "feature_scores_sha256": file_sha256(feature_scores_path(spec.bench)) if is_fg else None,
+        })
     if is_ft:
         r.update(
             ft_seed=seed_derivation.derive_seed_from_file(spec.bench, r["seed_file"],
@@ -308,16 +348,28 @@ def resolve(spec: RunSpec, config: dict) -> dict:
             ft_log_json=run_dir / "ft_log.json",
         )
         r.update({f"ft_{k}": v for k, v in g["fine_tuning"].items()})
+        r["lf_dataset_sha256"] = file_sha256(r["lf_dataset_json"])
         r["ft_fingerprint"] = fingerprint({
             "fine_tuning": g["fine_tuning"], "base_model": g["base_model"], "ft_seed": r["ft_seed"],
-            "n_total": g["n_total"],
+            "n_total": g["n_total"], "lf_dataset_sha256": r["lf_dataset_sha256"],
         })
-    r["bench_fingerprint"] = fingerprint({
+    bench_fields = {
         "bench_script": b["bench_script"], "test_tsv": b["test_tsv"], "mode": r["bench_mode"],
-        "icl_k": r.get("icl_k"), "max_prompts": b["max_prompts"], "bench_extra_args": list(b["bench_extra_args"]),
+        "icl_k": r.get("icl_k"), "max_prompts": b["max_prompts"], "bench_extra_args": r["bench_extra_args"],
         "ft_fingerprint": r.get("ft_fingerprint"),
-    })
+    }
+    if spec.arm == "api":  # only here, so the fingerprints of the other arms stay unchanged
+        bench_fields["api_model_id"] = r["api_model_id"]
+    r["bench_fingerprint"] = fingerprint(bench_fields)
     return {k: str(v) if isinstance(v, Path) else v for k, v in r.items()}
+
+
+def file_sha256(path) -> str | None:
+    """sha256 of a file's content, None if it does not exist."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
 
 
 def fingerprint(fields: dict) -> str:

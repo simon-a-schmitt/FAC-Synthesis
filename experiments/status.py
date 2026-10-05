@@ -9,7 +9,7 @@ the stage does not apply to the arm.
   stale / missing       not done, no active or failed submission; stale = a done marker written
                         under another config (fingerprint, see runs.py)
 
-Job stages: gen, label_build, ft_bench (one job for the ft and bench columns).
+Job stages: gen, label_build, ft_bench (one job for the ft and bench columns; api runs: api_bench_job.sh).
 
 Usage:
     python experiments/status.py [--bench B] [--arm A] [--setup S] [--seed-set K] [--group G]
@@ -109,7 +109,9 @@ def collect(config: dict, specs: list[RunSpec]) -> list[dict]:
             if slurm_state in ACTIVE + ("timeout", "failed"):
                 status[stage] = slurm_state
             elif slurm_state == "completed":
-                status[stage] = "failed"
+                # Finished without the stage being done: failed - unless the stage is merely stale,
+                # i.e. it was done but its marker no longer matches the current config.
+                status[stage] = "stale" if file_state == "stale" else "failed"
             else:
                 status[stage] = file_state  # missing / stale
         row["status"] = status
