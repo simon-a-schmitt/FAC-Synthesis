@@ -5,13 +5,19 @@ experiments/results/summary.md.
 Columns (empty where a value does not apply or is not available):
   identity     run_id, bench, arm, setup, api_model, seed_set, group, n_bb, n_fg
   metrics      bench.summary.json - toxicity: auprc_toxic, macro_f1; claudette_tos: weighted_auprc_8,
-               macro_auprc_8; cti_vsp: macro_f1, mad. api runs: n_no_logprobs (examples scored from the
+               macro_auprc_8; cti_vsp: mad, macro_f1 (the first metric is the
+               primary one in summary.md). api runs: n_no_logprobs (examples scored from the
                hard label because the response had no usable logprobs; cti_vsp parses free text and
                uses no logprobs), n_unparsable_pred.
   data         FT arms, training TSV (gold: GOLD_TSV, synthetic: LABEL_TSV): n_train, label_dist
                (toxicity: toxic rate; claudette: Y rate per slot; cti: mode per metric), TV to the test
                set via helper_scripts/distribution_analysis: tv_marginal (mean over slots), tv_slots,
                tv_joint (claudette, cti_vsp)
+  length       FT arms, text column of the same training TSV via helper_scripts/length_analysis:
+               len_chars_mean, len_words_mean, len_words_p95 (whitespace split), len_tokens_mean,
+               len_tokens_p50, len_tokens_p95, len_tokens_max (base-model tokenizer, raw text without chat
+               template or special tokens; empty if transformers is not importable),
+               len_words_ratio_test, len_tokens_ratio_test (training mean / test-set mean)
   generation   gen/label logs: n_accepted, n_rejected, acceptance_rate = accepted/(accepted+rejected),
                n_rouge_duplicate, n_feature_inactive, n_discarded (hybrid: both phases), n_majority_fallback,
                gen_temperature, gen_top_p (logged model_params), gen/label prompt + completion tokens and
@@ -44,9 +50,10 @@ RESULTS_DIR = EXPERIMENTS_DIR / "results"
 METRICS = {
     "toxicity_detection": ("auprc_toxic", "macro_f1"),
     "claudette_tos": ("weighted_auprc_8", "macro_auprc_8"),
-    "cti_vsp": ("macro_f1", "mad"),
+    "cti_vsp": ("mad", "macro_f1"),
 }
-PRIMARY = {bench: metrics[0] for bench, metrics in METRICS.items()}
+PRIMARY = {bench: metrics[0] for bench, metrics in METRICS.items()}  # first metric per benchmark
+LOWER_IS_BETTER = {"mad"}
 STAGES_META = ("gen", "label_build", "ft", "bench")
 COLUMNS = [
     "run_id", "bench", "arm", "setup", "api_model", "seed_set", "group", "n_bb", "n_fg",
@@ -59,6 +66,9 @@ COLUMNS = [
     *[f"wall_{s}" for s in STAGES_META], "sae_gpu_seconds",
     *[f"git_{s}" for s in STAGES_META], "ft_seed", "gen_fingerprint",
     "fac_relevant", "fac_test",
+    "len_chars_mean", "len_words_mean", "len_words_p95",
+    "len_tokens_mean", "len_tokens_p50", "len_tokens_p95", "len_tokens_max",
+    "len_words_ratio_test", "len_tokens_ratio_test",
 ]
 
 
@@ -69,6 +79,36 @@ def load_distribution_analysis():
     spec.loader.exec_module(module)
     specs = {s["domain_dir"]: s for s in module.build_domain_specs().values()}
     return module, specs
+
+
+def load_length_analysis():
+    path = PROJECT_DIR / "helper_scripts" / "length_analysis" / "length_analysis.py"
+    spec = importlib.util.spec_from_file_location("length_analysis", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class Tokenizers:
+    """Base-model tokenizers, loaded on first use; None (token columns left empty) without transformers."""
+
+    def __init__(self):
+        self.cache: dict = {}
+        self.available = True
+
+    def get(self, model_path):
+        if not self.available:
+            return None
+        if model_path not in self.cache:
+            try:
+                from transformers import AutoTokenizer
+            except ImportError:
+                print("warning: transformers not importable - len_tokens_* columns left empty "
+                      "(run in the project env, e.g. after sourcing start_llama.sh)")
+                self.available = False
+                return None
+            self.cache[model_path] = AutoTokenizer.from_pretrained(str(model_path))
+        return self.cache[model_path]
 
 
 def read_json(path) -> dict | None:
@@ -141,6 +181,28 @@ def data_columns(r: dict, da, da_specs: dict, ref_cache: dict) -> dict:
             "tv_marginal": round(tv["marginal"]["mean"], 4),
             "tv_slots": " ".join(f"{f}={v:.3f}" for f, v in tv["marginal"]["per_slot"].items()),
             "tv_joint": round(tv["joint"], 4)}
+
+
+def length_columns(r: dict, la, tokenizers: Tokenizers, ref_cache: dict) -> dict:
+    tsv = Path(r["gold_tsv"] if r["arm"] == "gold" else r.get("label_tsv", ""))
+    if r["arm"] not in ("gold", "bb", "fg", "hybrid") or not tsv.is_file():
+        return {}
+    tok = tokenizers.get(r["base_model"])
+    result = la.analyze_texts(la.read_texts(tsv), tok)
+    key = (r["bench"], r["base_model"] if tok else None)
+    if key not in ref_cache:
+        ref_cache[key] = la.analyze_texts(la.read_texts(Path(r["test_tsv"])), tok)
+    ref = ref_cache[key]
+    row = {"len_chars_mean": round(result["chars"]["mean"], 1),
+           "len_words_mean": round(result["words"]["mean"], 1),
+           "len_words_p95": round(result["words"]["p95"], 1),
+           "len_words_ratio_test": round(result["words"]["mean"] / ref["words"]["mean"], 3)}
+    if "tokens" in result:
+        t = result["tokens"]
+        row.update(len_tokens_mean=round(t["mean"], 1), len_tokens_p50=round(t["p50"], 1),
+                   len_tokens_p95=round(t["p95"], 1), len_tokens_max=int(t["max"]),
+                   len_tokens_ratio_test=round(t["mean"] / ref["tokens"]["mean"], 3))
+    return row
 
 
 def generation_columns(r: dict) -> dict:
@@ -240,7 +302,8 @@ def write_summary(rows: list[dict], config: dict, path: Path) -> None:
 
     lines = ["# Results", "",
              "Primary metric per benchmark (mean ± SD over the seed groups present, n = runs): "
-             + ", ".join(f"{b}: `{PRIMARY[b]}`" for b in benches), "",
+             + ", ".join(f"{b}: `{PRIMARY[b]}`" + (" (lower is better)" if PRIMARY[b] in LOWER_IS_BETTER else "")
+                        for b in benches), "",
              "| arm variant | " + " | ".join(benches) + " |",
              "|---|" + "---|" * len(benches)]
     for v in order:
@@ -256,7 +319,9 @@ def main() -> None:
 
     config = load_config()
     da, da_specs = load_distribution_analysis()
+    la, tokenizers = load_length_analysis(), Tokenizers()
     ref_cache: dict = {}
+    len_ref_cache: dict = {}
     specs = sorted(select_specs(config, args.run_ids, **filters_of(args)), key=lambda s: run_order_key(config, s))
     rows = []
     for spec in specs:
@@ -267,7 +332,7 @@ def main() -> None:
                "api_model": spec.api_model, "seed_set": spec.seed_set, "group": spec.group,
                "n_bb": spec.n_bb, "n_fg": spec.n_fg}
         for part in (metric_columns(r), data_columns(r, da, da_specs, ref_cache), generation_columns(r),
-                     meta_columns(r), fac_columns(r)):
+                     meta_columns(r), fac_columns(r), length_columns(r, la, tokenizers, len_ref_cache)):
             row.update(part)
         rows.append(row)
 

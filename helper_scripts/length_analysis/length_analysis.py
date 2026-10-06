@@ -1,16 +1,24 @@
-"""Berechnet Längen-Verteilungsstatistiken (Zeichen/Wörter) für das "text"-Feld
-in JSON-Dateien wie sie z.B. unter blackbox_generation/toxicity_detection/output
-liegen (Liste von Objekten mit einem "text"-Feld).
+"""Berechnet Längen-Verteilungsstatistiken (Zeichen/Wörter, optional Tokens) für Texte aus
+- JSON-Dateien wie sie z.B. unter blackbox_generation/toxicity_detection/output liegen
+  (Liste von Objekten mit einem "text"-Feld), oder
+- TSV-Dateien (zwei Spalten pro Zeile: Text, Label; Text = erste Spalte), wie die
+  Trainings- und Test-TSVs der Benchmarks.
+
+Wörter = Whitespace-Split. Tokens = input_ids des übergebenen Tokenizers auf dem reinen
+Text (ohne Chat-Template, ohne Special Tokens); benötigt transformers.
 
 Nutzung:
-    python length_analysis.py <input1.json> [<input2.json> ...]
+    python length_analysis.py <input1.json|tsv> [<input2> ...] [--tokenizer MODEL_DIR]
 
 Für jede Eingabedatei wird eine Ergebnisdatei
     <input-dateiname-ohne-endung>_length_distribution.json
 im Unterordner "length_distribution" des Eingabedatei-Ordners geschrieben.
+
+Als Modul (experiments/collect_results.py): analyze_texts(read_texts(path), tokenizer).
 """
 
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
@@ -34,34 +42,53 @@ def compute_distribution(values: list[int]) -> dict:
     return stats
 
 
-def analyze_file(input_path: Path) -> dict:
-    with input_path.open(encoding="utf-8") as f:
-        data = json.load(f)
+def read_texts(input_path: Path) -> list[str]:
+    """Texte einer .tsv (erste Spalte, Zeilen ohne Label übersprungen wie in
+    distribution_analysis.read_labels) oder einer JSON-Liste mit "text"-Feld."""
+    if input_path.suffix == ".tsv":
+        with input_path.open(encoding="utf-8", newline="") as f:
+            texts = [row[0] for row in csv.reader(f, delimiter="\t") if len(row) >= 2 and row[1].strip()]
+    else:
+        with input_path.open(encoding="utf-8") as f:
+            texts = [entry["text"] for entry in json.load(f)]
+    if not texts:
+        raise ValueError(f"Keine Texte in {input_path} gefunden.")
+    return texts
 
-    texts = [entry["text"] for entry in data]
-    char_counts = [len(t) for t in texts]
-    word_counts = [len(t.split()) for t in texts]
 
-    return {
-        "chars": compute_distribution(char_counts),
-        "words": compute_distribution(word_counts),
+def analyze_texts(texts: list[str], tokenizer=None) -> dict:
+    result = {
+        "chars": compute_distribution([len(t) for t in texts]),
+        "words": compute_distribution([len(t.split()) for t in texts]),
     }
+    if tokenizer is not None:
+        ids = tokenizer(texts, add_special_tokens=False)["input_ids"]
+        result["tokens"] = compute_distribution([len(i) for i in ids])
+    return result
+
+
+def analyze_file(input_path: Path, tokenizer=None) -> dict:
+    return analyze_texts(read_texts(input_path), tokenizer)
 
 
 def print_table(result: dict) -> None:
+    units = [u for u in ("chars", "words", "tokens") if u in result]
     rows = ["count", "mean", "std", "min"] + [f"p{p}" for p in PERCENTILES] + ["max"]
-    header = f"{'':6}{'chars':>15}{'words':>15}"
-    print(header)
+    print(f"{'':6}" + "".join(f"{u:>15}" for u in units))
     for row in rows:
-        chars_val = result["chars"][row]
-        words_val = result["words"][row]
-        print(f"{row:6}{chars_val:15.6f}{words_val:15.6f}")
+        print(f"{row:6}" + "".join(f"{result[u][row]:15.6f}" for u in units))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input_files", nargs="+", help="Pfad(e) zu Eingabe-JSON-Dateien")
+    parser.add_argument("input_files", nargs="+", help="Pfad(e) zu Eingabe-JSON/TSV-Dateien")
+    parser.add_argument("--tokenizer", help="Modell-/Tokenizer-Verzeichnis für Token-Längen (optional)")
     args = parser.parse_args()
+
+    tokenizer = None
+    if args.tokenizer:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
     for input_arg in args.input_files:
         input_path = Path(input_arg)
@@ -70,7 +97,7 @@ def main() -> None:
             continue
 
         print(f"\n=== {input_path.name} ===")
-        result = analyze_file(input_path)
+        result = analyze_file(input_path, tokenizer)
         print_table(result)
 
         output_dir = input_path.parent / "length_distribution"
