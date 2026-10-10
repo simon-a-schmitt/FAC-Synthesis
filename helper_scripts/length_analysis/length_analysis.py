@@ -14,7 +14,9 @@ Für jede Eingabedatei wird eine Ergebnisdatei
     <input-dateiname-ohne-endung>_length_distribution.json
 im Unterordner "length_distribution" des Eingabedatei-Ordners geschrieben.
 
-Als Modul (experiments/collect_results.py): analyze_texts(read_texts(path), tokenizer).
+Als Modul (experiments/collect_results.py): analyze_texts(read_texts(path), tokenizer), bzw.
+measure_lengths + analyze_lengths, wenn die Rohlängen zusätzlich für distance_to_reference
+(TV-Distanz und Wasserstein-1 gegen eine Referenzverteilung, z.B. das Testset) gebraucht werden.
 """
 
 import argparse
@@ -26,6 +28,7 @@ from pathlib import Path
 import numpy as np
 
 PERCENTILES = [50, 75, 90, 95, 99]
+TV_BINS = 10  # Quantil-Bins der Referenz für distance_to_reference (Dezile)
 
 
 def compute_distribution(values: list[int]) -> dict:
@@ -56,15 +59,51 @@ def read_texts(input_path: Path) -> list[str]:
     return texts
 
 
-def analyze_texts(texts: list[str], tokenizer=None) -> dict:
-    result = {
-        "chars": compute_distribution([len(t) for t in texts]),
-        "words": compute_distribution([len(t.split()) for t in texts]),
-    }
+def measure_lengths(texts: list[str], tokenizer=None) -> dict[str, list[int]]:
+    """Rohlängen pro Einheit (chars, words, tokens falls Tokenizer gegeben)."""
+    lengths = {"chars": [len(t) for t in texts], "words": [len(t.split()) for t in texts]}
     if tokenizer is not None:
-        ids = tokenizer(texts, add_special_tokens=False)["input_ids"]
-        result["tokens"] = compute_distribution([len(i) for i in ids])
-    return result
+        lengths["tokens"] = [len(i) for i in tokenizer(texts, add_special_tokens=False)["input_ids"]]
+    return lengths
+
+
+def analyze_lengths(lengths: dict[str, list[int]]) -> dict:
+    return {unit: compute_distribution(values) for unit, values in lengths.items()}
+
+
+def analyze_texts(texts: list[str], tokenizer=None) -> dict:
+    return analyze_lengths(measure_lengths(texts, tokenizer))
+
+
+def tv_quantile_bins(values, reference, n_bins: int = TV_BINS) -> float:
+    """TV-Distanz (1/2 * sum |p_i - q_i|) der beiden Längenverteilungen über Bins an den Quantilen
+    der Referenz (n_bins gleich besetzte Bins, bei Ties zusammengelegt), plus je ein Überlauf-Bin
+    unterhalb des Minimums und oberhalb des Maximums der Referenz - Längen außerhalb des
+    Referenzbereichs zählen damit voll als Abweichung. In [0, 1]."""
+    values, reference = np.asarray(values, dtype=float), np.asarray(reference, dtype=float)
+    edges = np.unique(np.quantile(reference, np.linspace(0, 1, n_bins + 1)))
+    cuts = np.append(edges[:-1], np.nextafter(edges[-1], np.inf))  # letztes Bin schließt das Maximum ein
+    # Index 0: < min, 1..len(cuts)-1: Quantil-Bins, len(cuts): > max
+    p = np.bincount(np.searchsorted(cuts, values, side="right"), minlength=len(cuts) + 1) / values.size
+    q = np.bincount(np.searchsorted(cuts, reference, side="right"), minlength=len(cuts) + 1) / reference.size
+    return float(0.5 * np.abs(p - q).sum())
+
+
+def wasserstein1(values, reference) -> float:
+    """Wasserstein-1 / Earth Mover's Distance zweier empirischer 1D-Verteilungen = Integral über
+    |F_values(x) - F_reference(x)| (wie scipy.stats.wasserstein_distance), in Einheiten der Länge."""
+    a, b = np.sort(np.asarray(values, dtype=float)), np.sort(np.asarray(reference, dtype=float))
+    support = np.sort(np.concatenate([a, b]))
+    cdf_a = np.searchsorted(a, support[:-1], side="right") / a.size
+    cdf_b = np.searchsorted(b, support[:-1], side="right") / b.size
+    return float(np.sum(np.abs(cdf_a - cdf_b) * np.diff(support)))
+
+
+def distance_to_reference(values, reference, n_bins: int = TV_BINS) -> dict:
+    """tv: tv_quantile_bins; w1: wasserstein1 (Längeneinheiten); w1_norm: w1 / Mittelwert der Referenz."""
+    w1 = wasserstein1(values, reference)
+    return {"tv": tv_quantile_bins(values, reference, n_bins), "w1": w1,
+            "w1_norm": w1 / float(np.mean(reference))}
 
 
 def analyze_file(input_path: Path, tokenizer=None) -> dict:
