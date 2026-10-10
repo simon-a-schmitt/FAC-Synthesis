@@ -9,7 +9,7 @@
 #       ~/ft_bench_{claudette,toxicity,cti_vsp}.sh (identical FT hyperparameters in all three;
 #       claudette defines them as variables, toxicity/cti_vsp hard-code the same values).
 #       The FT seed is deliberately NOT here: it is derived per run (PURPOSE_FINE_TUNING).
-#   sae_ckpt, api.*.max_concurrent_requests
+#   sae_ckpt, api.{generation,labeling}.max_concurrent_requests
 #       data_synthesis/{blackbox,feature_guided,hybrid,labeling}/*_job.sh
 #   rouge_threshold / activation_threshold
 #       claudette_tos: job scripts (0.5 / 0.0). toxicity_detection / cti_vsp: not in any job
@@ -49,11 +49,10 @@ global:
 
 # OpenRouter request concurrency (--max-concurrent-requests). generation: also sets the wave size
 # (2 x concurrency prompts per frozen pool snapshot, shared/generation.py) - a methodological
-# parameter, part of gen_fingerprint; keep it fixed across all runs. benchmark: --mode api runs.
+# parameter, part of gen_fingerprint; keep it fixed across all runs.
 api:
   generation: {max_concurrent_requests: 2}
   labeling: {max_concurrent_requests: 2}
-  benchmark: {max_concurrent_requests: 8}
 
 # Sampling of the generation calls (all generation arms incl. both hybrid phases, both setups);
 # passed explicitly by experiments/slurm/gen_job.sh. shared/generation.py BASE_GENERATION_PARAMS
@@ -64,9 +63,8 @@ generation: {temperature: 0.8, top_p: 0.9, max_tokens: 2048}
 # LABELING_MODEL_PARAMS and applies to every label_model preset, gpt and deepseek).
 labeling: {temperature: 0.0}
 
-# API evaluation arm: {bench}__api__{model}, plain-mode prompt sent to the OpenRouter model
-# (benchmark_play_ground/api_prediction.py API_MODEL_PRESETS, temperature 0).
-api_models: [deepseek, llama, gpt]
+# The API evaluation arm ({bench}__api__{model}) lives in benchmark_play_ground/labeling_benchmark/
+# (free generation, config there); experiments has no api runs.
 
 # gen_model: preset of data_synthesis/shared/openrouter.py GENERATION_MODEL_PRESETS
 # label_model: preset of data_synthesis/labeling/run_labeling.py MODEL_PRESETS
@@ -78,9 +76,14 @@ setups:
 # (k5: 350/50, 300/100; k10: 345/50, 295/100). The run_id carries both: r{n_bb}-{n_fg}.
 hybrid_n_feature_guided: [50, 100]
 
+# rouge_threshold / activation_threshold: the values of the runs status/submit/collect work on.
+# Values other than runs.py REFERENCE_THRESHOLDS (toxicity 0.6/0.0, claudette 0.5/0.0, cti 0.9/0.0)
+# give the bb/fg/hybrid runs a threshold tag (e.g. ..__k5-01__th0_7-0_5; bb: rouge only) - new runs
+# with their own outputs; the existing runs are left untouched. Setting the reference values back
+# switches to the untagged runs again (still done). icl/gold/plain runs are shared by all values.
 benchmarks:
   toxicity_detection:
-    rouge_threshold: 0.6
+    rouge_threshold: 0.7
     activation_threshold: 0.0
     bench_script: benchmark_play_ground/run_toxicity_benchmark.py
     test_tsv: benchmarks/toxicity_detection/tsv_files/toxicity_test_set.tsv
@@ -89,7 +92,7 @@ benchmarks:
     gold_pool_tsv: benchmarks/toxicity_detection/tsv_files/toxicity_holdout_set.tsv
 
   claudette_tos:
-    rouge_threshold: 0.5
+    rouge_threshold: 0.7
     activation_threshold: 0.0
     bench_script: benchmark_play_ground/run_claudette_benchmark.py
     test_tsv: benchmarks/claudette_tos/tsv_files/claudette_tos_test.tsv
@@ -98,7 +101,7 @@ benchmarks:
     gold_pool_tsv: benchmarks/claudette_tos/tsv_files/claudette_tos_val_backup.tsv
 
   cti_vsp:
-    rouge_threshold: 0.9
+    rouge_threshold: 0.7
     activation_threshold: 0.0
     bench_script: benchmark_play_ground/run_cti_vsp_benchmark.py
     test_tsv: benchmarks/cti_vsp/tsv_files/cti_vsp_test.tsv

@@ -4,13 +4,22 @@ job scripts). Nothing here stores state: whether a run is done is read off the f
 
 run_id schema (separator "__", characters [a-z0-9_-] only):
     {bench}__plain
-    {bench}__api__{model}          model: config api_models (benchmark_play_ground/api_prediction.py presets)
     {bench}__icl__{seedset}-{gg}
     {bench}__gold__{seedset}-{gg}
     {bench}__bb__{setup}__{seedset}-{gg}
     {bench}__fg__{setup}__{seedset}-{gg}
     {bench}__hybrid__{setup}__{seedset}-{gg}__r{nbb}-{nfg}
 e.g. claudette_tos__hybrid__llama__k10-03__r300-100
+
+Threshold tag: bb / fg / hybrid run_ids get a last field __th{rouge} (bb) / __th{rouge}-{act} (fg,
+hybrid) - "." written as "_" - iff the config's rouge_threshold / activation_threshold of the benchmark
+differ from REFERENCE_THRESHOLDS (the values of the first runs, whose run_ids carry no tag), e.g.
+    toxicity_detection__fg__deepseek__k5-01__th0_7-0_5
+    toxicity_detection__bb__llama__k5-01__th0_7
+bb only depends on rouge_threshold, so a changed activation_threshold leaves its run_ids unchanged.
+A run_id determines its thresholds (resolve() reads them off the tag, untagged = reference); the
+config only selects which runs expand() yields. Runs of other threshold values stay on disk untouched
+and are done again as soon as the config is set back to their values.
 
 Paths of generation/labeling outputs mirror the existing logic of
 data_synthesis/{blackbox,feature_guided,hybrid}/run_generation.py (shared/generation.py) and
@@ -25,7 +34,7 @@ stale (experiments/stages.py):
                        the feature score file; stored in the generation log of each run
     ft_fingerprint     FT hyperparameters, base model, ft_seed, n_total, sha256 of the LF dataset JSON
                        (new training data invalidates FT + bench)
-    bench_fingerprint  bench script, test TSV, mode, icl_k, max_prompts, extra args, API model id
+    bench_fingerprint  bench script, test TSV, mode, icl_k, max_prompts, extra args
                        and - for fine_tuned - ft_fingerprint
 
 Usage:
@@ -65,16 +74,14 @@ sys.path.insert(0, str(PROJECT_DIR))
 from shared import seed_derivation  # noqa: E402
 from shared.benchmarks import SEED_SETS, feature_scores_path, find_seed_file  # noqa: E402
 from shared.openrouter import GENERATION_MODEL_PRESETS  # noqa: E402
-from benchmark_play_ground.api_prediction import API_MODEL_PRESETS  # noqa: E402
 from sample_gold_ft_sets import SEED_GROUP_PATTERN  # noqa: E402
 
-ARMS = ("plain", "api", "icl", "gold", "bb", "fg", "hybrid")
+ARMS = ("plain", "icl", "gold", "bb", "fg", "hybrid")
 GEN_ARMS = ("bb", "fg", "hybrid")
 # run_id arm -> directory under data_synthesis/ (= run_labeling.py --source)
 GEN_ARM_DIRS = {"bb": "blackbox", "fg": "feature_guided", "hybrid": "hybrid"}
 STAGES = {
     "plain": ["bench"],
-    "api": ["bench"],
     "icl": ["bench"],
     "gold": ["ft_bench"],
     "bb": ["gen", "label_build", "ft_bench"],
@@ -82,18 +89,27 @@ STAGES = {
     "hybrid": ["gen", "label_build", "ft_bench"],
 }
 GEN_RESOURCE = {"bb": "cpu", "fg": "gpu", "hybrid": "gpu"}
+# (rouge_threshold, activation_threshold) of the untagged run_ids - never change: changing a value
+# would silently reinterpret the existing runs. Other values go into the config (-> tagged run_ids).
+REFERENCE_THRESHOLDS = {
+    "toxicity_detection": (0.6, 0.0),
+    "claudette_tos": (0.5, 0.0),
+    "cti_vsp": (0.9, 0.0),
+}
 
 SEP = "__"
 _NAME = r"[a-z0-9]+(?:_[a-z0-9]+)*"  # no "__" inside a field
 _SEED = r"(?P<seed_set>k\d+)-(?P<group>\d{2})"
+_NUM = r"\d+(?:_\d+)?"
+_TH_BB = rf"(?:__th(?P<rouge>{_NUM}))?"
+_TH_FG = rf"(?:__th(?P<rouge>{_NUM})-(?P<act>{_NUM}))?"
 RUN_ID_PATTERNS = {
     "plain": re.compile(rf"^(?P<bench>{_NAME})__plain$"),
-    "api": re.compile(rf"^(?P<bench>{_NAME})__api__(?P<api_model>{_NAME})$"),
     "icl": re.compile(rf"^(?P<bench>{_NAME})__icl__{_SEED}$"),
     "gold": re.compile(rf"^(?P<bench>{_NAME})__gold__{_SEED}$"),
-    "bb": re.compile(rf"^(?P<bench>{_NAME})__bb__(?P<setup>{_NAME})__{_SEED}$"),
-    "fg": re.compile(rf"^(?P<bench>{_NAME})__fg__(?P<setup>{_NAME})__{_SEED}$"),
-    "hybrid": re.compile(rf"^(?P<bench>{_NAME})__hybrid__(?P<setup>{_NAME})__{_SEED}__r(?P<n_bb>\d+)-(?P<n_fg>\d+)$"),
+    "bb": re.compile(rf"^(?P<bench>{_NAME})__bb__(?P<setup>{_NAME})__{_SEED}{_TH_BB}$"),
+    "fg": re.compile(rf"^(?P<bench>{_NAME})__fg__(?P<setup>{_NAME})__{_SEED}{_TH_FG}$"),
+    "hybrid": re.compile(rf"^(?P<bench>{_NAME})__hybrid__(?P<setup>{_NAME})__{_SEED}__r(?P<n_bb>\d+)-(?P<n_fg>\d+){_TH_FG}$"),
 }
 
 
@@ -106,35 +122,88 @@ class RunSpec:
     group: str | None = None
     n_bb: int | None = None  # hybrid only
     n_fg: int | None = None  # hybrid only
-    api_model: str | None = None  # api only
+    rouge_threshold: float | None = None  # bb/fg/hybrid, None = REFERENCE_THRESHOLDS
+    activation_threshold: float | None = None  # fg/hybrid, None = REFERENCE_THRESHOLDS
 
     def __post_init__(self):
         if self.arm not in ARMS:
             raise ValueError(f"Unknown arm {self.arm!r}; expected one of {ARMS}.")
-        needs_seed = self.arm not in ("plain", "api")
+        needs_seed = self.arm != "plain"
         needs_setup = self.arm in GEN_ARMS
         needs_ratio = self.arm == "hybrid"
         for name, value, needed in (("seed_set", self.seed_set, needs_seed), ("group", self.group, needs_seed),
                                     ("setup", self.setup, needs_setup), ("n_bb", self.n_bb, needs_ratio),
-                                    ("n_fg", self.n_fg, needs_ratio), ("api_model", self.api_model, self.arm == "api")):
+                                    ("n_fg", self.n_fg, needs_ratio)):
             if (value is not None) != needed:
                 raise ValueError(f"Arm {self.arm!r}: {name} must be {'set' if needed else 'None'}, got {value!r}.")
+        if self.rouge_threshold is None and self.activation_threshold is None:
+            return
+        if not needs_setup:
+            raise ValueError(f"Arm {self.arm!r} has no thresholds.")
+        uses_act = self.arm in ("fg", "hybrid")
+        if self.rouge_threshold is None or (self.activation_threshold is not None) != uses_act:
+            raise ValueError(f"Arm {self.arm!r}: threshold tag needs rouge_threshold"
+                             f"{' and activation_threshold' if uses_act else ' only'}.")
+        if min(t for t in (self.rouge_threshold, self.activation_threshold) if t is not None) < 0:
+            raise ValueError("Thresholds must be >= 0.")
+        if self.bench in REFERENCE_THRESHOLDS and self.threshold_values() == relevant_thresholds(self.arm, REFERENCE_THRESHOLDS[self.bench]):
+            raise ValueError(f"Thresholds {self.threshold_values()} equal the reference of {self.bench!r}: "
+                             "the run_id carries no tag then.")
+
+    def threshold_values(self) -> tuple:
+        return relevant_thresholds(self.arm, (self.rouge_threshold, self.activation_threshold))
 
     @property
     def run_id(self) -> str:
         return format_run_id(self)
 
 
+def relevant_thresholds(arm: str, thresholds: tuple) -> tuple:
+    """The thresholds an arm's generation depends on: (rouge,) for bb, (rouge, act) for fg/hybrid."""
+    return tuple(thresholds[:1]) if arm == "bb" else tuple(thresholds)
+
+
+def format_threshold(value: float) -> str:
+    return f"{value:g}".replace(".", "_")
+
+
+def parse_threshold(text: str) -> float:
+    return float(text.replace("_", "."))
+
+
+def effective_thresholds(spec: RunSpec) -> tuple[float, float]:
+    """(rouge_threshold, activation_threshold) a run uses: its tag, else the reference."""
+    ref = REFERENCE_THRESHOLDS[spec.bench]
+    return (ref[0] if spec.rouge_threshold is None else spec.rouge_threshold,
+            ref[1] if spec.activation_threshold is None else spec.activation_threshold)
+
+
+def threshold_tag(spec: RunSpec) -> str:
+    """"th{rouge}" / "th{rouge}-{act}", "" for runs with the reference thresholds."""
+    if spec.rouge_threshold is None:
+        return ""
+    return "th" + "-".join(format_threshold(t) for t in spec.threshold_values())
+
+
+def config_threshold_fields(config: dict, bench: str, arm: str) -> dict:
+    """RunSpec threshold fields of a gen arm under the config: {} if they equal the reference."""
+    b = config["benchmarks"][bench]
+    current = relevant_thresholds(arm, (float(b["rouge_threshold"]), float(b["activation_threshold"])))
+    if current == relevant_thresholds(arm, REFERENCE_THRESHOLDS[bench]):
+        return {}
+    return {"rouge_threshold": current[0], "activation_threshold": current[1] if arm != "bb" else None}
+
+
 def format_run_id(spec: RunSpec) -> str:
     parts = [spec.bench, spec.arm]
     if spec.setup is not None:
         parts.append(spec.setup)
-    if spec.api_model is not None:
-        parts.append(spec.api_model)
     if spec.seed_set is not None:
         parts.append(f"{spec.seed_set}-{spec.group}")
     if spec.arm == "hybrid":
         parts.append(f"r{spec.n_bb}-{spec.n_fg}")
+    if threshold_tag(spec):
+        parts.append(threshold_tag(spec))
     run_id = SEP.join(parts)
     if parse_run_id(run_id) != spec:  # rejects field values that would not parse back
         raise ValueError(f"RunSpec {spec} does not format to a valid run_id ({run_id!r}).")
@@ -150,7 +219,9 @@ def parse_run_id(run_id: str) -> RunSpec:
     g = match.groupdict()
     return RunSpec(bench=g["bench"], arm=arm, setup=g.get("setup"), seed_set=g.get("seed_set"),
                    group=g.get("group"), n_bb=int(g["n_bb"]) if "n_bb" in g else None,
-                   n_fg=int(g["n_fg"]) if "n_fg" in g else None, api_model=g.get("api_model"))
+                   n_fg=int(g["n_fg"]) if "n_fg" in g else None,
+                   rouge_threshold=parse_threshold(g["rouge"]) if g.get("rouge") else None,
+                   activation_threshold=parse_threshold(g["act"]) if g.get("act") else None)
 
 
 # ---------------------------------------------------------------------------
@@ -168,9 +239,9 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict:
         for n_bb, n_fg in hybrid_splits(config, seed_set):
             if n_bb <= 0 or n_fg <= 0:
                 raise ValueError(f"Seed set {seed_set!r}: hybrid split {n_bb}/{n_fg} must be > 0 on both sides.")
-    unknown = [m for m in config["api_models"] if m not in API_MODEL_PRESETS]
-    if unknown:
-        raise ValueError(f"api_models {unknown} unknown to api_prediction.API_MODEL_PRESETS.")
+    missing = [b for b in config["benchmarks"] if b not in REFERENCE_THRESHOLDS]
+    if missing:
+        raise ValueError(f"Benchmarks {missing} have no entry in runs.py REFERENCE_THRESHOLDS.")
     return config
 
 
@@ -193,12 +264,13 @@ def expand(config: dict) -> list[RunSpec]:
     specs = []
     for bench in config["benchmarks"]:
         specs.append(RunSpec(bench, "plain"))
-        specs += [RunSpec(bench, "api", api_model=m) for m in config["api_models"]]
         specs += [RunSpec(bench, "icl", seed_set=s, group=g) for s, g in seeds]
         specs += [RunSpec(bench, "gold", seed_set=s, group=g) for s, g in seeds]
         for arm in ("bb", "fg"):
-            specs += [RunSpec(bench, arm, setup, s, g) for setup in config["setups"] for s, g in seeds]
-        specs += [RunSpec(bench, "hybrid", setup, s, g, n_bb, n_fg)
+            th = config_threshold_fields(config, bench, arm)
+            specs += [RunSpec(bench, arm, setup, s, g, **th) for setup in config["setups"] for s, g in seeds]
+        th = config_threshold_fields(config, bench, "hybrid")
+        specs += [RunSpec(bench, "hybrid", setup, s, g, n_bb, n_fg, **th)
                   for setup in config["setups"] for s, g in seeds for n_bb, n_fg in hybrid_splits(config, s)]
     return specs
 
@@ -295,26 +367,24 @@ def resolve(spec: RunSpec, config: dict) -> dict:
         if n_found != n_examples:
             raise ValueError(f"{seed_file} has {n_found} seed examples, seed set {spec.seed_set} expects {n_examples}.")
         r.update(seed_set=spec.seed_set, seed_group=spec.group, seed_file=seed_file, seed_n_examples=n_examples)
-    if spec.arm == "api":
-        r.update(api_model=spec.api_model, api_model_id=API_MODEL_PRESETS[spec.api_model][0])
-        r["bench_extra_args"] += ["--api-model", spec.api_model, "--max-concurrent-requests",
-                                  str(config["api"]["benchmark"]["max_concurrent_requests"])]
     if spec.arm == "icl":
         r.update(icl_k=r["seed_n_examples"], few_shot_tsv=r["seed_file"])
     if spec.arm == "gold":
         r.update(gold_tsv=gold_tsv_path(spec.bench, spec.seed_set, r["seed_file"]),
                  gold_pool_tsv=PROJECT_DIR / b["gold_pool_tsv"], gold_n=n_synthetic(config, spec.seed_set))
     if spec.arm in GEN_ARMS:
+        rouge_threshold, activation_threshold = effective_thresholds(spec)
         setup = config["setups"][spec.setup]
         arm_dir = GEN_ARM_DIRS[spec.arm]
         r.update(setup=spec.setup, gen_resource=GEN_RESOURCE[spec.arm], gen_arm_dir=arm_dir,
-                 gen_prefix=run_id, gen_model=setup["gen_model"], rouge_threshold=b["rouge_threshold"])
+                 gen_prefix=run_id, gen_model=setup["gen_model"], rouge_threshold=rouge_threshold,
+                 threshold_tag=threshold_tag(spec))
         if spec.arm == "hybrid":
             r.update(n_blackbox=spec.n_bb, n_feature_guided=spec.n_fg)
         else:
             r.update(n_synthetic=n_synthetic(config, spec.seed_set))
         if spec.arm in ("fg", "hybrid"):
-            r.update(activation_threshold=b["activation_threshold"], sae_ckpt=WS_PATH / g["sae_ckpt"])
+            r.update(activation_threshold=activation_threshold, sae_ckpt=WS_PATH / g["sae_ckpt"])
         r.update(generation_paths(arm_dir, spec.bench, run_id))
         r.update(label_source=arm_dir, label_model=setup["label_model"],
                  gen_max_concurrent=config["api"]["generation"]["max_concurrent_requests"],
@@ -328,8 +398,8 @@ def resolve(spec: RunSpec, config: dict) -> dict:
         r["gen_fingerprint"] = fingerprint({
             "model_id": GENERATION_MODEL_PRESETS[setup["gen_model"]][0],
             "temperature": gen["temperature"], "top_p": gen["top_p"], "max_tokens": gen["max_tokens"],
-            "rouge_threshold": b["rouge_threshold"],
-            "activation_threshold": b["activation_threshold"] if is_fg else None,
+            "rouge_threshold": rouge_threshold,
+            "activation_threshold": activation_threshold if is_fg else None,
             "n": r.get("n_synthetic"), "n_bb": spec.n_bb, "n_fg": spec.n_fg,
             "max_concurrent_requests": r["gen_max_concurrent"],
             "generation_seed": r["generation_seed"],
@@ -358,8 +428,6 @@ def resolve(spec: RunSpec, config: dict) -> dict:
         "icl_k": r.get("icl_k"), "max_prompts": b["max_prompts"], "bench_extra_args": r["bench_extra_args"],
         "ft_fingerprint": r.get("ft_fingerprint"),
     }
-    if spec.arm == "api":  # only here, so the fingerprints of the other arms stay unchanged
-        bench_fields["api_model_id"] = r["api_model_id"]
     r["bench_fingerprint"] = fingerprint(bench_fields)
     return {k: str(v) if isinstance(v, Path) else v for k, v in r.items()}
 

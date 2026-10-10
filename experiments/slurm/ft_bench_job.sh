@@ -323,12 +323,8 @@ phase_benchmark() {
     set +u; source "$START_LLAMA_SH"; set -u
 
     local args=(--data-tsv "$TEST_TSV" --mode "$BENCH_MODE" --max-prompts "$MAX_PROMPTS")
-    if [[ "$BENCH_MODE" == "api" ]]; then
-        echo "[INFO] API-Modell: $API_MODEL ($API_MODEL_ID); --api-model steht in BENCH_EXTRA_ARGS."
-    else
-        gpu_diagnostics
-        args+=(--model-path "$BASE_MODEL" --device cuda)
-    fi
+    gpu_diagnostics
+    args+=(--model-path "$BASE_MODEL" --device cuda)
     case "$BENCH_MODE" in
         fine_tuned)
             [[ -f "$LORA_DIR/adapter_model.safetensors" ]] || die "Kein Adapter unter $LORA_DIR."

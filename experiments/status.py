@@ -9,7 +9,7 @@ the stage does not apply to the arm.
   stale / missing       not done, no active or failed submission; stale = a done marker written
                         under another config (fingerprint, see runs.py)
 
-Job stages: gen, label_build, ft_bench (one job for the ft and bench columns; api runs: api_bench_job.sh).
+Job stages: gen, label_build, ft_bench (one job for the ft and bench columns).
 
 Usage:
     python experiments/status.py [--bench B] [--arm A] [--setup S] [--seed-set K] [--group G]
@@ -25,7 +25,7 @@ import subprocess
 from collections import Counter, defaultdict
 from datetime import datetime
 
-from runs import ARMS, EXPERIMENTS_DIR, RunSpec, expand, load_config, parse_run_id, resolve
+from runs import ARMS, EXPERIMENTS_DIR, RunSpec, effective_thresholds, expand, load_config, parse_run_id, resolve
 from stages import STAGE_NAMES, run_states
 
 SUBMISSIONS = EXPERIMENTS_DIR / "state" / "submissions.jsonl"
@@ -122,7 +122,8 @@ def run_order_key(config: dict, spec: RunSpec) -> tuple:
     """Group-major: seed set, group, benchmark, arm (the submission order of submit.py)."""
     seed_sets, benches = list(config["global"]["seed_sets"]), list(config["benchmarks"])
     return (seed_sets.index(spec.seed_set) if spec.seed_set else -1, spec.group or "", benches.index(spec.bench),
-            ARMS.index(spec.arm), spec.setup or "", spec.n_fg or 0)
+            ARMS.index(spec.arm), spec.setup or "", spec.n_fg or 0,
+            effective_thresholds(spec) if spec.rouge_threshold is not None else ())
 
 
 # ---------------------------------------------------------------------------

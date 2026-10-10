@@ -3,12 +3,11 @@
 experiments/results/summary.md.
 
 Columns (empty where a value does not apply or is not available):
-  identity     run_id, bench, arm, setup, api_model, seed_set, group, n_bb, n_fg
+  identity     run_id, bench, arm, setup, seed_set, group, n_bb, n_fg, rouge_threshold,
+               activation_threshold (gen arms: the thresholds the run used, see runs.py threshold tag)
   metrics      bench.summary.json - toxicity: auprc_toxic, macro_f1; claudette_tos: weighted_auprc_8,
                macro_auprc_8; cti_vsp: mad, macro_f1 (the first metric is the
-               primary one in summary.md). api runs: n_no_logprobs (examples scored from the
-               hard label because the response had no usable logprobs; cti_vsp parses free text and
-               uses no logprobs), n_unparsable_pred.
+               primary one in summary.md).
   data         FT arms, training TSV (gold: GOLD_TSV, synthetic: LABEL_TSV): n_train, label_dist
                (toxicity: toxic rate; claudette: Y rate per slot; cti: mode per metric), TV to the test
                set via helper_scripts/distribution_analysis: tv_marginal (mean over slots), tv_slots,
@@ -17,9 +16,17 @@ Columns (empty where a value does not apply or is not available):
                len_chars_mean, len_words_mean, len_words_p95 (whitespace split), len_tokens_mean,
                len_tokens_p50, len_tokens_p95, len_tokens_max (base-model tokenizer, raw text without chat
                template or special tokens; empty if transformers is not importable),
-               len_words_ratio_test, len_tokens_ratio_test (training mean / test-set mean)
-  generation   gen/label logs: n_accepted, n_rejected, acceptance_rate = accepted/(accepted+rejected),
-               n_rouge_duplicate, n_feature_inactive, n_discarded (hybrid: both phases), n_majority_fallback,
+               len_words_ratio_test, len_tokens_ratio_test (training mean / test-set mean),
+               distance of the token-length distribution to the test set's: len_tokens_tv_test (TV
+               distance over the test set's decile bins plus one under-/overflow bin each, in [0, 1]),
+               len_tokens_w1_test (Wasserstein-1 / earth mover's distance in tokens, divided by the test
+               mean token length)
+  generation   gen/label logs: n_accepted, n_rejected, n_rouge_duplicate, n_feature_inactive and the rates
+               acceptance_rate, rejection_rate, rouge_rate, inactive_rate (each / checked candidates =
+               accepted + rejected; a candidate is checked for feature activation first, then ROUGE-L, so
+               the three reasons partition it; discarded candidates were never checked) - unprefixed: whole
+               run (hybrid: both phases summed), bb_* / fg_*: per phase (bb arm: bb_, fg arm: fg_, hybrid:
+               both); n_discarded, n_majority_fallback,
                gen_temperature, gen_top_p (logged model_params), gen/label prompt + completion tokens and
                cost_usd (summed usage.cost of the logged calls)
   compute      wall_<stage> (run_meta.json), sae_gpu_seconds (generation log)
@@ -28,8 +35,11 @@ Columns (empty where a value does not apply or is not available):
                the test-set features covered) from experiments/runs/<run_id>/fac.json - only if its
                input_sha256 matches the current training TSV
 
+Runs: those of the current config (filtered); with --all-on-disk also every other run under
+experiments/runs/ (e.g. other threshold variants), with the same filters.
+
 Usage:
-    python experiments/collect_results.py [--bench B] [--arm A] [--setup S] [--seed-set K] [--group G]
+    python experiments/collect_results.py [--bench B] [--arm A] [--setup S] [--seed-set K] [--group G] [--all-on-disk]
 """
 
 from __future__ import annotations
@@ -42,7 +52,7 @@ import statistics
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from runs import ARMS, EXPERIMENTS_DIR, PROJECT_DIR, file_sha256, load_config, resolve
+from runs import ARMS, EXPERIMENTS_DIR, PROJECT_DIR, RUNS_DIR, file_sha256, load_config, parse_run_id, resolve
 from stages import bench_state
 from status import add_filter_args, filters_of, run_order_key, select_specs
 
@@ -55,11 +65,16 @@ METRICS = {
 PRIMARY = {bench: metrics[0] for bench, metrics in METRICS.items()}  # first metric per benchmark
 LOWER_IS_BETTER = {"mad"}
 STAGES_META = ("gen", "label_build", "ft", "bench")
+GEN_PHASES = ("bb", "fg")
+GEN_COUNTS = ("n_accepted", "n_rejected", "n_rouge_duplicate", "n_feature_inactive")
+GEN_RATES = ("acceptance_rate", "rejection_rate", "rouge_rate", "inactive_rate")
 COLUMNS = [
-    "run_id", "bench", "arm", "setup", "api_model", "seed_set", "group", "n_bb", "n_fg",
-    "auprc_toxic", "macro_f1", "weighted_auprc_8", "macro_auprc_8", "mad", "n_no_logprobs", "n_unparsable_pred",
+    "run_id", "bench", "arm", "setup", "seed_set", "group", "n_bb", "n_fg",
+    "rouge_threshold", "activation_threshold",
+    "auprc_toxic", "macro_f1", "weighted_auprc_8", "macro_auprc_8", "mad",
     "n_train", "label_dist", "tv_marginal", "tv_slots", "tv_joint",
-    "n_accepted", "n_rejected", "acceptance_rate", "n_rouge_duplicate", "n_feature_inactive", "n_discarded",
+    *GEN_COUNTS, *GEN_RATES, *[f"{phase}_{k}" for phase in GEN_PHASES for k in (*GEN_COUNTS, *GEN_RATES)],
+    "n_discarded",
     "n_majority_fallback", "gen_temperature", "gen_top_p",
     "gen_prompt_tokens", "gen_completion_tokens", "gen_cost_usd",
     "label_prompt_tokens", "label_completion_tokens", "label_cost_usd",
@@ -68,7 +83,7 @@ COLUMNS = [
     "fac_relevant", "fac_test",
     "len_chars_mean", "len_words_mean", "len_words_p95",
     "len_tokens_mean", "len_tokens_p50", "len_tokens_p95", "len_tokens_max",
-    "len_words_ratio_test", "len_tokens_ratio_test",
+    "len_words_ratio_test", "len_tokens_ratio_test", "len_tokens_tv_test", "len_tokens_w1_test",
 ]
 
 
@@ -136,27 +151,7 @@ def summed_cost(run: dict | None) -> float | None:
 
 def metric_columns(r: dict) -> dict:
     s = read_json(Path(r["bench_jsonl"]).with_suffix(".summary.json")) or {}
-    row = {m: s.get(m) for m in METRICS[r["bench"]]}
-    if r["arm"] == "api":
-        row["n_unparsable_pred"] = s.get("n_unparsable_pred", s.get("n_excluded_unparseable"))
-        if r["bench"] == "cti_vsp":
-            row["n_no_logprobs"] = "n/a (free text)"
-        else:
-            row["n_no_logprobs"] = n_no_logprobs(r)
-    return row
-
-
-def n_no_logprobs(r: dict) -> int | None:
-    """Examples with at least one score taken from the hard label (no usable logprobs)."""
-    n = 0
-    with open(r["bench_jsonl"], encoding="utf-8") as f:
-        for line in f:
-            ex = json.loads(line)
-            if r["bench"] == "toxicity_detection":
-                n += ex.get("log_odds") is None
-            else:
-                n += any(v is None for v in (ex.get("slot_log_odds") or {}).values())
-    return n
+    return {m: s.get(m) for m in METRICS[r["bench"]]}
 
 
 def data_columns(r: dict, da, da_specs: dict, ref_cache: dict) -> dict:
@@ -188,11 +183,13 @@ def length_columns(r: dict, la, tokenizers: Tokenizers, ref_cache: dict) -> dict
     if r["arm"] not in ("gold", "bb", "fg", "hybrid") or not tsv.is_file():
         return {}
     tok = tokenizers.get(r["base_model"])
-    result = la.analyze_texts(la.read_texts(tsv), tok)
+    lengths = la.measure_lengths(la.read_texts(tsv), tok)
+    result = la.analyze_lengths(lengths)
     key = (r["bench"], r["base_model"] if tok else None)
     if key not in ref_cache:
-        ref_cache[key] = la.analyze_texts(la.read_texts(Path(r["test_tsv"])), tok)
-    ref = ref_cache[key]
+        ref_lengths = la.measure_lengths(la.read_texts(Path(r["test_tsv"])), tok)
+        ref_cache[key] = (la.analyze_lengths(ref_lengths), ref_lengths)
+    ref, ref_lengths = ref_cache[key]
     row = {"len_chars_mean": round(result["chars"]["mean"], 1),
            "len_words_mean": round(result["words"]["mean"], 1),
            "len_words_p95": round(result["words"]["p95"], 1),
@@ -202,7 +199,22 @@ def length_columns(r: dict, la, tokenizers: Tokenizers, ref_cache: dict) -> dict
         row.update(len_tokens_mean=round(t["mean"], 1), len_tokens_p50=round(t["p50"], 1),
                    len_tokens_p95=round(t["p95"], 1), len_tokens_max=int(t["max"]),
                    len_tokens_ratio_test=round(t["mean"] / ref["tokens"]["mean"], 3))
+        d = la.distance_to_reference(lengths["tokens"], ref_lengths["tokens"])
+        row.update(len_tokens_tv_test=round(d["tv"], 4), len_tokens_w1_test=round(d["w1_norm"], 4))
     return row
+
+
+def acceptance_stats(runs: list[dict], prefix: str = "") -> dict:
+    """GEN_COUNTS summed over the given generation log runs, plus GEN_RATES over the checked candidates."""
+    counts = {k: sum(x.get(k) or 0 for x in runs) for k in GEN_COUNTS}
+    checked = counts["n_accepted"] + counts["n_rejected"]
+
+    def rate(n):
+        return round(n / checked, 4) if checked else None
+
+    stats = {**counts, "acceptance_rate": rate(counts["n_accepted"]), "rejection_rate": rate(counts["n_rejected"]),
+             "rouge_rate": rate(counts["n_rouge_duplicate"]), "inactive_rate": rate(counts["n_feature_inactive"])}
+    return {f"{prefix}{k}": v for k, v in stats.items()}
 
 
 def generation_columns(r: dict) -> dict:
@@ -211,22 +223,25 @@ def generation_columns(r: dict) -> dict:
     main = last_run(r["gen_log_json"])
     if not main:
         return {}
-    phases = [last_run(r["gen_bb_log_json"]), last_run(r["gen_fg_log_json"])] if r["arm"] == "hybrid" else [main]
-    phases = [p for p in phases if p]
+    if r["arm"] == "hybrid":
+        by_phase = {tag: last_run(r[f"gen_{tag}_log_json"]) for tag in GEN_PHASES}
+    else:
+        by_phase = {r["arm"]: main}
+    by_phase = {tag: p for tag, p in by_phase.items() if p}
+    phases = list(by_phase.values())
 
     def total(key):
         return sum(p.get(key) or 0 for p in phases)
 
-    accepted, rejected = total("n_accepted"), total("n_rejected")
+    stats = acceptance_stats(phases)
+    for tag, p in by_phase.items():
+        stats.update(acceptance_stats([p], f"{tag}_"))
     params = main.get("model_params") or {}
     label = last_run(r["label_log_json"])
     sae = main.get("sae_total") or {}
     costs = [summed_cost(p) for p in phases]
     return {
-        "n_accepted": accepted, "n_rejected": rejected,
-        "acceptance_rate": round(accepted / (accepted + rejected), 4) if accepted + rejected else None,
-        "n_rouge_duplicate": total("n_rouge_duplicate"), "n_feature_inactive": total("n_feature_inactive"),
-        "n_discarded": total("n_discarded"),
+        **stats, "n_discarded": total("n_discarded"),
         "gen_temperature": params.get("temperature"), "gen_top_p": params.get("top_p"),
         "gen_prompt_tokens": main.get("prompt_tokens"), "gen_completion_tokens": main.get("completion_tokens"),
         "gen_cost_usd": round(sum(c for c in costs if c is not None), 6) if any(c is not None for c in costs) else None,
@@ -273,12 +288,12 @@ def variant(row: dict) -> str:
     parts = [row["arm"]]
     if row.get("setup"):
         parts.append(row["setup"])
-    if row.get("api_model"):
-        parts.append(row["api_model"])
     if row.get("n_fg"):
         parts.append(f"r{row['n_bb']}-{row['n_fg']}")
     if row.get("seed_set"):
         parts.append(row["seed_set"])
+    if row.get("threshold_tag"):
+        parts.append(row["threshold_tag"])
     return "/".join(parts)
 
 
@@ -309,12 +324,90 @@ def write_summary(rows: list[dict], config: dict, path: Path) -> None:
     for v in order:
         lines.append(f"| {v} | " + " | ".join(fmt(cells.get((v, b), [])) for b in benches) + " |")
     lines += ["", f"{len(rows)} run(s) with bench done; per-run values in runs.csv."]
+    lines += acceptance_section(rows, benches)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# (table title, arm, phases as (label, column prefix), show the per-reason columns)
+ACCEPTANCE_TABLES = (
+    ("Black-box (bb)", "bb", (("", "bb_"),), False),
+    ("Feature-guided (fg)", "fg", (("", "fg_"),), True),
+    ("Hybrid", "hybrid", (("bb", "bb_"), ("fg", "fg_"), ("total", "")), True),
+)
+
+
+def acceptance_section(rows: list[dict], benches: list[str]) -> list[str]:
+    """One table per generation arm: candidate counts (mean over the runs of a cell) and rates
+    (mean +- SD over the runs; each / checked candidates = accepted + rejected)."""
+
+    def values(group: list[dict], key: str) -> list[float]:
+        return [row[key] for row in group if isinstance(row.get(key), (int, float))]
+
+    def count(group, key):
+        v = values(group, key)
+        return f"{statistics.mean(v):.1f}".removesuffix(".0") if v else ""
+
+    def rate(group, key):
+        v = values(group, key)
+        if not v:
+            return ""
+        sd = f" ± {100 * statistics.stdev(v):.1f}" if len(v) > 1 else ""
+        return f"{100 * statistics.mean(v):.1f}{sd}"
+
+    lines = ["", "## Generation acceptance", "",
+             "Per arm variant x benchmark: candidate counts (mean over the n runs) and rates in % (mean ± SD over "
+             "the runs) of the checked candidates (accepted + rejected; candidates discarded after the target was "
+             "reached are not counted). Rejection reasons: activation = target feature not active (checked first), "
+             "ROUGE-L = too similar to the pool (ROUGE-L > rouge_threshold)."]
+    for title, arm, phases, reasons in ACCEPTANCE_TABLES:
+        groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        for row in rows:
+            if row["arm"] == arm and row.get("n_accepted") is not None:
+                groups[(variant(row), row["bench"])].append(row)
+        if not groups:
+            continue
+        keys = sorted(groups, key=lambda vb: (benches.index(vb[1]), list(dict.fromkeys(v for v, _ in groups)).index(vb[0])))
+        if reasons:
+            head = ["accepted", "rej. ROUGE-L", "rej. activation", "rejected", "acceptance %", "ROUGE-L %",
+                    "activation %", "rejection %"]
+            cols = [(count, "n_accepted"), (count, "n_rouge_duplicate"), (count, "n_feature_inactive"),
+                    (count, "n_rejected"), (rate, "acceptance_rate"), (rate, "rouge_rate"),
+                    (rate, "inactive_rate"), (rate, "rejection_rate")]
+        else:
+            head = ["accepted", "rejected", "acceptance %", "rejection %"]
+            cols = [(count, "n_accepted"), (count, "n_rejected"), (rate, "acceptance_rate"), (rate, "rejection_rate")]
+        has_phase = len(phases) > 1
+        head = ["arm variant", "benchmark", *(["phase"] if has_phase else []), "n", *head]
+        lines += ["", f"### {title}", "", "| " + " | ".join(head) + " |", "|---" * len(head) + "|"]
+        for v, bench in keys:
+            group = groups[(v, bench)]
+            for label, prefix in phases:
+                cells = [v, bench, *([label] if has_phase else []), str(len(group)),
+                         *(fmt(group, prefix + key) for fmt, key in cols)]
+                lines.append("| " + " | ".join(cells) + " |")
+    return lines
+
+
+def on_disk_specs(config: dict, filters: dict) -> list:
+    """RunSpecs of the run directories under RUNS_DIR that resolve under the current config (other
+    threshold variants etc.); names that are no run_id are skipped."""
+    specs = []
+    for path in sorted(RUNS_DIR.iterdir()):
+        try:
+            spec = parse_run_id(path.name)
+            resolve(spec, config)
+        except (ValueError, KeyError):
+            continue
+        if path.is_dir() and all(v is None or getattr(spec, k) == v for k, v in filters.items()):
+            specs.append(spec)
+    return specs
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     add_filter_args(parser)
+    parser.add_argument("--all-on-disk", action="store_true",
+                        help="Also every run under experiments/runs/ that the current config does not expand to.")
     args = parser.parse_args()
 
     config = load_config()
@@ -322,15 +415,19 @@ def main() -> None:
     la, tokenizers = load_length_analysis(), Tokenizers()
     ref_cache: dict = {}
     len_ref_cache: dict = {}
-    specs = sorted(select_specs(config, args.run_ids, **filters_of(args)), key=lambda s: run_order_key(config, s))
+    specs = select_specs(config, args.run_ids, **filters_of(args))
+    if args.all_on_disk:
+        specs = list(dict.fromkeys(specs + on_disk_specs(config, filters_of(args))))
+    specs = sorted(specs, key=lambda s: run_order_key(config, s))
     rows = []
     for spec in specs:
         r = resolve(spec, config)
         if bench_state(r)[0] != "done":
             continue
         row = {"run_id": r["run_id"], "bench": spec.bench, "arm": spec.arm, "setup": spec.setup,
-               "api_model": spec.api_model, "seed_set": spec.seed_set, "group": spec.group,
-               "n_bb": spec.n_bb, "n_fg": spec.n_fg}
+               "seed_set": spec.seed_set, "group": spec.group,
+               "n_bb": spec.n_bb, "n_fg": spec.n_fg, "rouge_threshold": r.get("rouge_threshold"),
+               "activation_threshold": r.get("activation_threshold"), "threshold_tag": r.get("threshold_tag")}
         for part in (metric_columns(r), data_columns(r, da, da_specs, ref_cache), generation_columns(r),
                      meta_columns(r), fac_columns(r), length_columns(r, la, tokenizers, len_ref_cache)):
             row.update(part)
