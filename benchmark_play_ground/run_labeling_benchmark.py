@@ -9,19 +9,32 @@ max_tokens 64 (= run_labeling.py LABELING_MODEL_PARAMS) for all benchmarks, logp
 one call per example; a call that still fails after the retry budget of call_openrouter_chat aborts
 the run (rerun to continue - finished calls are kept, see below).
 
+Every line of raw_outputs.jsonl carries a request fingerprint: a hash over the SHA-256 of the system
+prompt, the user prompt prefix, max_tokens, the model id and the full request parameters. A rerun
+reuses only lines with the current fingerprint and refuses to continue a file that holds others,
+so a changed prompt, max_tokens or model id behind the same preset name never mixes old and new
+answers (move the file away or pass another --output-dir).
+
 Every answer is parsed in two ways:
   exact        the labeling parser (data_synthesis/labeling/run_labeling.py build_answer_regex +
                normalize_label_line): one line must match the full answer template. All slots or none.
-  recoverable  the lenient parser of the run_*_benchmark.py --mode api paths, slot by slot
-               (CVSS_METRIC_RE after cut_at_stop_strings, CLAUDETTE_SLOT_RE, TOXICITY_ANSWER_RE).
-               A slot that cannot be parsed is invalid, the parsed slots of the same answer still
-               count. An answer that parses exactly takes its exact values, so every exact answer
-               is also recoverable.
+  recoverable  a lenient parser over the whole answer, case-insensitive, Markdown emphasis/code
+               characters (* _ ` # ~) removed first:
+               toxicity_detection  exactly one of the class labels "toxic" / "safe" occurs as a word
+                                   (not inside "non-toxic", "unsafe", "toxicity"); both or neither
+                                   -> invalid
+               claudette_tos,      per slot: every "<key> : <value>" / "<key> = <value>" occurrence,
+               cti_vsp             key = abbreviation or metric name ("AV", "Attack Vector",
+                                   "Attack Vector (AV)"), value = letter or its spelled-out name
+                                   ("N" / "Network", "Y" / "Yes"); exactly one distinct value ->
+                                   that value, none or conflicting values -> the slot is invalid
+               The other slots of the same answer still count. An answer that parses exactly
+               takes its exact values, so every exact answer is also recoverable.
 
 Metrics, once per parse group (only exact answers valid / recoverable slots valid too):
 an invalid slot prediction counts as a false negative for its gold class and never as a false
 positive (it is a prediction that matches no class).
-  toxicity_detection  precision / recall / F1 of "toxic" and of "safe"
+  toxicity_detection  precision / recall / F1 of "toxic" and of "safe", macro-F1 (mean of the two)
   claudette_tos       8-class scenario of run_claudette_benchmark.py: per clause type F1 with "Y" as
                       positive, micro-F1 (TP/FP/FN pooled over the 8) and macro-F1 (mean of the 8)
   cti_vsp             per metric and class F1 over the gold classes observed in the test set,
@@ -30,10 +43,12 @@ positive (it is a prediction that matches no class).
 
 Outputs under --output-dir (default benchmark_play_ground/labeling_benchmark/):
   <bench>/<model>/raw_outputs.jsonl  one line per API call (prompt, gt, raw text, OpenRouter
-                                     metadata); append-only, a rerun only queries missing indices
+                                     metadata, fingerprint); append-only, a rerun only queries
+                                     missing indices
   <bench>/<model>/predictions.jsonl  parsed values per example (exact + recoverable), rewritten
                                      from raw_outputs.jsonl on every run
-  <bench>/<model>/summary.json       metrics of both parse groups, parse counts, API parameters
+  <bench>/<model>/summary.json       metrics of both parse groups, parse counts, fingerprint and
+                                     its components
   summary.json / summary.csv         all benchmarks x models x parse groups (CSV in long format:
                                      one row per metric)
 
@@ -44,6 +59,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import importlib
 import json
 import re
 import sys
@@ -58,11 +75,12 @@ sys.path.insert(0, str(DATA_SYNTHESIS_DIR))
 sys.path.insert(0, str(DATA_SYNTHESIS_DIR / "labeling"))
 
 from benchmark_play_ground.api_prediction import (  # noqa: E402
-    API_MODEL_PRESETS, ApiPredictor, add_api_cli_args, first_messages_dump,
+    API_BASE_PARAMS, API_MODEL_PRESETS, ApiPredictor, add_api_cli_args, first_messages_dump,
 )
 from benchmark_play_ground.data_loader import load_claudette_tsv, load_cti_vsp_tsv, load_toxicity_tsv  # noqa: E402
 from prompts import LabelingPrompt, load_labeling_prompt  # noqa: E402
 from run_labeling import build_answer_regex, normalize_label_line  # noqa: E402
+from shared.openrouter import build_model_params  # noqa: E402
 
 DEFAULT_CONFIG = ROOT_DIR / "experiments" / "config" / "experiments.yaml"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "labeling_benchmark"
@@ -77,59 +95,82 @@ LOADERS = {
 }
 
 # ---------------------------------------------------------------------------
-# Lenient benchmark parsers, copied from the --mode api paths of the run_*_benchmark.py scripts
-# (not imported: those modules import torch at module level).
+# Lenient parsers (recoverable group)
 # ---------------------------------------------------------------------------
 
 TOXICITY_SLOT = "label"
 TOXICITY_CLASSES = ["toxic", "safe"]
-TOXICITY_ANSWER_RE = re.compile(r"Answer:\s*(toxic|safe)", re.IGNORECASE)  # run_toxicity_benchmark.py
 
 CLAUDETTE_METRICS = ["LTD", "TER", "CH", "CR", "USE", "LAW", "J", "ARB"]
-CLAUDETTE_SLOT_RE = {m: re.compile(rf"\b{m}:\s*([YN])\b") for m in CLAUDETTE_METRICS}  # run_claudette_benchmark.py
-
 CVSS_METRICS = ["AV", "AC", "PR", "UI", "S", "C", "I", "A"]
-CVSS_METRIC_VALUE_CHARS = {  # run_cti_vsp_benchmark.py
-    "AV": "NALP", "AC": "LH", "PR": "NLH", "UI": "NR", "S": "UC", "C": "NLH", "I": "NLH", "A": "NLH",
+
+# Markdown emphasis / code / heading characters, removed before lenient parsing ("**AV:** `N`").
+MARKDOWN_RE = re.compile(r"[*_`#~]")
+
+# Spelled-out values per slot (CVSS v3.1 specification names); the letters themselves always count.
+_CVSS_IMPACT = {"N": ["None"], "L": ["Low"], "H": ["High"]}
+VALUE_NAMES = {
+    "cti_vsp": {
+        "AV": {"N": ["Network"], "A": ["Adjacent Network", "Adjacent"], "L": ["Local"], "P": ["Physical"]},
+        "AC": {"L": ["Low"], "H": ["High"]},
+        "PR": _CVSS_IMPACT,
+        "UI": {"N": ["None"], "R": ["Required"]},
+        "S": {"U": ["Unchanged"], "C": ["Changed"]},
+        "C": _CVSS_IMPACT,
+        "I": _CVSS_IMPACT,
+        "A": _CVSS_IMPACT,
+    },
+    "claudette_tos": {m: {"Y": ["Yes"], "N": ["No"]} for m in CLAUDETTE_METRICS},
 }
-CVSS_METRIC_RE = {m: re.compile(rf"\b{m}:\s*([{chars}])") for m, chars in CVSS_METRIC_VALUE_CHARS.items()}
-CTI_VSP_STOP_STRINGS = ["\nCVE Description:", "\n\n"]
-
-
-def cut_at_stop_strings(text: str) -> str:
-    """run_cti_vsp_benchmark.cut_at_stop_strings: the text up to the first stop string."""
-    text = text.lstrip()
-    cut = min((i for i in (text.find(stop) for stop in CTI_VSP_STOP_STRINGS) if i >= 0), default=len(text))
-    return text[:cut]
-
-
-def recover_toxicity(text: str) -> dict:
-    match = TOXICITY_ANSWER_RE.search(text)
-    return {TOXICITY_SLOT: match.group(1).lower() if match else None}
-
-
-def recover_claudette(text: str) -> dict:
-    out = {}
-    for m in CLAUDETTE_METRICS:
-        match = CLAUDETTE_SLOT_RE[m].search(text)
-        out[m] = match.group(1) if match else None
-    return out
-
-
-def recover_cti_vsp(text: str) -> dict:
-    text = cut_at_stop_strings(text)
-    out = {}
-    for m in CVSS_METRICS:
-        match = CVSS_METRIC_RE[m].search(text)
-        out[m] = match.group(1) if match else None
-    return out
-
-
-RECOVER = {
-    "toxicity_detection": recover_toxicity,
-    "claudette_tos": recover_claudette,
-    "cti_vsp": recover_cti_vsp,
+# Spelled-out slot keys: the metric names of the labeling prompts ("Attack Vector", "arbitration").
+METRIC_NAMES = {
+    "cti_vsp": importlib.import_module("prompts.cti_vsp.labeling").CVSS_METRIC_NAMES,
+    "claudette_tos": importlib.import_module("prompts.claudette_tos.labeling").CLAUDETTE_METRIC_NAMES,
 }
+
+
+def _alternation(spellings) -> str:
+    """Longest first, so "None" wins over "N"; inner spaces match any whitespace."""
+    return "|".join(re.escape(x).replace(r"\ ", r"\s+") for x in sorted(spellings, key=len, reverse=True))
+
+
+class LenientParser:
+    """The recoverable parser of one domain, see the module docstring."""
+
+    def __init__(self, domain: str, prompt: LabelingPrompt):
+        self.domain = domain
+        if domain == "toxicity_detection":
+            if sorted(prompt.fragments["labels"]) != sorted(TOXICITY_CLASSES):
+                raise SystemExit(f"labels {prompt.fragments['labels']} != {TOXICITY_CLASSES}")
+            # (?<![\w-]) / (?![\w-]): "non-toxic", "unsafe" and "toxicity" are not a label.
+            self.label_re = {c: re.compile(rf"(?<![\w-]){c}(?![\w-])", re.IGNORECASE) for c in TOXICITY_CLASSES}
+            return
+        self.slot_re, self.value_of = {}, {}
+        for slot in SLOTS[domain]:
+            names = VALUE_NAMES[domain][slot]
+            if set(names) != set(prompt.fragments["fields"][slot]):
+                raise SystemExit(f"{domain} {slot}: spelled-out values {sorted(names)} != "
+                                 f"labeling values {sorted(prompt.fragments['fields'][slot])}")
+            self.value_of[slot] = {" ".join(x.split()).lower(): v for v, xs in names.items() for x in [v, *xs]}
+            key = _alternation([slot, METRIC_NAMES[domain][slot]])
+            value = _alternation(self.value_of[slot])
+            self.slot_re[slot] = re.compile(
+                rf"(?<![A-Za-z])(?:{key})(?:\s*\(\s*{re.escape(slot)}\s*\))?\s*[:=]\s*({value})(?![A-Za-z])",
+                re.IGNORECASE,
+            )
+
+    def parse(self, text: str) -> dict:
+        """{slot: value or None}."""
+        text = MARKDOWN_RE.sub("", text)
+        if self.domain == "toxicity_detection":
+            found = [c for c in TOXICITY_CLASSES if self.label_re[c].search(text)]
+            return {TOXICITY_SLOT: found[0] if len(found) == 1 else None}
+        out = {}
+        for slot, regex in self.slot_re.items():
+            values = {self.value_of[slot][" ".join(m.group(1).split()).lower()] for m in regex.finditer(text)}
+            out[slot] = values.pop() if len(values) == 1 else None
+        return out
+
 
 SLOTS = {
     "toxicity_detection": [TOXICITY_SLOT],
@@ -209,6 +250,7 @@ def metrics_toxicity(rows: list[dict], group: str) -> dict:
     return {
         "f1_toxic": per_class["toxic"]["f1"],
         "f1_safe": per_class["safe"]["f1"],
+        "macro_f1": sum(per_class[c]["f1"] for c in TOXICITY_CLASSES) / len(TOXICITY_CLASSES),
         "per_class": per_class,
     }
 
@@ -278,7 +320,7 @@ def flat_metrics(domain: str, metrics: dict) -> dict[str, float]:
     """Metric name -> value of one parse group, for summary.csv."""
     if domain == "toxicity_detection":
         flat = {f"{cls}/{k}": s[k] for cls, s in metrics["per_class"].items() for k in ("precision", "recall", "f1")}
-        return {"f1_toxic": metrics["f1_toxic"], "f1_safe": metrics["f1_safe"], **flat}
+        return {"macro_f1": metrics["macro_f1"], "f1_toxic": metrics["f1_toxic"], "f1_safe": metrics["f1_safe"], **flat}
     flat = {"micro_f1": metrics["micro_f1"], "macro_f1": metrics["macro_f1"]}
     if domain == "claudette_tos":
         flat.update({f"f1/{m}": s["f1"] for m, s in metrics["per_class"].items()})
@@ -309,11 +351,36 @@ def parse_args():
     return p.parse_args()
 
 
-def load_raw(path: Path, records: list[dict], api_model: str) -> dict[int, dict]:
-    """index -> raw call record of an earlier run; refuses a file from another model or test set."""
+def sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def request_fingerprint(run_args) -> tuple[str, dict]:
+    """(fingerprint, its components): everything besides the example that shapes an answer.
+    The request parameters are built exactly as ApiPredictor.__init__ builds them (checked in
+    query_missing), but without needing an API key, so a rerun without new calls can verify too."""
+    model_id, provider = API_MODEL_PRESETS[run_args.api_model]
+    no_overrides = argparse.Namespace(temperature=None, top_p=None, max_tokens=None, extra_params=None)
+    model_params = build_model_params(model_id, provider, dict(API_BASE_PARAMS, max_tokens=MAX_TOKENS), no_overrides)
+    model_params["provider"]["allow_fallbacks"] = True
+    prompt: LabelingPrompt = run_args.labeling_prompt
+    components = {
+        "system_prompt_sha256": sha256(prompt.system),
+        "user_prompt_prefix": prompt.user_prefix,
+        "max_tokens": MAX_TOKENS,
+        "model_id": model_id,
+        "model_params": model_params,
+    }
+    return sha256(json.dumps(components, sort_keys=True))[:16], components
+
+
+def load_raw(path: Path, records: list[dict], api_model: str, fingerprint: str) -> dict[int, dict]:
+    """index -> raw call record of an earlier run; refuses a file from another model, test set or
+    request fingerprint."""
     done: dict[int, dict] = {}
     if not path.exists():
         return done
+    stale: dict[str | None, int] = {}
     with path.open(encoding="utf-8") as fh:
         for line in fh:
             if not line.strip():
@@ -325,17 +392,29 @@ def load_raw(path: Path, records: list[dict], api_model: str) -> dict[int, dict]
             i = rec["index"]
             if rec["api_model"] != api_model or i >= len(records) or rec["prompt"] != records[i]["prompt"]:
                 raise SystemExit(f"{path}: line for index {i} does not belong to model {api_model} / this test set.")
+            if rec.get("fingerprint") != fingerprint:
+                stale[rec.get("fingerprint")] = stale.get(rec.get("fingerprint"), 0) + 1
+                continue
             done[i] = rec
+    if stale:
+        found = ", ".join(f"{fp}: {n} line(s)" for fp, n in stale.items())
+        raise SystemExit(
+            f"{path} holds answers of another request setup (fingerprint {found}; current: {fingerprint}). "
+            "The system prompt, max_tokens, model id or request parameters changed - move the file away "
+            "or use another --output-dir."
+        )
     return done
 
 
-def query_missing(run_args, records: list[dict], raw_path: Path) -> dict[int, dict]:
-    done = load_raw(raw_path, records, run_args.api_model)
+def query_missing(run_args, records: list[dict], raw_path: Path, fingerprint: str) -> dict[int, dict]:
+    done = load_raw(raw_path, records, run_args.api_model, fingerprint)
     todo = [i for i in range(len(records)) if i not in done]
     print(f"[{run_args.domain} / {run_args.api_model}] {len(done)} answers found, {len(todo)} to query", flush=True)
     if not todo:
         return done
     predictor = ApiPredictor(run_args, max_tokens=MAX_TOKENS, logprobs=False)
+    if predictor.model_params != request_fingerprint(run_args)[1]["model_params"]:
+        raise SystemExit("request_fingerprint() no longer builds the request parameters ApiPredictor sends.")
     first_messages_dump(build_chat_messages(run_args, records[todo[0]]["prompt"]))
     batch_size = max(1, run_args.batch_size)
     with raw_path.open("a", encoding="utf-8") as fh:
@@ -347,6 +426,7 @@ def query_missing(run_args, records: list[dict], raw_path: Path) -> dict[int, di
                     "index": i,
                     "api_model": predictor.api_model,
                     "model_id": predictor.model_id,
+                    "fingerprint": fingerprint,
                     "prompt": records[i]["prompt"],
                     "gt": records[i]["gt"],
                     "raw_output": resp["text"],
@@ -356,17 +436,16 @@ def query_missing(run_args, records: list[dict], raw_path: Path) -> dict[int, di
                 done[i] = rec
             fh.flush()
             print(f"  [{min(start + batch_size, len(todo))}/{len(todo)}]", flush=True)
-    run_args.api_describe = predictor.describe()
     return done
 
 
-def parse_row(domain: str, exact: ExactParser, rec: dict, gt_values: dict) -> dict:
+def parse_row(domain: str, exact: ExactParser, lenient: LenientParser, rec: dict, gt_values: dict) -> dict:
     slots = SLOTS[domain]
     text = rec["raw_output"]
     label_line, exact_values = exact.parse(text)
-    benchmark_values = RECOVER[domain](text)
+    lenient_values = lenient.parse(text)
     # An exact answer keeps its exact values in the recoverable group (exact is a subset of it).
-    recoverable_values = exact_values if exact_values is not None else benchmark_values
+    recoverable_values = exact_values if exact_values is not None else lenient_values
     n_recovered = sum(1 for s in slots if recoverable_values[s] is not None)
     if exact_values is not None:
         status = "exact"
@@ -387,7 +466,7 @@ def parse_row(domain: str, exact: ExactParser, rec: dict, gt_values: dict) -> di
         "exact": {"valid": exact_values is not None, "label_line": label_line,
                   "values": exact_values or {s: None for s in slots}},
         "recoverable": {"valid_slots": n_recovered, "values": recoverable_values,
-                        "benchmark_parser_values": benchmark_values},
+                        "lenient_parser_values": lenient_values},
     }
 
 
@@ -396,11 +475,12 @@ def run_one(cli, domain: str, model: str, records: list[dict], gt_values: list[d
     out_dir = cli.output_dir / domain / model
     out_dir.mkdir(parents=True, exist_ok=True)
     run_args = argparse.Namespace(**vars(cli))
-    run_args.api_model, run_args.domain, run_args.labeling_prompt, run_args.api_describe = model, domain, prompt, None
+    run_args.api_model, run_args.domain, run_args.labeling_prompt = model, domain, prompt
+    fingerprint, fingerprint_components = request_fingerprint(run_args)
 
-    raw = query_missing(run_args, records, out_dir / "raw_outputs.jsonl")
-    exact = ExactParser(domain, prompt)
-    rows = [parse_row(domain, exact, raw[i], gt_values[i]) for i in range(len(records))]
+    raw = query_missing(run_args, records, out_dir / "raw_outputs.jsonl", fingerprint)
+    exact, lenient = ExactParser(domain, prompt), LenientParser(domain, prompt)
+    rows = [parse_row(domain, exact, lenient, raw[i], gt_values[i]) for i in range(len(records))]
     with (out_dir / "predictions.jsonl").open("w", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -408,9 +488,10 @@ def run_one(cli, domain: str, model: str, records: list[dict], gt_values: list[d
     summary = {
         "benchmark": domain,
         "api_model": model,
-        "model_id": raw[0]["model_id"],
+        "model_id": fingerprint_components["model_id"],
         "max_tokens": MAX_TOKENS,
-        "api": run_args.api_describe,  # None if every answer came from an earlier run
+        "fingerprint": fingerprint,
+        "fingerprint_components": fingerprint_components,
         **data_info,
         "parse_counts": parse_counts(rows, SLOTS[domain]),
         "metrics": evaluate(domain, rows, metric_classes),
@@ -428,7 +509,7 @@ def print_summary(s: dict) -> None:
     for group in PARSE_GROUPS:
         m = s["metrics"][group]
         if s["benchmark"] == "toxicity_detection":
-            print(f"   {group:<11} f1_toxic={m['f1_toxic']:.4f}  f1_safe={m['f1_safe']:.4f}")
+            print(f"   {group:<11} macro_f1={m['macro_f1']:.4f}  f1_toxic={m['f1_toxic']:.4f}  f1_safe={m['f1_safe']:.4f}")
         else:
             print(f"   {group:<11} micro_f1={m['micro_f1']:.4f}  macro_f1={m['macro_f1']:.4f}")
 
