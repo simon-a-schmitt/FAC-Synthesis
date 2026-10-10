@@ -1,0 +1,30 @@
+# Labeling benchmark: second evaluation of the experiments runs, with free generation.
+#
+# Everything about a run except the settings below comes from experiments/config/experiments.yaml
+# (read-only): benchmarks, test_tsv, max_prompts, seed sets, setups, hybrid ratios and the
+# rouge/activation thresholds that select the run_ids. Nothing is generated or fine-tuned here: the
+# plain/icl arms use the base model, gold/bb/fg/hybrid the LoRA adapter of experiments/runs/<run_id>/lora.
+# See lb_runs.py.
+
+# Generation (all arms, all benchmarks): greedy, no stop strings, at most this many new tokens
+# (= OpenRouter max_tokens for the api arm).
+max_new_tokens: 64
+
+# Prompts per batched generate() call (local arms; halved automatically on CUDA OOM).
+# api arm: requests sent together per chunk and appended to raw_outputs.jsonl together.
+batch_size:
+  toxicity_detection: 16
+  claudette_tos: 16
+  cti_vsp: 8
+
+# api arm: {bench}__api__{model}, plain prompt sent to the OpenRouter model
+# (benchmark_play_ground/api_prediction.py API_MODEL_PRESETS, temperature 0, no logprobs).
+api_models: [deepseek, llama, gpt]
+api_max_concurrent_requests: 8
+
+# SLURM time limits per job class (partitions: GPU_PARTITION / CPU_PARTITION of
+# experiments/config/cluster.env, read only). A run that hits the limit continues where it stopped
+# when it is submitted again (raw_outputs.jsonl is resumable).
+slurm:
+  gpu_time: "00:30:00"
+  cpu_time: "02:00:00"
