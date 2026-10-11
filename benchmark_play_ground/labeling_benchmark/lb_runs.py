@@ -12,8 +12,8 @@ experiments is only read: its run_ids, resolve() and stage checks; nothing there
 
 Outputs per run under labeling_benchmark/runs/<run_id>/:
     raw_outputs.jsonl   one line per example (raw model text, lb_fingerprint); resumable
-    predictions.jsonl   exact + lenient parse per example, rewritten on every run
-    summary.json        metrics of both parsers
+    predictions.jsonl   labeling-parser values per example, rewritten on every run
+    summary.json        metrics
     lbench.done         done marker with lb_fingerprint, written last
 
 lb_fingerprint: everything that shapes an answer - benchmark, mode, test TSV + max_prompts,

@@ -8,7 +8,7 @@ Predictions as the experiments benchmark scripts determined them:
   cti_vsp             "predicted_metrics"; a None slot is invalid -> FN of its gold class (the
                       experiments script itself excludes such examples; here they stay in, as in
                       the labeling benchmark)
-Gold: the test TSV parsed with the exact parser; every line's gt must equal the TSV's.
+Gold: the test TSV parsed with the labeling parser; every line's gt must equal the TSV's.
 
 Usage:
     python benchmark_play_ground/labeling_benchmark/lb_experiments_eval.py <run_id> [<run_id> ...]

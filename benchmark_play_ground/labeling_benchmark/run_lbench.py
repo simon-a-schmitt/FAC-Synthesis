@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Runs one labeling-benchmark run (lb_runs.py): free generation on the test set, then both parsers
-(lb_parsers.py) and the metrics (lb_metrics.py).
+"""Runs one labeling-benchmark run (lb_runs.py): free generation on the test set, then the labeling
+parser (lb_parsers.py; an answer it cannot parse is invalid as a whole) and the metrics (lb_metrics.py).
 
 Prompts: build_chat_messages() of the experiments benchmark script of the domain
 (run_{toxicity,claudette,cti_vsp}_benchmark.py) - the same messages experiments sends, incl. the ICL
@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 
 from lb_metrics import evaluate
-from lb_parsers import PARSERS, SLOTS, make_parsers
+from lb_parsers import SLOTS, LabelingParser
 from lb_experiments_eval import load_test
 from lb_runs import api_model_params, load_configs, parse_run_id, prerequisite, resolve_full
 
@@ -244,22 +244,18 @@ def message_builder(r: dict, records_loader):
 
 def parse_and_evaluate(r: dict, records: list[dict], gold: list[dict], raw: dict[int, dict]) -> tuple[list[dict], dict]:
     domain, slots = r["bench"], SLOTS[r["bench"]]
-    parsers = make_parsers(domain)
+    parser = LabelingParser(domain)
     rows = []
     for i, rec in enumerate(records):
         text = raw[i]["raw_output"]
-        values = {name: parser.parse(text) for name, parser in parsers.items()}
-        n_valid = {name: sum(v[s] is not None for s in slots) for name, v in values.items()}
+        values = parser.parse(text)
         rows.append({"index": i, "gt": rec["gt"], "gt_values": gold[i], "raw_output": text,
                      "hit_max_new_tokens": raw[i].get("hit_max_new_tokens"),
-                     **{name: {"values": v, "n_valid_slots": n_valid[name]} for name, v in values.items()}})
-    metrics = {name: evaluate(domain, gold, [row[name]["values"] for row in rows]) for name in PARSERS}
+                     "values": values, "valid": all(values[s] is not None for s in slots)})
+    metrics = evaluate(domain, gold, [row["values"] for row in rows])
     counts = {
         "n_examples": len(rows),
-        "n_exact_valid": sum(row["exact"]["n_valid_slots"] == len(slots) for row in rows),
-        "n_lenient_valid": sum(row["lenient"]["n_valid_slots"] == len(slots) for row in rows),
-        "n_lenient_only": sum(row["lenient"]["n_valid_slots"] == len(slots) and row["exact"]["n_valid_slots"] == 0
-                              for row in rows),
+        "n_valid": sum(row["valid"] for row in rows),
         "n_hit_max_new_tokens": sum(bool(row["hit_max_new_tokens"]) for row in rows),
     }
     return rows, {"metrics": metrics, "counts": counts}
@@ -329,12 +325,9 @@ def main() -> None:
     }
     Path(r["summary_json"]).write_text(json.dumps(summary, indent=2), encoding="utf-8")
     c = result["counts"]
-    print(f"== {r['run_id']}: n={c['n_examples']}  exact_valid={c['n_exact_valid']}  lenient_valid={c['n_lenient_valid']}  "
-          f"hit_max_new_tokens={c['n_hit_max_new_tokens']}")
-    for name in PARSERS:
-        m = result["metrics"][name]
-        print(f"   {name:<8} {m['metric']}={m['value']:.4f}  valid_examples={m['validity']['valid_example_rate']:.4f}  "
-              f"valid_slots={m['validity']['valid_slot_rate']:.4f}")
+    m = result["metrics"]
+    print(f"== {r['run_id']}: n={c['n_examples']}  valid={c['n_valid']}  hit_max_new_tokens={c['n_hit_max_new_tokens']}  "
+          f"{m['metric']}={m['value']:.4f}")
 
     tmp = Path(r["lb_done"] + ".tmp")
     tmp.write_text(json.dumps({"run_id": r["run_id"], "lb_fingerprint": r["lb_fingerprint"], "finished_at": now(),

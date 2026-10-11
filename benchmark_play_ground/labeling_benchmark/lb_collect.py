@@ -3,8 +3,7 @@ source) and a pivot labeling_benchmark/results/summary.md (variant x source per 
 over the seed groups present, n per cell).
 
 Sources:
-  lbench_exact    free generation, exact (labeling) parser       runs/<run_id>/summary.json (lbench done)
-  lbench_lenient  free generation, lenient (benchmark) parser    runs/<run_id>/summary.json (lbench done)
+  lbench       free generation, labeling parser    runs/<run_id>/summary.json (lbench done)
   experiments     experiments/runs/<run_id>/bench.jsonl (experiments bench done; not for api),
                   same metrics via lb_experiments_eval.py
 Metric per benchmark (lb_metrics.py): toxicity f1_toxic, claudette weighted_f1, cti_vsp macro_f1;
@@ -25,12 +24,11 @@ from pathlib import Path
 
 from lb_experiments_eval import evaluate_experiments_run
 from lb_metrics import PRIMARY_METRIC
-from lb_parsers import PARSERS
 from lb_runs import (LB_DIR, add_filter_args, experiments_bench_done, filters_of, lb_state, load_configs,
                      resolve_full, select)
 
 RESULTS_DIR = LB_DIR / "results"
-SOURCES = (*(f"lbench_{p}" for p in PARSERS), "experiments")
+SOURCES = ("lbench", "experiments")
 COLUMNS = ["run_id", "bench", "arm", "variant", "setup", "api_model", "seed_set", "group", "n_bb", "n_fg",
            "rouge_threshold", "activation_threshold", "source", "metric", "value", "valid_example_rate",
            "valid_slot_rate", "n_examples", "n_hit_max_new_tokens"]
@@ -72,8 +70,8 @@ def write_summary(rows: list[dict], exp_config: dict, path: Path) -> None:
             order[row["bench"]].append(row["variant"])
     lines = ["# Labeling benchmark", "",
              "Metric: mean ± SD over the seed groups present (n). valid = mean valid_example_rate. "
-             "Sources: lbench_exact / lbench_lenient = free generation parsed with the labeling / benchmark "
-             "parser; experiments = outputs of the experiments benchmark (constrained for toxicity/claudette). "
+             "Sources: lbench = free generation parsed with the labeling parser (an answer it cannot parse "
+             "is invalid as a whole); experiments = outputs of the experiments benchmark (constrained for toxicity/claudette). "
              "Invalid predictions count as FN of the gold class, never as FP.", ""]
     head = ["variant", *[f"{s}" for s in SOURCES], *[f"valid {s}" for s in SOURCES]]
     for bench in exp_config["benchmarks"]:
@@ -101,7 +99,7 @@ def main() -> None:
         if lb_state(r, exp_r) == "done":
             summary = json.loads(Path(r["summary_json"]).read_text(encoding="utf-8"))
             extra = {"n_hit_max_new_tokens": summary["counts"]["n_hit_max_new_tokens"]}
-            rows += [result_row(spec, r, f"lbench_{p}", summary["metrics"][p], extra) for p in PARSERS]
+            rows.append(result_row(spec, r, "lbench", summary["metrics"], extra))
             n_lb += 1
         if experiments_bench_done(exp_r):
             rows.append(result_row(spec, r, "experiments", evaluate_experiments_run(r)))

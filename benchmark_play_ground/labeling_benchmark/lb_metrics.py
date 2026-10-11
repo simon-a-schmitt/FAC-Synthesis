@@ -1,4 +1,4 @@
-"""Metrics of the labeling benchmark - the same for both parsers of a run here and for the
+"""Metrics of the labeling benchmark - the same for the free-generation runs here and for the
 experiments outputs (lb_experiments_eval.py).
 
 Input per example: gold slot values and predicted slot values, a predicted value None = invalid.
